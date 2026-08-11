@@ -66,7 +66,7 @@
   <body>
     <div id="subtitle" class="subtitle" role="status" aria-live="polite" hidden></div>
     <script>
-      const MAX_SEGMENT_LENGTH = 28;
+      const MAX_SEGMENT_LENGTH = 42;
       const MIN_SEGMENT_DISPLAY_MS = 1800;
       const MAX_SEGMENT_DISPLAY_MS = 4500;
       const DISPLAY_MS_PER_CHARACTER = 120;
@@ -149,6 +149,23 @@
         );
       }
 
+      function getSegmentDurations(segments, audioDurationMs) {
+        if (!Number.isFinite(audioDurationMs) || audioDurationMs <= 0) {
+          return segments.map(getDisplayDuration);
+        }
+
+        const characterCounts = segments.map((segment) =>
+          Math.max(characterCount(segment), 1),
+        );
+        const totalCharacterCount = characterCounts.reduce(
+          (total, count) => total + count,
+          0,
+        );
+        return characterCounts.map(
+          (count) => audioDurationMs * (count / totalCharacterCount),
+        );
+      }
+
       function stopSubtitlePlayback() {
         playbackToken += 1;
         if (subtitleTimerId !== null) {
@@ -176,6 +193,10 @@
           hideSubtitle();
           return;
         }
+        const segmentDurations = getSegmentDurations(
+          segments,
+          command.duration_ms,
+        );
 
         const showSegment = (index) => {
           if (token !== playbackToken) return;
@@ -192,7 +213,7 @@
           subtitle.hidden = false;
           subtitleTimerId = window.setTimeout(
             () => showSegment(index + 1),
-            getDisplayDuration(segment),
+            segmentDurations[index],
           );
         };
 

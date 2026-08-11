@@ -1,9 +1,11 @@
+import io
 import json
 import math
 import queue
 import sys
 import threading
 import uuid
+import wave
 from collections import OrderedDict
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -41,6 +43,21 @@ ALLOWED_HEAD_MOTIONS = {
 }
 
 SUBTITLE_OVERLAY_PATH = Path(__file__).with_name("subtitle_overlay.html")
+
+
+def get_wav_duration_ms(audio_data):
+    try:
+        with wave.open(io.BytesIO(audio_data), "rb") as wav_file:
+            frame_rate = wav_file.getframerate()
+            frame_count = wav_file.getnframes()
+    except (EOFError, wave.Error) as exc:
+        raise RuntimeError(
+            "AivisSpeechのWAV音声から再生時間を取得できませんでした。"
+        ) from exc
+
+    if frame_rate <= 0 or frame_count <= 0:
+        raise RuntimeError("AivisSpeechのWAV音声に有効な再生時間がありません。")
+    return round(frame_count / frame_rate * 1000)
 
 
 def normalize_motion_command(motion):
@@ -181,6 +198,7 @@ class ExternalControlRuntime:
             self.speaker_id,
             emotion,
         )
+        duration_ms = get_wav_duration_ms(audio_data)
         audio_id = self.audio_store.put(audio_data)
         command = {
             "type": "speak",
@@ -188,6 +206,7 @@ class ExternalControlRuntime:
             "text": normalized_text,
             "emotion": emotion,
             "audio_url": f"{self.public_base_url}/audio/{audio_id}.wav",
+            "duration_ms": duration_ms,
             "interrupt": True,
         }
         if normalized_motion is not None:
@@ -199,6 +218,7 @@ class ExternalControlRuntime:
                 "id": command["id"],
                 "text": normalized_text,
                 "emotion": emotion,
+                "duration_ms": duration_ms,
             }
         )
         return command, delivered_count

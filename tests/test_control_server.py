@@ -1,10 +1,24 @@
+import io
 import unittest
+import wave
 
 from control_server import (
     AudioStore,
     ExternalControlRuntime,
+    get_wav_duration_ms,
     normalize_motion_command,
 )
+
+
+def create_test_wav(duration_ms=1500, frame_rate=8000):
+    frame_count = round(duration_ms / 1000 * frame_rate)
+    output = io.BytesIO()
+    with wave.open(output, "wb") as wav_file:
+        wav_file.setnchannels(1)
+        wav_file.setsampwidth(2)
+        wav_file.setframerate(frame_rate)
+        wav_file.writeframes(b"\x00\x00" * frame_count)
+    return output.getvalue()
 
 
 class FakeAivisSpeechClient:
@@ -15,7 +29,7 @@ class FakeAivisSpeechClient:
         if not text or speaker_id != 101:
             raise AssertionError("テスト用AivisSpeech呼び出しの引数が不正です。")
         self.last_emotion = emotion
-        return b"RIFF-test-wav"
+        return create_test_wav()
 
 
 class AudioStoreTest(unittest.TestCase):
@@ -26,6 +40,15 @@ class AudioStoreTest(unittest.TestCase):
 
         self.assertIsNone(store.get(old_audio_id))
         self.assertEqual(store.get(new_audio_id), b"new")
+
+
+class WavDurationTest(unittest.TestCase):
+    def test_gets_duration_from_wav(self):
+        self.assertEqual(get_wav_duration_ms(create_test_wav(2345)), 2345)
+
+    def test_rejects_invalid_wav(self):
+        with self.assertRaisesRegex(RuntimeError, "再生時間を取得できません"):
+            get_wav_duration_ms(b"not-wav")
 
 
 class ExternalControlRuntimeTest(unittest.TestCase):
@@ -46,8 +69,9 @@ class ExternalControlRuntimeTest(unittest.TestCase):
         self.assertEqual(received_command, command)
         self.assertEqual(command["text"], "こんにちは")
         self.assertEqual(command["emotion"], "happy")
+        self.assertEqual(command["duration_ms"], 1500)
         self.assertEqual(aivis_client.last_emotion, "happy")
-        self.assertEqual(runtime.audio_store.get(audio_id), b"RIFF-test-wav")
+        self.assertEqual(runtime.audio_store.get(audio_id), create_test_wav())
 
     def test_unknown_emotion_is_rejected(self):
         runtime = ExternalControlRuntime(
@@ -77,6 +101,7 @@ class ExternalControlRuntimeTest(unittest.TestCase):
                 "id": command["id"],
                 "text": "字幕テスト",
                 "emotion": "surprised",
+                "duration_ms": 1500,
             },
         )
 
