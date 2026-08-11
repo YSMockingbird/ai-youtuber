@@ -66,24 +66,150 @@
   <body>
     <div id="subtitle" class="subtitle" role="status" aria-live="polite" hidden></div>
     <script>
+      const MAX_SEGMENT_LENGTH = 28;
+      const MIN_SEGMENT_DISPLAY_MS = 1800;
+      const MAX_SEGMENT_DISPLAY_MS = 4500;
+      const DISPLAY_MS_PER_CHARACTER = 120;
+      const FINAL_HOLD_MS = 1200;
       const subtitle = document.getElementById('subtitle');
       const events = new EventSource('/subtitle-events');
+      let subtitleTimerId = null;
+      let playbackToken = 0;
+
+      function characterCount(text) {
+        return Array.from(text).length;
+      }
+
+      function splitLongUnit(text) {
+        const segments = [];
+        let remaining = text.trim();
+
+        while (characterCount(remaining) > MAX_SEGMENT_LENGTH) {
+          const characters = Array.from(remaining);
+          const minimumBreak = Math.floor(MAX_SEGMENT_LENGTH * 0.55);
+          let breakAt = MAX_SEGMENT_LENGTH;
+
+          for (let index = minimumBreak; index < MAX_SEGMENT_LENGTH; index += 1) {
+            if (/[、，,\s]/.test(characters[index])) {
+              breakAt = index + 1;
+            }
+          }
+
+          segments.push(characters.slice(0, breakAt).join('').trim());
+          remaining = characters.slice(breakAt).join('').trim();
+        }
+
+        if (remaining) segments.push(remaining);
+        return segments;
+      }
+
+      function splitSubtitleText(text) {
+        const normalized = text
+          .replace(/\r\n/g, '\n')
+          .replace(/[ \t]+/g, ' ')
+          .trim();
+        if (!normalized) return [];
+
+        const units = normalized.match(/[^。！？!?\n]+[。！？!?]?|\n/g) || [normalized];
+        const segments = [];
+        let buffer = '';
+
+        const flushBuffer = () => {
+          if (!buffer) return;
+          segments.push(buffer);
+          buffer = '';
+        };
+
+        for (const unit of units) {
+          if (unit === '\n') {
+            flushBuffer();
+            continue;
+          }
+
+          for (const piece of splitLongUnit(unit)) {
+            const combined = `${buffer}${piece}`;
+            if (buffer && characterCount(combined) > MAX_SEGMENT_LENGTH) {
+              flushBuffer();
+            }
+            buffer = `${buffer}${piece}`;
+          }
+        }
+
+        flushBuffer();
+        return segments;
+      }
+
+      function getDisplayDuration(text) {
+        return Math.min(
+          MAX_SEGMENT_DISPLAY_MS,
+          Math.max(
+            MIN_SEGMENT_DISPLAY_MS,
+            characterCount(text) * DISPLAY_MS_PER_CHARACTER,
+          ),
+        );
+      }
+
+      function stopSubtitlePlayback() {
+        playbackToken += 1;
+        if (subtitleTimerId !== null) {
+          window.clearTimeout(subtitleTimerId);
+          subtitleTimerId = null;
+        }
+      }
+
+      function hideSubtitle() {
+        subtitle.textContent = '';
+        subtitle.hidden = true;
+        delete subtitle.dataset.emotion;
+      }
+
+      function clearSubtitle() {
+        stopSubtitlePlayback();
+        hideSubtitle();
+      }
+
+      function playSubtitle(command) {
+        stopSubtitlePlayback();
+        const token = playbackToken;
+        const segments = splitSubtitleText(command.text);
+        if (segments.length === 0) {
+          hideSubtitle();
+          return;
+        }
+
+        const showSegment = (index) => {
+          if (token !== playbackToken) return;
+          if (index >= segments.length) {
+            subtitleTimerId = window.setTimeout(() => {
+              if (token === playbackToken) hideSubtitle();
+            }, FINAL_HOLD_MS);
+            return;
+          }
+
+          const segment = segments[index];
+          subtitle.textContent = segment;
+          subtitle.dataset.emotion = command.emotion || 'neutral';
+          subtitle.hidden = false;
+          subtitleTimerId = window.setTimeout(
+            () => showSegment(index + 1),
+            getDisplayDuration(segment),
+          );
+        };
+
+        showSegment(0);
+      }
 
       events.onmessage = (event) => {
         try {
           const command = JSON.parse(event.data);
           if (command.type === 'clear') {
-            subtitle.textContent = '';
-            subtitle.hidden = true;
-            delete subtitle.dataset.emotion;
+            clearSubtitle();
             return;
           }
           if (command.type !== 'subtitle' || typeof command.text !== 'string') {
             throw new Error('未対応の字幕コマンドです。');
           }
-          subtitle.textContent = command.text;
-          subtitle.dataset.emotion = command.emotion || 'neutral';
-          subtitle.hidden = false;
+          playSubtitle(command);
         } catch (error) {
           console.error('字幕コマンドを処理できませんでした:', error);
         }

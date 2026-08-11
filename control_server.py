@@ -1,6 +1,7 @@
 import json
 import math
 import queue
+import sys
 import threading
 import uuid
 from collections import OrderedDict
@@ -231,6 +232,16 @@ class ExternalControlHttpServer(ThreadingHTTPServer):
     def __init__(self, server_address, runtime):
         super().__init__(server_address, ExternalControlRequestHandler)
         self.runtime = runtime
+
+    def handle_error(self, request, client_address):
+        error = sys.exc_info()[1]
+        if isinstance(error, (BrokenPipeError, ConnectionResetError)):
+            print(
+                "HTTPクライアントが接続を終了しました。"
+                f"address={client_address[0]}:{client_address[1]}"
+            )
+            return
+        super().handle_error(request, client_address)
 
 
 class ExternalControlRequestHandler(BaseHTTPRequestHandler):
