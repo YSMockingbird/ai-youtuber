@@ -2,6 +2,11 @@ import requests
 
 
 DEFAULT_AIVIS_API_URL = "http://127.0.0.1:10101"
+VOICE_SETTINGS_BY_EMOTION = {
+    "neutral": {
+        "speedScale": 1.2,
+    },
+}
 
 
 class AivisSpeechClient:
@@ -55,7 +60,7 @@ class AivisSpeechClient:
                 )
         return styles
 
-    def synthesize(self, text, speaker_id):
+    def synthesize(self, text, speaker_id, emotion="neutral"):
         normalized_text = text.strip()
         if not normalized_text:
             raise ValueError("音声合成する文章が空です。")
@@ -75,6 +80,10 @@ class AivisSpeechClient:
             raise RuntimeError(
                 "AivisSpeechの音声合成クエリをJSONとして読み取れませんでした。"
             ) from exc
+
+        # 感情ごとの音声設定を、AivisSpeechの既定クエリへ上書きします。
+        voice_settings = VOICE_SETTINGS_BY_EMOTION.get(emotion, {})
+        audio_query.update(voice_settings)
 
         synthesis_response = self._request(
             "POST",

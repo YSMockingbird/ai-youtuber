@@ -124,8 +124,19 @@ HTTP APIから送信する場合は次を使用します。
 ```bash
 curl -X POST http://127.0.0.1:8765/api/speak \
   -H 'Content-Type: application/json' \
-  -d '{"text":"こんにちは！","emotion":"happy"}'
+  -d '{"text":"こんにちは！","emotion":"happy","motion":"greeting"}'
 ```
+
+音声なしでボディモーションだけを確認する場合は、次を使用します。
+
+```bash
+curl -X POST http://127.0.0.1:8765/api/motion \
+  -H 'Content-Type: application/json' \
+  -d '{"motion":"peace_sign"}'
+```
+
+利用可能なボディモーションは `show_body`、`greeting`、`peace_sign`、
+`shoot`、`spin`、`model_pose`、`squat` です。
 
 ## OpenAI返答からAITuber OnAirまでの統合確認
 
@@ -149,7 +160,7 @@ emotion：happy
 
 ## ニュースを使った自発的な雑談
 
-ニュースRSSの取得と、りんの雑談生成だけを確認します。
+ニュースRSSの取得と、ガン奈の雑談生成だけを確認します。
 
 ```bash
 .venv/bin/python main.py --mode news-test

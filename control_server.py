@@ -17,6 +17,19 @@ ALLOWED_EMOTIONS = {
     "thinking",
 }
 
+ALLOWED_MOTIONS = {
+    "laugh",
+    "pout",
+    "teary",
+    "show_body",
+    "greeting",
+    "peace_sign",
+    "shoot",
+    "spin",
+    "model_pose",
+    "squat",
+}
+
 
 class AudioStore:
     def __init__(self, max_items=32):
@@ -82,14 +95,20 @@ class ExternalControlRuntime:
         self.audio_store = AudioStore()
         self.event_broker = EventBroker()
 
-    def speak(self, text, emotion="neutral"):
+    def speak(self, text, emotion="neutral", motion=None):
         normalized_text = text.strip()
         if not normalized_text:
             raise ValueError("発話する文章が空です。")
         if emotion not in ALLOWED_EMOTIONS:
             raise ValueError(f"未対応のemotionです。emotion={emotion}")
+        if motion is not None and motion not in ALLOWED_MOTIONS:
+            raise ValueError(f"未対応のmotionです。motion={motion}")
 
-        audio_data = self.aivis_client.synthesize(normalized_text, self.speaker_id)
+        audio_data = self.aivis_client.synthesize(
+            normalized_text,
+            self.speaker_id,
+            emotion,
+        )
         audio_id = self.audio_store.put(audio_data)
         command = {
             "type": "speak",
@@ -97,6 +116,20 @@ class ExternalControlRuntime:
             "text": normalized_text,
             "emotion": emotion,
             "audio_url": f"{self.public_base_url}/audio/{audio_id}.wav",
+            "interrupt": True,
+        }
+        if motion is not None:
+            command["motion"] = motion
+        delivered_count = self.event_broker.publish(command)
+        return command, delivered_count
+
+    def move(self, motion):
+        if motion not in ALLOWED_MOTIONS:
+            raise ValueError(f"未対応のmotionです。motion={motion}")
+        command = {
+            "type": "speak",
+            "id": uuid.uuid4().hex,
+            "motion": motion,
             "interrupt": True,
         }
         delivered_count = self.event_broker.publish(command)
@@ -147,6 +180,9 @@ class ExternalControlRequestHandler(BaseHTTPRequestHandler):
         path = urlparse(self.path).path
         if path == "/api/speak":
             self._handle_speak()
+            return
+        if path == "/api/motion":
+            self._handle_motion()
             return
         if path == "/api/reset":
             command, delivered_count = self.runtime.reset()
@@ -209,43 +245,26 @@ class ExternalControlRequestHandler(BaseHTTPRequestHandler):
         self.wfile.write(audio_data)
 
     def _handle_speak(self):
-        try:
-            content_length = int(self.headers.get("Content-Length", "0"))
-        except ValueError:
-            self._send_json(400, {"error": "Content-Lengthが不正です。"})
-            return
-
-        if content_length <= 0 or content_length > 64 * 1024:
-            self._send_json(400, {"error": "リクエスト本文のサイズが不正です。"})
-            return
-
-        try:
-            body = json.loads(self.rfile.read(content_length).decode("utf-8"))
-        except (UnicodeDecodeError, json.JSONDecodeError):
-            self._send_json(
-                400,
-                {"error": "リクエスト本文をJSONとして読み取れません。"},
-            )
-            return
-
-        if not isinstance(body, dict):
-            self._send_json(
-                400,
-                {"error": "リクエスト本文はJSONオブジェクトで指定してください。"},
-            )
+        body = self._read_json_object()
+        if body is None:
             return
 
         text = body.get("text", "")
         emotion = body.get("emotion", "neutral")
-        if not isinstance(text, str) or not isinstance(emotion, str):
+        motion = body.get("motion")
+        if (
+            not isinstance(text, str)
+            or not isinstance(emotion, str)
+            or (motion is not None and not isinstance(motion, str))
+        ):
             self._send_json(
                 400,
-                {"error": "textとemotionは文字列で指定してください。"},
+                {"error": "text、emotion、motionは文字列で指定してください。"},
             )
             return
 
         try:
-            command, delivered_count = self.runtime.speak(text, emotion)
+            command, delivered_count = self.runtime.speak(text, emotion, motion)
         except ValueError as exc:
             self._send_json(400, {"error": str(exc)})
             return
@@ -257,6 +276,52 @@ class ExternalControlRequestHandler(BaseHTTPRequestHandler):
             200,
             {"command": command, "delivered_clients": delivered_count},
         )
+
+    def _handle_motion(self):
+        body = self._read_json_object()
+        if body is None:
+            return
+        motion = body.get("motion")
+        if not isinstance(motion, str) or not motion.strip():
+            self._send_json(400, {"error": "motionは空でない文字列で指定してください。"})
+            return
+        try:
+            command, delivered_count = self.runtime.move(motion.strip())
+        except ValueError as exc:
+            self._send_json(400, {"error": str(exc)})
+            return
+        self._send_json(
+            200,
+            {"command": command, "delivered_clients": delivered_count},
+        )
+
+    def _read_json_object(self):
+        try:
+            content_length = int(self.headers.get("Content-Length", "0"))
+        except ValueError:
+            self._send_json(400, {"error": "Content-Lengthが不正です。"})
+            return None
+
+        if content_length <= 0 or content_length > 64 * 1024:
+            self._send_json(400, {"error": "リクエスト本文のサイズが不正です。"})
+            return None
+
+        try:
+            body = json.loads(self.rfile.read(content_length).decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            self._send_json(
+                400,
+                {"error": "リクエスト本文をJSONとして読み取れません。"},
+            )
+            return None
+
+        if not isinstance(body, dict):
+            self._send_json(
+                400,
+                {"error": "リクエスト本文はJSONオブジェクトで指定してください。"},
+            )
+            return None
+        return body
 
     def _send_json(self, status_code, body):
         payload = json.dumps(body, ensure_ascii=False).encode("utf-8")
