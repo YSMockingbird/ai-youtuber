@@ -44,6 +44,26 @@ def generate_news_commentary(article):
     return _generate_structured_response(prompt)
 
 
+def generate_autonomous_speech(situation, recent_utterances=None):
+    # コメントへの返答ではない、配信開始や終了などの自発発話を生成します。
+    recent_utterances = recent_utterances or []
+    recent_text = "\n".join(
+        f"- {utterance}" for utterance in recent_utterances[-5:]
+    )
+    if not recent_text:
+        recent_text = "- なし"
+
+    prompt = (
+        "視聴者コメントへの返答ではなく、現在の状況に合う自発的な発話をしてください。\n"
+        "直近の発言と同じ内容を繰り返さず、配信中の自然な一言にしてください。\n\n"
+        f"現在の状況: {situation}\n"
+        f"直近のりんの発言:\n{recent_text}\n\n"
+        "返答は必ず次のJSON形式だけにしてください。\n"
+        '{"text":"AIの発言","emotion":"neutral"}'
+    )
+    return _generate_structured_response(prompt)
+
+
 def _generate_structured_response(prompt):
     # .envから読み込まれたAPIキーとモデル名を使います。
     api_key = os.getenv("OPENAI_API_KEY", "").strip()

@@ -5,7 +5,11 @@ import time
 from dotenv import load_dotenv
 
 from aivis_speech import AivisSpeechClient, DEFAULT_AIVIS_API_URL
-from ai_response import generate_ai_response, generate_news_commentary
+from ai_response import (
+    generate_ai_response,
+    generate_autonomous_speech,
+    generate_news_commentary,
+)
 from control_server import ALLOWED_EMOTIONS, ExternalControlServer
 from news_source import fetch_news_articles, select_news_article
 from youtube_chat import fetch_chat_messages, get_live_chat_id, iter_chat_messages
@@ -123,13 +127,12 @@ def start_external_control_server():
     version = client.get_version()
     speaker_id = get_aivis_speaker_id(client)
     port = get_control_server_port()
-    server = ExternalControlServer(
-        aivis_client=client,
-        speaker_id=speaker_id,
-        port=port,
-    )
-
     try:
+        server = ExternalControlServer(
+            aivis_client=client,
+            speaker_id=speaker_id,
+            port=port,
+        )
         server.start()
     except OSError as exc:
         raise RuntimeError(
@@ -272,6 +275,101 @@ def run_news_voice_test():
             article,
         )
         print_news_commentary(article, ai_response, delivered_count)
+    finally:
+        server.stop()
+        print("外部制御サーバーを停止しました。")
+
+
+def get_mock_live_delay_seconds(override=None):
+    raw_delay = (
+        str(override)
+        if override is not None
+        else os.getenv("MOCK_LIVE_DELAY_SECONDS", "15").strip()
+    )
+    try:
+        delay_seconds = float(raw_delay)
+    except ValueError as exc:
+        raise RuntimeError("MOCK_LIVE_DELAY_SECONDSは数値で設定してください。") from exc
+    if not 0 <= delay_seconds <= 60:
+        raise RuntimeError("MOCK_LIVE_DELAY_SECONDSは0〜60秒で設定してください。")
+    return delay_seconds
+
+
+def deliver_autonomous_speech(runtime, situation, recent_utterances):
+    ai_response = generate_autonomous_speech(situation, recent_utterances)
+    _, delivered_count = runtime.speak(
+        ai_response["text"],
+        ai_response["emotion"],
+    )
+    recent_utterances.append(ai_response["text"])
+    return ai_response, delivered_count
+
+
+def run_mock_live(delay_override=None):
+    # YouTubeを使わず、配信開始から終了までの主要な発話経路を再現します。
+    delay_seconds = get_mock_live_delay_seconds(delay_override)
+    server, version, speaker_id, port = start_external_control_server()
+    recent_utterances = []
+    mock_comments = [
+        ("初見さん", "初見です。今日の配信を楽しみにしていました"),
+        ("ゲーム好き", "りんはどんなゲームが好き？"),
+        ("仕事帰り", "今日も残業で疲れたよ"),
+    ]
+
+    print_external_control_server_info(version, speaker_id, port)
+    print("模擬ライブを開始します。終了する場合はCtrl+Cを押してください。")
+    print(f"発話間隔：{delay_seconds}秒")
+
+    try:
+        opening_response, delivered_count = deliver_autonomous_speech(
+            server.runtime,
+            "配信を開始した直後。視聴者を短く歓迎する",
+            recent_utterances,
+        )
+        print("--- 配信開始 ---")
+        print(f"AI：{opening_response['text']}")
+        print(f"emotion：{opening_response['emotion']}")
+        print(f"接続中クライアント数：{delivered_count}")
+
+        for user_name, comment in mock_comments:
+            time.sleep(delay_seconds)
+            ai_response, delivered_count = generate_and_deliver_ai_response(
+                server.runtime,
+                user_name,
+                comment,
+            )
+            recent_utterances.append(ai_response["text"])
+            print("--- ダミーコメント ---")
+            print(f"{user_name}：{comment}")
+            print(f"AI：{ai_response['text']}")
+            print(f"emotion：{ai_response['emotion']}")
+            print(f"接続中クライアント数：{delivered_count}")
+
+        time.sleep(delay_seconds)
+        article = get_unused_news_article()
+        news_response, delivered_count = generate_and_deliver_news_commentary(
+            server.runtime,
+            article,
+        )
+        recent_utterances.append(news_response["text"])
+        print("--- コメントがない時間のニュース雑談 ---")
+        print_news_commentary(article, news_response, delivered_count)
+
+        time.sleep(delay_seconds)
+        closing_response, delivered_count = deliver_autonomous_speech(
+            server.runtime,
+            "模擬配信を終了する直前。視聴者へ感謝して、短く別れを告げる",
+            recent_utterances,
+        )
+        print("--- 配信終了 ---")
+        print(f"AI：{closing_response['text']}")
+        print(f"emotion：{closing_response['emotion']}")
+        print(f"接続中クライアント数：{delivered_count}")
+        # 最後の音声をクライアントが取得する前にサーバーが終了するのを防ぎます。
+        shutdown_grace_seconds = min(max(delay_seconds, 1), 5)
+        time.sleep(shutdown_grace_seconds)
+    except KeyboardInterrupt:
+        print("\n終了操作を受け付けました。")
     finally:
         server.stop()
         print("外部制御サーバーを停止しました。")
@@ -500,6 +598,7 @@ def parse_args():
             "news-test",
             "news-voice",
             "ai-youtuber-live",
+            "mock-live",
         ],
         default="openai-test",
         help="実行する確認処理を選びます。",
@@ -509,6 +608,12 @@ def parse_args():
         type=int,
         default=3,
         help="youtube-loopまたはai-youtuber-loopモードでコメント取得を繰り返す回数です。",
+    )
+    parser.add_argument(
+        "--mock-delay-seconds",
+        type=float,
+        default=None,
+        help="mock-liveモードで各発話の間に待つ秒数です。",
     )
     return parser.parse_args()
 
@@ -543,6 +648,8 @@ def main():
             run_news_voice_test()
         elif args.mode == "ai-youtuber-live":
             run_ai_youtuber_live(args.max_loops)
+        elif args.mode == "mock-live":
+            run_mock_live(args.mock_delay_seconds)
     except (RuntimeError, ValueError) as exc:
         print(f"エラー: {exc}")
         return

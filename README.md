@@ -183,3 +183,31 @@ AUTONOMOUS_SPEECH_INTERVAL_SECONDS=600
 
 コメントがある場合はコメントへの返答を優先します。ニュースのタイトル、
 配信元、公開日時、参照URLは確認できるようターミナルへ表示します。
+
+## YouTubeを使わない模擬ライブ
+
+実際のYouTube Liveを始める前に、開始挨拶、ダミーコメントへの返答、
+ニュース雑談、終了挨拶を順番に実行できます。AivisSpeechとAITuber OnAirを
+起動してから実行してください。
+
+```bash
+.venv/bin/python main.py --mode mock-live
+```
+
+各発話の待ち時間は `.env` またはコマンド引数で変更できます。
+
+```dotenv
+MOCK_LIVE_DELAY_SECONDS=15
+```
+
+動作経路だけを短時間で確認する場合は、次のように指定します。
+
+```bash
+.venv/bin/python main.py --mode mock-live --mock-delay-seconds 1
+```
+
+短い待ち時間では音声が重なる可能性があります。音声と表情の見た目を確認する
+場合は、既定の15秒を使用してください。
+
+途中で終了する場合は `Ctrl+C` を押します。OpenAI APIは開始挨拶、
+ダミーコメント3件、ニュース雑談、終了挨拶の合計6回呼び出されます。

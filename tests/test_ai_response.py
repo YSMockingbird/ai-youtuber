@@ -1,7 +1,11 @@
 import unittest
 from unittest.mock import patch
 
-from ai_response import generate_news_commentary, parse_ai_response
+from ai_response import (
+    generate_autonomous_speech,
+    generate_news_commentary,
+    parse_ai_response,
+)
 
 
 class ParseAiResponseTest(unittest.TestCase):
@@ -43,6 +47,26 @@ class ParseAiResponseTest(unittest.TestCase):
         self.assertIn("配信元: テストニュース", prompt)
         self.assertIn("タイトル: 新しい技術が発表", prompt)
         self.assertEqual(response["emotion"], "surprised")
+
+    @patch("ai_response._generate_structured_response")
+    def test_autonomous_speech_receives_situation_and_recent_speech(
+        self,
+        generate_mock,
+    ):
+        generate_mock.return_value = {
+            "text": "今日も始めようか。",
+            "emotion": "happy",
+        }
+
+        response = generate_autonomous_speech(
+            "配信開始直後",
+            ["前回の発言"],
+        )
+
+        prompt = generate_mock.call_args.args[0]
+        self.assertIn("現在の状況: 配信開始直後", prompt)
+        self.assertIn("- 前回の発言", prompt)
+        self.assertEqual(response["emotion"], "happy")
 
 
 if __name__ == "__main__":
