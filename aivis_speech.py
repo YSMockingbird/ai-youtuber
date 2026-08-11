@@ -7,6 +7,19 @@ VOICE_SETTINGS_BY_EMOTION = {
         "speedScale": 1.2,
     },
 }
+PRONUNCIATION_REPLACEMENTS = (
+    ("才羽 ガン奈", "さいばね がんな"),
+    ("才羽ガン奈", "さいばね がんな"),
+    ("才羽", "さいばね"),
+)
+
+
+def apply_pronunciation_replacements(text):
+    # 字幕の表記は変えず、音声合成へ渡す文章の読みだけを補正します。
+    speech_text = text
+    for source, pronunciation in PRONUNCIATION_REPLACEMENTS:
+        speech_text = speech_text.replace(source, pronunciation)
+    return speech_text
 
 
 class AivisSpeechClient:
@@ -69,10 +82,12 @@ class AivisSpeechClient:
         if not isinstance(speaker_id, int):
             raise ValueError("AivisSpeechのスタイルIDは整数で指定してください。")
 
+        speech_text = apply_pronunciation_replacements(normalized_text)
+
         query_response = self._request(
             "POST",
             "/audio_query",
-            params={"text": normalized_text, "speaker": speaker_id},
+            params={"text": speech_text, "speaker": speaker_id},
         )
         try:
             audio_query = query_response.json()

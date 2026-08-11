@@ -1,10 +1,20 @@
 import unittest
 from unittest.mock import Mock, patch
 
-from aivis_speech import AivisSpeechClient
+from aivis_speech import AivisSpeechClient, apply_pronunciation_replacements
 
 
 class AivisSpeechClientTest(unittest.TestCase):
+    def test_character_name_pronunciation_is_replaced(self):
+        self.assertEqual(
+            apply_pronunciation_replacements("才羽 ガン奈です"),
+            "さいばね がんなです",
+        )
+        self.assertEqual(
+            apply_pronunciation_replacements("才羽の配信です"),
+            "さいばねの配信です",
+        )
+
     @patch("aivis_speech.requests.request")
     def test_get_styles_flattens_speakers(self, request_mock):
         response = Mock()
@@ -66,6 +76,24 @@ class AivisSpeechClientTest(unittest.TestCase):
 
         synthesis_request = request_mock.call_args_list[1]
         self.assertEqual(synthesis_request.kwargs["json"]["speedScale"], 1.0)
+
+    @patch("aivis_speech.requests.request")
+    def test_synthesize_sends_corrected_pronunciation(self, request_mock):
+        query_response = Mock()
+        query_response.json.return_value = {"speedScale": 1.0}
+        synthesis_response = Mock()
+        synthesis_response.content = b"RIFF-test-wav"
+        request_mock.side_effect = [query_response, synthesis_response]
+
+        client = AivisSpeechClient()
+
+        client.synthesize("才羽 ガン奈です", 101)
+
+        audio_query_request = request_mock.call_args_list[0]
+        self.assertEqual(
+            audio_query_request.kwargs["params"]["text"],
+            "さいばね がんなです",
+        )
 
 
 if __name__ == "__main__":
