@@ -1,6 +1,10 @@
 import unittest
 
-from control_server import AudioStore, ExternalControlRuntime
+from control_server import (
+    AudioStore,
+    ExternalControlRuntime,
+    normalize_motion_command,
+)
 
 
 class FakeAivisSpeechClient:
@@ -55,6 +59,59 @@ class ExternalControlRuntimeTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "未対応のemotion"):
             runtime.speak("こんにちは", "unknown")
 
+    def test_speak_publishes_subtitle(self):
+        runtime = ExternalControlRuntime(
+            aivis_client=FakeAivisSpeechClient(),
+            speaker_id=101,
+            public_base_url="http://127.0.0.1:8765",
+        )
+        subtitle_subscriber = runtime.subtitle_event_broker.subscribe()
+
+        command, _ = runtime.speak("字幕テスト", "surprised")
+        subtitle_command = subtitle_subscriber.get_nowait()
+
+        self.assertEqual(
+            subtitle_command,
+            {
+                "type": "subtitle",
+                "id": command["id"],
+                "text": "字幕テスト",
+                "emotion": "surprised",
+            },
+        )
+
+    def test_subtitle_is_replayed_to_reconnected_client(self):
+        runtime = ExternalControlRuntime(
+            aivis_client=FakeAivisSpeechClient(),
+            speaker_id=101,
+            public_base_url="http://127.0.0.1:8765",
+        )
+
+        runtime.speak("再接続後も表示", "neutral")
+        subtitle_subscriber = runtime.subtitle_event_broker.subscribe()
+
+        self.assertEqual(
+            subtitle_subscriber.get_nowait()["text"],
+            "再接続後も表示",
+        )
+
+    def test_reset_clears_subtitle(self):
+        runtime = ExternalControlRuntime(
+            aivis_client=FakeAivisSpeechClient(),
+            speaker_id=101,
+            public_base_url="http://127.0.0.1:8765",
+        )
+        subtitle_subscriber = runtime.subtitle_event_broker.subscribe()
+        runtime.speak("消去対象", "neutral")
+        subtitle_subscriber.get_nowait()
+
+        reset_command, _ = runtime.reset()
+
+        self.assertEqual(
+            subtitle_subscriber.get_nowait(),
+            {"type": "clear", "id": reset_command["id"]},
+        )
+
     def test_speak_can_include_body_motion(self):
         runtime = ExternalControlRuntime(
             aivis_client=FakeAivisSpeechClient(),
@@ -68,6 +125,23 @@ class ExternalControlRuntimeTest(unittest.TestCase):
         self.assertEqual(delivered_count, 1)
         self.assertEqual(command["motion"], "greeting")
         self.assertEqual(subscriber.get_nowait(), command)
+
+    def test_speak_can_include_parameterized_motion(self):
+        runtime = ExternalControlRuntime(
+            aivis_client=FakeAivisSpeechClient(),
+            speaker_id=101,
+            public_base_url="http://127.0.0.1:8765",
+        )
+        motion = {
+            "name": "model_pose",
+            "speed": 0.9,
+            "intensity": 0.7,
+            "head": "tilt_left",
+        }
+
+        command, _ = runtime.speak("決めるよ", "happy", motion)
+
+        self.assertEqual(command["motion"], motion)
 
     def test_move_publishes_motion_without_audio(self):
         runtime = ExternalControlRuntime(
@@ -93,6 +167,17 @@ class ExternalControlRuntimeTest(unittest.TestCase):
 
         with self.assertRaisesRegex(ValueError, "未対応のmotion"):
             runtime.move("unknown_motion")
+
+    def test_invalid_parameterized_motion_is_rejected(self):
+        with self.assertRaisesRegex(ValueError, "motion.speed"):
+            normalize_motion_command(
+                {
+                    "name": "greeting",
+                    "speed": 2.0,
+                    "intensity": 0.8,
+                    "head": "nod",
+                }
+            )
 
     def test_speak_is_delivered_only_to_latest_subscriber(self):
         runtime = ExternalControlRuntime(

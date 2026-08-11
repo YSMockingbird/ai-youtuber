@@ -14,7 +14,11 @@ class CharacterPromptTest(unittest.TestCase):
             "neutral、happy、angry、sad、surprised、relaxed",
             CHARACTER_PROMPT,
         )
-        self.assertIn("JSONのキーは必ずtextとemotionだけ", CHARACTER_PROMPT)
+        self.assertIn(
+            "JSONのキーは必ずtext、emotion、motion、memory_candidateにする",
+            CHARACTER_PROMPT,
+        )
+        self.assertIn("shootは自動選択しない", CHARACTER_PROMPT)
 
     def test_emotion_selection_does_not_default_to_neutral(self):
         self.assertIn("neutralを安全な既定値として選ばず", CHARACTER_PROMPT)

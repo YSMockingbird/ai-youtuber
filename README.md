@@ -1,6 +1,6 @@
 # AI YouTuber
 
-YouTube Liveのコメントを取得し、OpenAI APIで返答を生成します。AivisSpeechで音声を生成し、SSE経由でAITuber OnAirのVRMを外部制御できます。
+YouTube Liveのコメントを取得し、設定されたLLMで返答を生成します。AivisSpeechで音声を生成し、SSE経由でAITuber OnAirのVRMを外部制御できます。
 
 長期的な目標とプロジェクトの判断基準は [VISION.md](VISION.md) に記載しています。
 
@@ -8,15 +8,15 @@ YouTube Liveのコメントを取得し、OpenAI APIで返答を生成します�
 
 - YouTube Liveコメントの取得
 - 返答対象コメントの選択
-- OpenAI APIによる返答生成
+- LLMによる返答生成
+- 短期会話、配信メモ、SQLite長期記憶
+- 無言時間を抑える自発発話
 - ターミナルへの表示
 
 ## 現在未対応のもの
 
 - Live2D
 - OBS連携
-- 長期記憶
-- データベース
 - Webアプリ化
 - Docker
 - クラウド実行
@@ -112,6 +112,15 @@ http://127.0.0.1:8765/events
 
 サーバーを起動したターミナルへ文章を入力すると、AivisSpeechで音声を生成し、AITuber OnAirへ字幕・感情・音声を送信します。
 
+OBSで字幕を独立したブラウザソースとして表示する場合は、次のURLを追加します。
+
+```text
+http://127.0.0.1:8765/overlay
+```
+
+ブラウザソースの幅と高さは配信キャンバスと同じ値にします。AITuber OnAirの
+Visual設定では「ソロ配信で内蔵字幕を表示」をオフにしてください。
+
 ```text
 発話> こんにちは、今日は何をしようかな。
 発話> /emotion surprised えっ、それ本当なの？
@@ -179,11 +188,13 @@ AivisSpeechとAITuber OnAirまで含めて確認する場合は、両方を起�
 ```dotenv
 NEWS_RSS_URL=https://www.digital.go.jp/rss/news.xml
 NEWS_TIMEOUT_SECONDS=10
-AUTONOMOUS_SPEECH_INTERVAL_SECONDS=600
 ```
 
-`AUTONOMOUS_SPEECH_INTERVAL_SECONDS` は、コメントも発話もない状態で
-ニュース雑談を始めるまでの秒数です。60〜3600秒で設定します。
+自発発話、コンテキスト予算、記憶件数は`config/llm_config.json`で管理します。
+既定では、前の音声の終了見込みから3秒間コメントも発話もない場合に
+自発雑談を生成します。ニュース、雑学、身近な観察、キャラクターらしい考察を
+設定された重みに従ってランダムに選び、直前と同じ種類は避けます。
+コメントがない間は視聴者へ呼びかけず、独り言を基本とします。
 
 ライブコメントへの返答とニュース自発発話を、音声とVRM制御までまとめて
 実行する場合は次のモードを使用します。
@@ -194,6 +205,22 @@ AUTONOMOUS_SPEECH_INTERVAL_SECONDS=600
 
 コメントがある場合はコメントへの返答を優先します。ニュースのタイトル、
 配信元、公開日時、参照URLは確認できるようターミナルへ表示します。
+
+## LLMコンテキストと記憶
+
+固定人格は`config/character_prompt.txt`、LLM関連設定は
+`config/llm_config.json`で管理します。現在のプロバイダーはOpenAIです。
+`.env`の`LLM_PROVIDER=openai`で明示できます。GroqとGeminiはプロバイダー決定後に
+対応クライアントを追加します。
+
+LLMへ渡す情報は、関連する視聴者記憶、上限付き配信メモ、直近会話、今回の入力に
+分けます。System Promptと今回の入力は削らず、設定された総トークン予算を超える
+場合は意味のあるエラーを出します。プロバイダー未確定のため、事前計算には日本語を
+多めに見積もる近似値を使います。
+
+長期記憶は既定で`data/memory.db`へ保存します。表示名ではなくYouTube Channel IDで
+視聴者を識別し、重要度が設定値以上で、機密情報を含まない記憶候補だけを保存します。
+DBファイルはGit管理対象外です。
 
 ## YouTubeを使わない模擬ライブ
 

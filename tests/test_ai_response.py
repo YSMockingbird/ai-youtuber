@@ -19,8 +19,41 @@ class ParseAiResponseTest(unittest.TestCase):
             {
                 "text": "ゆっくりしていってね。",
                 "emotion": "relaxed",
+                "motion": None,
             },
         )
+
+    def test_parameterized_motion_is_allowed(self):
+        response = parse_ai_response(
+            '{"text":"決めるよ。","emotion":"happy","motion":'
+            '{"name":"model_pose","speed":0.9,"intensity":0.7,'
+            '"head":"tilt_left"}}'
+        )
+
+        self.assertEqual(response["motion"]["name"], "model_pose")
+        self.assertEqual(response["motion"]["head"], "tilt_left")
+
+    def test_memory_candidate_is_allowed(self):
+        response = parse_ai_response(
+            '{"text":"北海道が好きなんだね。","emotion":"happy",'
+            '"motion":null,"memory_candidate":'
+            '{"content":"北海道旅行が好き","category":"preference",'
+            '"importance":0.8}}'
+        )
+
+        self.assertEqual(
+            response["memory_candidate"]["content"],
+            "北海道旅行が好き",
+        )
+
+    def test_invalid_motion_is_ignored_without_losing_speech(self):
+        response = parse_ai_response(
+            '{"text":"普通に話すよ。","emotion":"neutral","motion":'
+            '{"name":"unknown","speed":2,"intensity":2,"head":"none"}}'
+        )
+
+        self.assertEqual(response["text"], "普通に話すよ。")
+        self.assertIsNone(response["motion"])
 
     def test_thinking_emotion_is_rejected(self):
         with self.assertRaisesRegex(RuntimeError, "emotionが不正"):
@@ -61,11 +94,14 @@ class ParseAiResponseTest(unittest.TestCase):
         response = generate_autonomous_speech(
             "配信開始直後",
             ["前回の発言"],
+            topic_instruction="役立つ雑学を一つ話す",
         )
 
         prompt = generate_mock.call_args.args[0]
         self.assertIn("現在の状況: 配信開始直後", prompt)
         self.assertIn("- 前回の発言", prompt)
+        self.assertIn("今回の話題方針: 役立つ雑学を一つ話す", prompt)
+        self.assertIn("視聴者がいると決めつけず", prompt)
         self.assertEqual(response["emotion"], "happy")
 
 

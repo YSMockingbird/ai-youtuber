@@ -95,6 +95,7 @@ def fetch_chat_messages(live_chat_id, page_token=None):
         messages.append(
             {
                 "message_id": item.get("id", ""),
+                "user_id": author_details.get("channelId", ""),
                 "user_name": author_details.get("displayName", "unknown"),
                 "comment": snippet.get("displayMessage", ""),
                 "published_at": snippet.get("publishedAt", ""),

@@ -63,7 +63,7 @@ class AivisSpeechClientTest(unittest.TestCase):
         self.assertEqual(synthesis_request.kwargs["json"]["speedScale"], 1.2)
 
     @patch("aivis_speech.requests.request")
-    def test_non_neutral_emotion_keeps_default_speed(self, request_mock):
+    def test_non_neutral_emotion_uses_common_speed(self, request_mock):
         query_response = Mock()
         query_response.json.return_value = {"speedScale": 1.0}
         synthesis_response = Mock()
@@ -75,7 +75,7 @@ class AivisSpeechClientTest(unittest.TestCase):
         client.synthesize("うれしいな", 101, "happy")
 
         synthesis_request = request_mock.call_args_list[1]
-        self.assertEqual(synthesis_request.kwargs["json"]["speedScale"], 1.0)
+        self.assertEqual(synthesis_request.kwargs["json"]["speedScale"], 1.2)
 
     @patch("aivis_speech.requests.request")
     def test_synthesize_sends_corrected_pronunciation(self, request_mock):

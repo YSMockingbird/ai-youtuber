@@ -2,11 +2,8 @@ import requests
 
 
 DEFAULT_AIVIS_API_URL = "http://127.0.0.1:10101"
-VOICE_SETTINGS_BY_EMOTION = {
-    "neutral": {
-        "speedScale": 1.2,
-    },
-}
+DEFAULT_VOICE_SPEED_SCALE = 1.2
+VOICE_SETTINGS_BY_EMOTION = {}
 PRONUNCIATION_REPLACEMENTS = (
     ("才羽 ガン奈", "さいばね がんな"),
     ("才羽ガン奈", "さいばね がんな"),
@@ -96,8 +93,11 @@ class AivisSpeechClient:
                 "AivisSpeechの音声合成クエリをJSONとして読み取れませんでした。"
             ) from exc
 
-        # 感情ごとの音声設定を、AivisSpeechの既定クエリへ上書きします。
-        voice_settings = VOICE_SETTINGS_BY_EMOTION.get(emotion, {})
+        # 全感情の基準話速を適用し、必要な場合だけ感情別設定で上書きします。
+        voice_settings = {
+            "speedScale": DEFAULT_VOICE_SPEED_SCALE,
+            **VOICE_SETTINGS_BY_EMOTION.get(emotion, {}),
+        }
         audio_query.update(voice_settings)
 
         synthesis_response = self._request(

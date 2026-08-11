@@ -10,8 +10,13 @@ from ai_response import (
     generate_autonomous_speech,
     generate_news_commentary,
 )
+from autonomous_topics import AutonomousTopicSelector, TOPIC_INSTRUCTIONS
 from control_server import ALLOWED_EMOTIONS, ExternalControlServer
+from llm.config import load_llm_config
+from llm.session import StreamContextManager
+from motion_control import MotionRateLimiter
 from news_source import fetch_news_articles, select_news_article
+from speech_scheduler import SpeechScheduler
 from youtube_chat import fetch_chat_messages, get_live_chat_id, iter_chat_messages
 
 
@@ -25,6 +30,7 @@ def run_openai_test():
     print(f"{user_name}：{comment}")
     print(f"AI：{ai_response['text']}")
     print(f"emotion：{ai_response['emotion']}")
+    print(f"motion：{ai_response['motion']}")
 
 
 def create_aivis_client():
@@ -148,6 +154,7 @@ def print_external_control_server_info(version, speaker_id, port):
         f"AivisSpeech={version} speaker_id={speaker_id}"
     )
     print(f"SSE URL: http://127.0.0.1:{port}/events")
+    print(f"OBS字幕URL: http://127.0.0.1:{port}/overlay")
     print(f"確認URL: http://127.0.0.1:{port}/health")
 
 
@@ -195,14 +202,50 @@ def run_external_control_server():
         print("外部制御サーバーを停止しました。")
 
 
-def generate_and_deliver_ai_response(runtime, user_name, comment):
-    # OpenAIの返答結果をそのままAivisSpeechとAITuber OnAirへ渡します。
-    ai_response = generate_ai_response(user_name, comment)
-    _, delivered_count = runtime.speak(
-        ai_response["text"],
-        ai_response["emotion"],
+def deliver_generated_response(runtime, ai_response):
+    # ランタイムごとにモーション間隔を管理し、発話経路を共通化します。
+    runtime_state = vars(runtime)
+    motion_limiter = runtime_state.get("_ai_motion_limiter")
+    if not isinstance(motion_limiter, MotionRateLimiter):
+        motion_limiter = MotionRateLimiter()
+        runtime_state["_ai_motion_limiter"] = motion_limiter
+
+    filtered_response = dict(ai_response)
+    filtered_response["motion"] = motion_limiter.filter(
+        ai_response.get("motion")
     )
-    return ai_response, delivered_count
+    _, delivered_count = runtime.speak(
+        filtered_response["text"],
+        filtered_response["emotion"],
+        filtered_response["motion"],
+    )
+    return filtered_response, delivered_count
+
+
+def generate_and_deliver_ai_response(
+    runtime,
+    user_name,
+    comment,
+    user_id="",
+    stream_context=None,
+):
+    # LLMの返答結果をそのままAivisSpeechとAITuber OnAirへ渡します。
+    if stream_context is None:
+        ai_response = generate_ai_response(user_name, comment)
+    else:
+        ai_response = generate_ai_response(
+            user_name,
+            comment,
+            context_builder=stream_context.context_builder,
+            user_id=user_id,
+        )
+        stream_context.record_comment_exchange(
+            user_id,
+            user_name,
+            comment,
+            ai_response,
+        )
+    return deliver_generated_response(runtime, ai_response)
 
 
 def get_autonomous_speech_interval_seconds():
@@ -246,14 +289,21 @@ def print_news_commentary(article, ai_response, delivered_count=None):
         print(f"接続中クライアント数：{delivered_count}")
 
 
-def generate_and_deliver_news_commentary(runtime, article):
+def generate_and_deliver_news_commentary(
+    runtime,
+    article,
+    stream_context=None,
+):
     # ニュース雑談を生成し、AivisSpeechとAITuber OnAirへ渡します。
-    ai_response = generate_news_commentary(article)
-    _, delivered_count = runtime.speak(
-        ai_response["text"],
-        ai_response["emotion"],
+    ai_response = generate_news_commentary(
+        article,
+        context_builder=(
+            stream_context.context_builder if stream_context else None
+        ),
     )
-    return ai_response, delivered_count
+    if stream_context is not None:
+        stream_context.record_ai_speech(ai_response["text"])
+    return deliver_generated_response(runtime, ai_response)
 
 
 def run_news_test():
@@ -295,14 +345,23 @@ def get_mock_live_delay_seconds(override=None):
     return delay_seconds
 
 
-def deliver_autonomous_speech(runtime, situation, recent_utterances):
-    ai_response = generate_autonomous_speech(situation, recent_utterances)
-    _, delivered_count = runtime.speak(
-        ai_response["text"],
-        ai_response["emotion"],
+def deliver_autonomous_speech(
+    runtime,
+    situation,
+    recent_utterances,
+    stream_context=None,
+):
+    ai_response = generate_autonomous_speech(
+        situation,
+        recent_utterances,
+        context_builder=(
+            stream_context.context_builder if stream_context else None
+        ),
     )
     recent_utterances.append(ai_response["text"])
-    return ai_response, delivered_count
+    if stream_context is not None:
+        stream_context.record_ai_speech(ai_response["text"])
+    return deliver_generated_response(runtime, ai_response)
 
 
 def run_mock_live(delay_override=None):
@@ -504,16 +563,24 @@ def run_ai_youtuber_once():
 
 
 def run_ai_youtuber_loop(max_loops, runtime=None):
-    # コメントを優先し、無言時間が続いた場合はニュースから自発発話します。
+    # コメントを優先し、音声終了後の無言時間が続いたら自発発話します。
     live_chat_id = get_live_chat_id()
     processed_message_ids = set()
     used_news_links = set()
-    interval_seconds = get_autonomous_speech_interval_seconds()
-    last_speech_at = time.monotonic()
+    llm_config = load_llm_config()
+    stream_context = StreamContextManager(config=llm_config)
+    speech_scheduler = SpeechScheduler.from_config(llm_config)
+    topic_selector = AutonomousTopicSelector(llm_config)
+    recent_utterances = []
+    previous_autonomous_topic = None
+    has_received_comment = False
 
     print("AI YouTuberループを開始します。")
     print(f"最大取得回数：{max_loops}")
-    print(f"ニュース自発発話間隔：{interval_seconds}秒")
+    print(
+        "自発発話の無言時間："
+        f"{speech_scheduler.silence_seconds:g}秒（音声終了見込みから計測）"
+    )
 
     for index, result in enumerate(iter_chat_messages(live_chat_id, max_loops=max_loops), start=1):
         messages = [
@@ -530,43 +597,109 @@ def run_ai_youtuber_loop(max_loops, runtime=None):
 
         if target_message is None:
             print("返答対象のコメントはありませんでした。")
-            if time.monotonic() - last_speech_at < interval_seconds:
+            if not speech_scheduler.should_speak_autonomously():
+                print(
+                    "次の自発発話まで："
+                    f"約{speech_scheduler.seconds_until_autonomous_speech()}秒"
+                )
                 continue
 
             try:
-                article = get_unused_news_article(used_news_links)
-                ai_response = generate_news_commentary(article)
+                selected_topic = topic_selector.select(
+                    previous_autonomous_topic
+                )
+                article = None
+                if selected_topic == "news":
+                    try:
+                        article = get_unused_news_article(used_news_links)
+                    except RuntimeError as exc:
+                        print(
+                            "ニュースを取得できないため雑学へ切り替えます: "
+                            f"{exc}"
+                        )
+                        selected_topic = "trivia"
+
+                if selected_topic == "news":
+                    ai_response = generate_news_commentary(
+                        article,
+                        context_builder=stream_context.context_builder,
+                    )
+                    used_news_links.add(article["link"])
+                else:
+                    audience_situation = (
+                        "配信開始後、まだコメントは一件もない。"
+                        "視聴者がいない前提で独り言を話す"
+                        if not has_received_comment
+                        else
+                        "現在はコメントが途切れている。"
+                        "誰かに回答せず、独り言を続ける"
+                    )
+                    ai_response = generate_autonomous_speech(
+                        audience_situation,
+                        recent_utterances,
+                        context_builder=stream_context.context_builder,
+                        topic_instruction=TOPIC_INSTRUCTIONS[selected_topic],
+                    )
+
                 delivered_count = None
                 if runtime is not None:
-                    _, delivered_count = runtime.speak(
-                        ai_response["text"],
-                        ai_response["emotion"],
+                    ai_response, delivered_count = deliver_generated_response(
+                        runtime, ai_response
                     )
-                used_news_links.add(article["link"])
-                print_news_commentary(
-                    article,
-                    ai_response,
-                    delivered_count,
+                stream_context.record_ai_speech(ai_response["text"])
+                recent_utterances.append(ai_response["text"])
+                recent_utterances = recent_utterances[-8:]
+                estimated_duration = speech_scheduler.record_speech(
+                    ai_response["text"]
                 )
+                previous_autonomous_topic = selected_topic
+                if selected_topic == "news":
+                    print_news_commentary(
+                        article,
+                        ai_response,
+                        delivered_count,
+                    )
+                else:
+                    print(f"--- 自発雑談 / 種類：{selected_topic} ---")
+                    print(f"AI：{ai_response['text']}")
+                    print(f"emotion：{ai_response['emotion']}")
+                    print(f"motion：{ai_response.get('motion')}")
+                    if delivered_count is not None:
+                        print(f"接続中クライアント数：{delivered_count}")
+                print(f"推定音声時間：{estimated_duration:.1f}秒")
             except (RuntimeError, ValueError) as exc:
-                print(f"ニュース自発発話エラー: {exc}")
-            finally:
-                # 失敗時も次の取得ですぐ再試行せず、設定間隔を空けます。
-                last_speech_at = time.monotonic()
+                print(f"自発発話エラー: {exc}")
+                # 失敗時は固定時間だけ待ち、取得ループごとの連続再試行を防ぎます。
+                speech_scheduler.record_failed_attempt(retry_seconds=10)
             continue
 
-        ai_response = generate_ai_response(target_message["user_name"], target_message["comment"])
+        ai_response = generate_ai_response(
+            target_message["user_name"],
+            target_message["comment"],
+            context_builder=stream_context.context_builder,
+            user_id=target_message.get("user_id", ""),
+        )
+        has_received_comment = True
 
         print(f"{target_message['user_name']}：{target_message['comment']}")
         print(f"AI：{ai_response['text']}")
         print(f"emotion：{ai_response['emotion']}")
         if runtime is not None:
-            _, delivered_count = runtime.speak(
-                ai_response["text"],
-                ai_response["emotion"],
+            ai_response, delivered_count = deliver_generated_response(
+                runtime,
+                ai_response,
             )
+            print(f"motion：{ai_response['motion']}")
             print(f"接続中クライアント数：{delivered_count}")
-        last_speech_at = time.monotonic()
+        stream_context.record_comment_exchange(
+            target_message.get("user_id", ""),
+            target_message["user_name"],
+            target_message["comment"],
+            ai_response,
+        )
+        recent_utterances.append(ai_response["text"])
+        recent_utterances = recent_utterances[-8:]
+        speech_scheduler.record_speech(ai_response["text"])
 
 
 def run_ai_youtuber_live(max_loops):

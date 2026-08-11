@@ -6,6 +6,7 @@ from main import (
     generate_and_deliver_news_commentary,
     get_autonomous_speech_interval_seconds,
     get_mock_live_delay_seconds,
+    run_ai_youtuber_loop,
     run_mock_live,
 )
 
@@ -16,6 +17,12 @@ class GenerateAndDeliverAiResponseTest(unittest.TestCase):
         generate_mock.return_value = {
             "text": "今日は調子がいいよ。",
             "emotion": "happy",
+            "motion": {
+                "name": "peace_sign",
+                "speed": 1.0,
+                "intensity": 0.8,
+                "head": "nod",
+            },
         }
         runtime = Mock()
         runtime.speak.return_value = ({"type": "speak"}, 1)
@@ -30,7 +37,16 @@ class GenerateAndDeliverAiResponseTest(unittest.TestCase):
             "テストユーザー",
             "今日の調子はどう？",
         )
-        runtime.speak.assert_called_once_with("今日は調子がいいよ。", "happy")
+        runtime.speak.assert_called_once_with(
+            "今日は調子がいいよ。",
+            "happy",
+            {
+                "name": "peace_sign",
+                "speed": 1.0,
+                "intensity": 0.8,
+                "head": "nod",
+            },
+        )
         self.assertEqual(response["emotion"], "happy")
         self.assertEqual(delivered_count, 1)
 
@@ -39,6 +55,7 @@ class GenerateAndDeliverAiResponseTest(unittest.TestCase):
         generate_mock.return_value = {
             "text": "新しい技術、少し気になるね。",
             "emotion": "surprised",
+            "motion": None,
         }
         runtime = Mock()
         runtime.speak.return_value = ({"type": "speak"}, 1)
@@ -51,6 +68,7 @@ class GenerateAndDeliverAiResponseTest(unittest.TestCase):
         runtime.speak.assert_called_once_with(
             "新しい技術、少し気になるね。",
             "surprised",
+            None,
         )
         self.assertEqual(response["emotion"], "surprised")
         self.assertEqual(delivered_count, 1)
@@ -76,6 +94,57 @@ class GenerateAndDeliverAiResponseTest(unittest.TestCase):
     def test_too_long_mock_live_delay_is_rejected(self):
         with self.assertRaisesRegex(RuntimeError, "0〜60秒"):
             get_mock_live_delay_seconds(61)
+
+    @patch("main.generate_autonomous_speech")
+    @patch("main.SpeechScheduler.from_config")
+    @patch("main.StreamContextManager")
+    @patch("main.load_llm_config")
+    @patch("main.iter_chat_messages")
+    @patch("main.get_live_chat_id")
+    def test_live_loop_generates_autonomous_speech_after_fixed_silence(
+        self,
+        live_chat_id_mock,
+        iter_messages_mock,
+        load_config_mock,
+        context_manager_mock,
+        scheduler_factory_mock,
+        autonomous_mock,
+    ):
+        live_chat_id_mock.return_value = "live-chat-id"
+        iter_messages_mock.return_value = iter(
+            [{"messages": [], "next_page_token": None}]
+        )
+        load_config_mock.return_value = {
+            "autonomous_speech": {
+                "silence_seconds": 3,
+                "topic_weights": {
+                    "news": 0,
+                    "trivia": 1,
+                    "observation": 0,
+                    "character_thought": 0,
+                },
+            }
+        }
+        stream_context = context_manager_mock.return_value
+        scheduler = scheduler_factory_mock.return_value
+        scheduler.silence_seconds = 3
+        scheduler.should_speak_autonomously.return_value = True
+        scheduler.record_speech.return_value = 4.0
+        autonomous_mock.return_value = {
+            "text": "静かな時間も配信の一部だね。",
+            "emotion": "relaxed",
+            "motion": None,
+        }
+
+        run_ai_youtuber_loop(max_loops=1)
+
+        autonomous_mock.assert_called_once()
+        stream_context.record_ai_speech.assert_called_once_with(
+            "静かな時間も配信の一部だね。"
+        )
+        scheduler.record_speech.assert_called_once_with(
+            "静かな時間も配信の一部だね。"
+        )
 
     @patch("main.time.sleep")
     @patch("main.get_unused_news_article")
