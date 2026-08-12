@@ -177,6 +177,7 @@
         <div id="queue" class="queue"></div>
       </section>
       <div id="theme" class="theme"></div>
+      <div id="discardedPrefetches" class="theme"></div>
 
       <div class="grid">
         <section class="card">
@@ -255,6 +256,7 @@
         statusMessage: document.getElementById('statusMessage'),
         queue: document.getElementById('queue'),
         theme: document.getElementById('theme'),
+        discardedPrefetches: document.getElementById('discardedPrefetches'),
         result: document.getElementById('result'),
         instruction: document.getElementById('instruction'),
         directText: document.getElementById('directText'),
@@ -295,6 +297,10 @@
           : '';
         elements.theme.textContent = status.stream_theme
           ? `配信テーマ：${status.stream_theme}`
+          : '';
+        const discarded = Number(status.discarded_prefetches || 0);
+        elements.discardedPrefetches.textContent = discarded
+          ? `コメント到着で破棄した先読み：${discarded}回`
           : '';
         elements.statusDot.className = 'status-dot';
         if (status.phase === 'error') elements.statusDot.classList.add('error');

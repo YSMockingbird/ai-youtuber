@@ -340,6 +340,7 @@ class ExternalControlRuntime:
             "phase": "starting",
             "message": "ライブ制御の開始を待っています。",
             "stream_theme": "",
+            "discarded_prefetches": 0,
             "updated_at_ms": round(time.time() * 1000),
         }
 

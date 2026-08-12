@@ -129,6 +129,10 @@ class AutonomousSpeechBufferTest(unittest.TestCase):
 
         buffer.cancel_for_comment()
         self.assertIsNone(buffer.prepared)
+        self.assertEqual(buffer.discarded_for_comment_count, 1)
+        self.runtime.update_admin_status.assert_called_once_with(
+            discarded_prefetches=1,
+        )
 
         comment_response = {
             "text": "コメントへの返答だよ。",
@@ -144,6 +148,26 @@ class AutonomousSpeechBufferTest(unittest.TestCase):
         self.assertFalse(buffer.tick(now=104.4))
         self.assertTrue(buffer.tick(now=104.5))
         self.assertTrue(buffer.has_received_comment)
+
+    @patch("autonomous_buffer.generate_autonomous_speech")
+    def test_comment_without_prepared_speech_does_not_increment_discard_count(
+        self,
+        generate_mock,
+    ):
+        generate_mock.return_value = self.ai_response
+        buffer = AutonomousSpeechBuffer(
+            runtime=self.runtime,
+            stream_context=self.stream_context,
+            config=create_config(),
+            publish_callback=self.publish_callback,
+            stream_topic="インターネットと集中力",
+            now=100,
+        )
+
+        buffer.cancel_for_comment()
+
+        self.assertEqual(buffer.discarded_for_comment_count, 0)
+        self.runtime.update_admin_status.assert_not_called()
 
     @patch("autonomous_buffer.generate_autonomous_speech")
     def test_no_comment_prompt_assumes_no_audience(self, generate_mock):

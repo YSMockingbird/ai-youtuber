@@ -47,6 +47,7 @@ class AutonomousSpeechBuffer:
         self.previous_topic = None
         self.has_received_comment = False
         self.prepared = None
+        self.discarded_for_comment_count = 0
         self.paused = False
         self.retry_at = 0.0
         current_time = time.monotonic() if now is None else float(now)
@@ -106,6 +107,16 @@ class AutonomousSpeechBuffer:
 
     def cancel_for_comment(self):
         # コメント返信を優先し、まだ再生していない自発発話を破棄します。
+        if self.prepared is not None:
+            self.discarded_for_comment_count += 1
+            print(
+                "先読み済み自発発話を破棄しました："
+                "理由=YouTubeコメント "
+                f"累計={self.discarded_for_comment_count}回"
+            )
+            self.runtime.update_admin_status(
+                discarded_prefetches=self.discarded_for_comment_count,
+            )
         self.prepared = None
         self.next_speech_at = math.inf
         self.retry_at = math.inf
