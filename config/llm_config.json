@@ -1,7 +1,7 @@
 {
   "provider": "openai",
   "context": {
-    "total_token_budget": 4800,
+    "total_token_budget": 5600,
     "relevant_memory_token_budget": 300,
     "stream_summary_token_budget": 300,
     "recent_conversation_token_budget": 700,

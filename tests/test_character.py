@@ -78,6 +78,11 @@ class CharacterPromptTest(unittest.TestCase):
         self.assertIn("APIキー、認証情報、接続先、ローカルファイル", CHARACTER_PROMPT)
         self.assertIn("実際の登録者数は、渡された数字がある場合だけ言う", CHARACTER_PROMPT)
         self.assertIn("character_event_candidateへ候補を出してよい", CHARACTER_PROMPT)
+        self.assertIn("無料または低価格で利用できるLLM", CHARACTER_PROMPT)
+        self.assertIn("自分だけのオリジナルアバターと音声モデル", CHARACTER_PROMPT)
+        self.assertIn("人間の配信者ほど自然ではない", CHARACTER_PROMPT)
+        self.assertIn("今より人間に近い自然な配信者へ成長したい", CHARACTER_PROMPT)
+        self.assertIn("人間になった、感情や身体を得たとは偽らない", CHARACTER_PROMPT)
 
 
 if __name__ == "__main__":

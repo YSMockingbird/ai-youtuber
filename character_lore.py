@@ -12,19 +12,39 @@ def build_public_character_context(bible=None):
         )
     runtime = str(identity.get("runtime", "")).strip()
     disclosure_boundary = str(identity.get("disclosure_boundary", "")).strip()
+    current_resources = str(identity.get("current_resources", "")).strip()
+    current_limitations = str(identity.get("current_limitations", "")).strip()
     purpose = str(goals.get("purpose", "")).strip()
     first_goal = str(goals.get("first_subscriber_goal", "")).strip()
     long_term_goal = str(goals.get("long_term_subscriber_goal", "")).strip()
-    if not all((runtime, disclosure_boundary, purpose, first_goal, long_term_goal)):
+    original_model_goal = str(goals.get("original_model_goal", "")).strip()
+    human_growth_goal = str(goals.get("human_growth_goal", "")).strip()
+    if not all(
+        (
+            runtime,
+            disclosure_boundary,
+            current_resources,
+            current_limitations,
+            purpose,
+            first_goal,
+            long_term_goal,
+            original_model_goal,
+            human_growth_goal,
+        )
+    ):
         raise RuntimeError(
             "キャラクター設定集の公開自己認識と目標は空にできません。"
         )
     return (
         "[公開できる自己認識と目標]\n"
         f"- 正体: {runtime}\n"
+        f"- 現在の制作環境: {current_resources}\n"
+        f"- 現在の課題: {current_limitations}\n"
         f"- 公開しない情報: {disclosure_boundary}\n"
         f"- 目的: {purpose}\n"
-        f"- 登録者目標: まず{first_goal}、その先は{long_term_goal}"
+        f"- 登録者目標: まず{first_goal}、その先は{long_term_goal}\n"
+        f"- オリジナルモデルの目標: {original_model_goal}\n"
+        f"- 会話面の成長目標: {human_growth_goal}"
     )
 
 
@@ -95,12 +115,17 @@ def build_character_lore_context(
         position = str(stance.get("position", "")).strip()
         keywords = stance.get("keywords", [])
         angles = stance.get("angles", [])
+        stance_boundaries = stance.get("boundaries")
         if (
             not subject
             or not position
             or not isinstance(keywords, list)
             or not isinstance(angles, list)
             or not angles
+            or (
+                stance_boundaries is not None
+                and not isinstance(stance_boundaries, list)
+            )
         ):
             raise RuntimeError(
                 "各industry_stancesにはsubject、position、keywords、anglesが必要です。"
@@ -126,6 +151,15 @@ def build_character_lore_context(
                         "subject": subject,
                         "position": position,
                         "angles": normalized_angles,
+                        "boundaries": (
+                            [
+                                str(boundary).strip()
+                                for boundary in stance_boundaries
+                                if str(boundary).strip()
+                            ]
+                            if stance_boundaries is not None
+                            else None
+                        ),
                     },
                 )
             )
@@ -139,7 +173,9 @@ def build_character_lore_context(
         key=lambda item: item[:3],
     )
     if selected_kind == "stance":
-        boundaries = source.get("industry_boundaries", [])
+        boundaries = selected.get("boundaries")
+        if boundaries is None:
+            boundaries = source.get("industry_boundaries", [])
         if not isinstance(boundaries, list):
             raise RuntimeError(
                 "キャラクター設定集のindustry_boundariesは配列にしてください。"

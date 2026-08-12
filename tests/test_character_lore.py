@@ -13,11 +13,15 @@ class CharacterLoreTest(unittest.TestCase):
             "public_identity": {
                 "runtime": "Pythonプログラムを土台に動くAI",
                 "disclosure_boundary": "認証情報は公開しない",
+                "current_resources": "無料の姿と声、低価格のLLMで動く",
+                "current_limitations": "会話にはまだ機械っぽさがある",
             },
             "goals": {
                 "purpose": "人気者になって世界平和へ近づく",
                 "first_subscriber_goal": "1万人",
                 "long_term_subscriber_goal": "100万人",
+                "original_model_goal": "自分だけの姿と声を得る",
+                "human_growth_goal": "交流から自然な会話を学ぶ",
             },
             "industry_boundaries": [
                 "実在する組織やファンを攻撃しない",
@@ -52,6 +56,9 @@ class CharacterLoreTest(unittest.TestCase):
         self.assertIn("Pythonプログラムを土台に動くAI", context)
         self.assertIn("まず1万人、その先は100万人", context)
         self.assertIn("認証情報は公開しない", context)
+        self.assertIn("無料の姿と声、低価格のLLM", context)
+        self.assertIn("自分だけの姿と声を得る", context)
+        self.assertIn("交流から自然な会話を学ぶ", context)
 
     def test_matching_episode_is_selected(self):
         context = build_character_lore_context("冷蔵庫の野菜が余った", self.bible)
