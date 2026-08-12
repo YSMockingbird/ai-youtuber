@@ -1,6 +1,8 @@
 import html
 import os
 import re
+import threading
+import time
 import xml.etree.ElementTree as ET
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
@@ -12,6 +14,9 @@ import requests
 
 LEGACY_DEFAULT_NEWS_RSS_URL = "https://www.digital.go.jp/rss/news.xml"
 DEFAULT_NEWS_MAX_AGE_HOURS = 168
+DEFAULT_NEWS_CACHE_SECONDS = 600
+_NEWS_CACHE = {}
+_NEWS_CACHE_LOCK = threading.Lock()
 DEFAULT_NEWS_FEED_QUERIES = (
     (
         "vtuber",
@@ -155,12 +160,43 @@ def get_news_max_age_hours():
     return hours
 
 
-def fetch_news_articles(rss_url=None):
+def get_news_cache_seconds():
+    raw_seconds = os.getenv(
+        "NEWS_CACHE_SECONDS",
+        str(DEFAULT_NEWS_CACHE_SECONDS),
+    ).strip()
+    try:
+        seconds = int(raw_seconds)
+    except ValueError as exc:
+        raise RuntimeError("NEWS_CACHE_SECONDSは整数で設定してください。") from exc
+    if not 0 <= seconds <= 3600:
+        raise RuntimeError("NEWS_CACHE_SECONDSは0〜3600で設定してください。")
+    return seconds
+
+
+def clear_news_cache():
+    # テストや設定変更後に、プロセス内のRSSキャッシュを明示的に破棄します。
+    with _NEWS_CACHE_LOCK:
+        _NEWS_CACHE.clear()
+
+
+def fetch_news_articles(rss_url=None, now=None):
     specs = (
         [{"url": _validate_feed_url(rss_url), "category": "custom"}]
         if rss_url
         else get_news_feed_specs()
     )
+    cache_key = tuple((spec["url"], spec["category"]) for spec in specs)
+    current_time = time.monotonic() if now is None else float(now)
+    cache_seconds = get_news_cache_seconds()
+    with _NEWS_CACHE_LOCK:
+        cached = _NEWS_CACHE.get(cache_key)
+    if (
+        cached is not None
+        and current_time - cached["fetched_at"] < cache_seconds
+    ):
+        return _copy_articles(cached["articles"])
+
     timeout_seconds = get_news_timeout_seconds()
     articles = []
     errors = []
@@ -181,10 +217,26 @@ def fetch_news_articles(rss_url=None):
 
     if not articles:
         detail = "; ".join(errors) or "取得対象がありません。"
+        if cached is not None:
+            print(
+                "ニュースフィードの更新に失敗したため、"
+                f"期限切れキャッシュを使用します: {detail}"
+            )
+            return _copy_articles(cached["articles"])
         raise RuntimeError(f"ニュースフィードを一件も取得できませんでした: {detail}")
     if errors:
         print("一部のニュースフィードを取得できませんでした: " + "; ".join(errors))
-    return _merge_duplicate_articles(articles)
+    merged = _merge_duplicate_articles(articles)
+    with _NEWS_CACHE_LOCK:
+        _NEWS_CACHE[cache_key] = {
+            "articles": _copy_articles(merged),
+            "fetched_at": current_time,
+        }
+    return _copy_articles(merged)
+
+
+def _copy_articles(articles):
+    return [dict(article) for article in articles]
 
 
 def parse_news_feed(xml_content, source_url):

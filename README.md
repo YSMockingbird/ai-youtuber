@@ -297,7 +297,12 @@ AivisSpeechとAITuber OnAirまで含めて確認する場合は、両方を起�
 NEWS_RSS_URLS=https://example.com/vtuber.xml,https://example.com/anime.xml
 NEWS_TIMEOUT_SECONDS=10
 NEWS_MAX_AGE_HOURS=168
+NEWS_CACHE_SECONDS=600
 ```
+
+`NEWS_CACHE_SECONDS`は取得済みニュースを再利用する秒数です。既定の`600`では、
+同じ配信中にRSSへアクセスする回数を10分に1回までに抑えます。更新に失敗した場合は、
+取得済みの古いキャッシュがあれば配信を止めずに利用します。
 
 以前の`NEWS_RSS_URL`も独自URLの場合は互換用として利用できます。ただし、旧既定値の
 デジタル庁RSSが残っている場合は無視し、オタク層向けの既定フィードへ移行します。

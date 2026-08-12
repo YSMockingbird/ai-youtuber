@@ -1,9 +1,13 @@
 import unittest
 from datetime import datetime, timezone
-from unittest.mock import patch
+from unittest.mock import Mock, patch
+
+import requests
 
 from news_source import (
     _merge_duplicate_articles,
+    clear_news_cache,
+    fetch_news_articles,
     get_news_feed_specs,
     parse_news_feed,
     select_news_article,
@@ -11,6 +15,65 @@ from news_source import (
 
 
 class NewsSourceTest(unittest.TestCase):
+    def setUp(self):
+        clear_news_cache()
+
+    def tearDown(self):
+        clear_news_cache()
+
+    @staticmethod
+    def rss_response(title="キャッシュ対象ニュース"):
+        response = Mock()
+        response.content = (
+            "<?xml version='1.0' encoding='UTF-8'?>"
+            "<rss><channel><title>テストニュース</title><item>"
+            f"<title>{title}</title>"
+            "<link>https://example.com/cache-news</link>"
+            "<description>概要です。</description>"
+            "</item></channel></rss>"
+        ).encode("utf-8")
+        return response
+
+    @patch.dict("os.environ", {"NEWS_CACHE_SECONDS": "600"}, clear=False)
+    @patch("news_source.requests.get")
+    def test_fetch_reuses_cache_within_ten_minutes(self, request_mock):
+        request_mock.return_value = self.rss_response()
+
+        first = fetch_news_articles("https://example.com/rss.xml", now=100)
+        second = fetch_news_articles("https://example.com/rss.xml", now=200)
+
+        self.assertEqual(first, second)
+        request_mock.assert_called_once()
+
+    @patch.dict("os.environ", {"NEWS_CACHE_SECONDS": "600"}, clear=False)
+    @patch("news_source.requests.get")
+    def test_fetch_refreshes_cache_after_ten_minutes(self, request_mock):
+        request_mock.side_effect = [
+            self.rss_response("最初の記事"),
+            self.rss_response("更新後の記事"),
+        ]
+
+        first = fetch_news_articles("https://example.com/rss.xml", now=100)
+        second = fetch_news_articles("https://example.com/rss.xml", now=701)
+
+        self.assertEqual(first[0]["title"], "最初の記事")
+        self.assertEqual(second[0]["title"], "更新後の記事")
+        self.assertEqual(request_mock.call_count, 2)
+
+    @patch.dict("os.environ", {"NEWS_CACHE_SECONDS": "600"}, clear=False)
+    @patch("news_source.requests.get")
+    def test_expired_cache_is_used_when_refresh_fails(self, request_mock):
+        request_mock.side_effect = [
+            self.rss_response(),
+            requests.exceptions.ConnectionError("接続失敗"),
+        ]
+
+        first = fetch_news_articles("https://example.com/rss.xml", now=100)
+        stale = fetch_news_articles("https://example.com/rss.xml", now=701)
+
+        self.assertEqual(stale, first)
+        self.assertEqual(request_mock.call_count, 2)
+
     def test_parse_rss_articles(self):
         xml_content = """<?xml version="1.0" encoding="UTF-8"?>
         <rss version="2.0">
