@@ -2,6 +2,7 @@ import unittest
 from unittest.mock import Mock, patch
 
 from ai_response import (
+    generate_ai_response,
     generate_admin_directed_speech,
     generate_autonomous_speech,
     generate_news_commentary,
@@ -10,6 +11,22 @@ from ai_response import (
 
 
 class ParseAiResponseTest(unittest.TestCase):
+    @patch("ai_response._generate_structured_response")
+    def test_comment_length_changes_with_content(self, generate_mock):
+        generate_mock.return_value = {
+            "text": "質問に合う長さで答えるよ。",
+            "emotion": "relaxed",
+        }
+
+        generate_ai_response("視聴者", "将来の目標を詳しく教えて")
+
+        prompt = generate_mock.call_args.args[0]
+        self.assertIn("挨拶や短い反応には1〜2文", prompt)
+        self.assertIn("普通の質問には2〜4文", prompt)
+        self.assertIn("設定、考え、目標を詳しく聞かれた場合", prompt)
+        self.assertIn("4〜7文まで", prompt)
+        self.assertIn("同じ説明を繰り返さない", prompt)
+
     @patch("ai_response._generate_structured_response")
     def test_admin_instruction_is_not_read_as_viewer_comment(self, generate_mock):
         generate_mock.return_value = {
