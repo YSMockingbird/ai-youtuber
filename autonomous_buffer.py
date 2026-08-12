@@ -249,7 +249,14 @@ class AutonomousSpeechBuffer:
 
     def _get_unused_news_article(self):
         articles = fetch_news_articles()
-        article = select_news_article(articles, self.used_news_links)
+        article = select_news_article(
+            articles,
+            self.used_news_links,
+            theme_text=(
+                f"{self.theme_manager.state.main_theme} "
+                f"{self.theme_manager.state.current_focus}"
+            ),
+        )
         if article is None:
             raise RuntimeError(
                 "未使用かつ雑談に適したニュース記事が見つかりませんでした。"

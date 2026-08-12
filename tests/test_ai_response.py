@@ -151,7 +151,34 @@ class ParseAiResponseTest(unittest.TestCase):
         self.assertIn("タイトル: 新しい技術が発表", prompt)
         self.assertIn("ニュース情報は使わず現在の枝の続きを話してください", prompt)
         self.assertNotIn("[ガン奈の記録済みエピソード]", prompt)
+        self.assertIn("確認できた情報源は一媒体です", prompt)
+        self.assertIn("炎上、物議、卒業、活動休止", prompt)
+        self.assertIn("冷蔵庫、食べ物、身体、日用品", prompt)
+        self.assertIn("キャラクター設定を締めとして付け足さない", prompt)
+        self.assertIn("知的で無難な感想で締めず", prompt)
         self.assertEqual(response["emotion"], "surprised")
+
+    @patch("ai_response._generate_structured_response")
+    def test_unverified_news_is_explicitly_labeled_in_prompt(self, generate_mock):
+        generate_mock.return_value = {
+            "text": "まだ噂の段階みたいだね。",
+            "emotion": "relaxed",
+        }
+        article = {
+            "source_name": "テストニュース",
+            "published_at": "2026-08-12",
+            "title": "VTuberの不仲説が話題",
+            "summary": "真偽不明の噂です。",
+            "information_status": "unverified",
+            "source_count": 1,
+            "audience_category": "gossip",
+        }
+
+        generate_news_commentary(article)
+
+        prompt = generate_mock.call_args.args[0]
+        self.assertIn("まだ事実とは限らない", prompt)
+        self.assertIn("話題カテゴリ: gossip", prompt)
 
     @patch("ai_response._generate_structured_response")
     def test_autonomous_speech_receives_situation_and_recent_speech(

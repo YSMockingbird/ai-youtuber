@@ -51,6 +51,7 @@ class CharacterPromptTest(unittest.TestCase):
         self.assertIn("相手やファンへの悪口にしない", CHARACTER_PROMPT)
         self.assertIn("関係ない雑談へライバル設定を挿入しない", CHARACTER_PROMPT)
         self.assertIn("発言例の丸写し", CHARACTER_PROMPT)
+        self.assertIn("ニュース記事にライバル組織の名前が出ただけでは", CHARACTER_PROMPT)
 
     def test_autonomous_speech_keeps_its_current_thread(self):
         self.assertIn(
