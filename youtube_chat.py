@@ -136,18 +136,33 @@ def iter_chat_messages(
         raise ValueError("wait_step_secondsは0より大きくしてください。")
     page_token = None
     loop_count = 0
+    previous_fetch_at = None
 
     while True:
+        fetch_started_at = time.monotonic()
         result = fetch_chat_messages(live_chat_id, page_token)
         page_token = result["next_page_token"]
         loop_count += 1
+        actual_interval = (
+            "初回"
+            if previous_fetch_at is None
+            else f"{fetch_started_at - previous_fetch_at:.1f}秒"
+        )
+        previous_fetch_at = fetch_started_at
+        recommended_seconds = result["polling_interval_millis"] / 1000
+        print(
+            "YouTubeコメント取得："
+            f"新規候補={len(result['messages'])}件 "
+            f"前回取得から={actual_interval} "
+            f"次回取得目安={recommended_seconds:.1f}秒"
+        )
 
         yield result
 
         if max_loops is not None and loop_count >= max_loops:
             break
 
-        wait_seconds = result["polling_interval_millis"] / 1000
+        wait_seconds = recommended_seconds
         deadline = time.monotonic() + wait_seconds
         while time.monotonic() < deadline:
             if wait_callback is not None:

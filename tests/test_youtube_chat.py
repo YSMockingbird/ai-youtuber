@@ -1,4 +1,6 @@
 import unittest
+from contextlib import redirect_stdout
+from io import StringIO
 from unittest.mock import Mock, patch
 
 from youtube_chat import (
@@ -148,6 +150,51 @@ class YouTubeChatTest(unittest.TestCase):
 
         self.assertEqual(len(results), 2)
         sleep_mock.assert_not_called()
+
+    @patch("youtube_chat.time.sleep")
+    @patch("youtube_chat.time.monotonic")
+    @patch("youtube_chat.fetch_chat_messages")
+    def test_polling_log_shows_recommended_and_actual_interval(
+        self,
+        fetch_mock,
+        monotonic_mock,
+        sleep_mock,
+    ):
+        fetch_mock.side_effect = [
+            {
+                "messages": [],
+                "next_page_token": "next",
+                "polling_interval_millis": 60000,
+            },
+            {
+                "messages": [{"message_id": "message-1"}],
+                "next_page_token": None,
+                "polling_interval_millis": 10000,
+            },
+        ]
+        current_time = [0.0]
+        monotonic_mock.side_effect = lambda: current_time[0]
+        sleep_mock.side_effect = lambda seconds: current_time.__setitem__(
+            0,
+            current_time[0] + seconds,
+        )
+        output = StringIO()
+
+        with redirect_stdout(output):
+            list(
+                iter_chat_messages(
+                    "live-chat-id",
+                    max_loops=2,
+                    wait_step_seconds=10,
+                )
+            )
+
+        log = output.getvalue()
+        self.assertIn("前回取得から=初回", log)
+        self.assertIn("次回取得目安=60.0秒", log)
+        self.assertIn("前回取得から=60.0秒", log)
+        self.assertIn("新規候補=1件", log)
+        self.assertIn("次回取得目安=10.0秒", log)
 
     @patch.dict("os.environ", {"YOUTUBE_API_KEY": "test-key"})
     @patch("youtube_chat.requests.get")
