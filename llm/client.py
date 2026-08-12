@@ -1,5 +1,6 @@
 import os
 import logging
+import time
 from abc import ABC, abstractmethod
 
 from pydantic import ValidationError
@@ -21,6 +22,7 @@ class LlmClient(ABC):
         input_text,
         response_model,
         max_output_tokens,
+        request_label="llm",
     ):
         """構造化されたLLM応答を返します。"""
 
@@ -44,11 +46,13 @@ class OpenAiLlmClient(LlmClient):
         input_text,
         response_model,
         max_output_tokens,
+        request_label="llm",
     ):
         retry_tokens = max(int(max_output_tokens) * 2, 1200)
         token_limits = (int(max_output_tokens), retry_tokens)
 
         for attempt, token_limit in enumerate(token_limits):
+            started_at = time.monotonic()
             try:
                 response = self._request_structured(
                     instructions=instructions,
@@ -70,6 +74,13 @@ class OpenAiLlmClient(LlmClient):
                     "OpenAI APIの構造化出力を検証できませんでした。"
                     f" detail={_validation_error_summary(exc)}"
                 ) from exc
+
+            _print_usage(
+                response,
+                request_label=request_label,
+                attempt=attempt + 1,
+                elapsed_seconds=time.monotonic() - started_at,
+            )
 
             parsed = response.output_parsed
             if parsed is not None:
@@ -159,6 +170,32 @@ def _response_diagnostics(response):
     error = getattr(response, "error", None)
     error_code = getattr(error, "code", None) or "none"
     return status, incomplete_reason, error_code
+
+
+def _print_usage(response, request_label, attempt, elapsed_seconds):
+    # APIが返す実測値だけを表示し、プロンプト本文や認証情報はログへ出しません。
+    usage = getattr(response, "usage", None)
+    if usage is None:
+        print(
+            "LLM使用量："
+            f"処理={request_label} 試行={attempt} "
+            "usage=取得不可 "
+            f"応答時間={elapsed_seconds:.2f}秒"
+        )
+        return
+
+    input_details = getattr(usage, "input_tokens_details", None)
+    output_details = getattr(usage, "output_tokens_details", None)
+    print(
+        "LLM使用量："
+        f"処理={request_label} 試行={attempt} "
+        f"入力={getattr(usage, 'input_tokens', 0)} "
+        f"キャッシュ={getattr(input_details, 'cached_tokens', 0)} "
+        f"出力={getattr(usage, 'output_tokens', 0)} "
+        f"推論={getattr(output_details, 'reasoning_tokens', 0)} "
+        f"合計={getattr(usage, 'total_tokens', 0)} "
+        f"応答時間={elapsed_seconds:.2f}秒"
+    )
 
 
 def create_llm_client(config=None):

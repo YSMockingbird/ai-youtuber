@@ -111,7 +111,7 @@ def generate_ai_response(
         if context_builder is not None
         else current_input
     )
-    return _generate_structured_response(prompt)
+    return _generate_structured_response(prompt, request_label="comment_reply")
 
 
 def generate_news_commentary(
@@ -173,7 +173,7 @@ def generate_news_commentary(
         if context_builder is not None
         else current_input
     )
-    return _generate_structured_response(prompt)
+    return _generate_structured_response(prompt, request_label="news_commentary")
 
 
 def generate_autonomous_speech(
@@ -226,7 +226,7 @@ def generate_autonomous_speech(
         if context_builder is not None
         else current_input
     )
-    return _generate_structured_response(prompt)
+    return _generate_structured_response(prompt, request_label="autonomous_speech")
 
 
 def generate_admin_directed_speech(
@@ -263,10 +263,10 @@ def generate_admin_directed_speech(
         if context_builder is not None
         else current_input
     )
-    return _generate_structured_response(prompt)
+    return _generate_structured_response(prompt, request_label="admin_instruction")
 
 
-def _generate_structured_response(prompt):
+def _generate_structured_response(prompt, request_label="ai_response"):
     # プロバイダー依存処理は共通クライアントの内側へ閉じ込めます。
     client = create_llm_client(load_llm_config())
     parsed = client.generate_structured(
@@ -274,6 +274,7 @@ def _generate_structured_response(prompt):
         input_text=prompt,
         response_model=AiResponseSchema,
         max_output_tokens=800,
+        request_label=request_label,
     )
     return parsed.model_dump()
 

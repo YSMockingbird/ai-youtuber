@@ -47,6 +47,7 @@ def generate_stream_theme_plan(previous_state=None):
         input_text=input_text,
         response_model=StreamThemePlan,
         max_output_tokens=500,
+        request_label="stream_theme",
     )
 
 

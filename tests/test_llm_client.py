@@ -1,4 +1,6 @@
 import unittest
+from contextlib import redirect_stdout
+from io import StringIO
 from types import SimpleNamespace
 from unittest.mock import Mock
 
@@ -108,6 +110,40 @@ class OpenAiLlmClientTest(unittest.TestCase):
             )
 
         client.client.responses.parse.assert_called_once()
+
+    def test_prints_api_usage_without_prompt_content(self):
+        client = self.create_client()
+        parsed = TestResponse(text="成功")
+        client.client.responses.parse.return_value = SimpleNamespace(
+            output_parsed=parsed,
+            usage=SimpleNamespace(
+                input_tokens=120,
+                output_tokens=30,
+                total_tokens=150,
+                input_tokens_details=SimpleNamespace(cached_tokens=80),
+                output_tokens_details=SimpleNamespace(reasoning_tokens=10),
+            ),
+        )
+        output = StringIO()
+
+        with redirect_stdout(output):
+            client.generate_structured(
+                "秘密の指示",
+                "秘密の入力",
+                TestResponse,
+                800,
+                request_label="comment_reply",
+            )
+
+        log = output.getvalue()
+        self.assertIn("処理=comment_reply", log)
+        self.assertIn("入力=120", log)
+        self.assertIn("キャッシュ=80", log)
+        self.assertIn("出力=30", log)
+        self.assertIn("推論=10", log)
+        self.assertIn("合計=150", log)
+        self.assertNotIn("秘密の指示", log)
+        self.assertNotIn("秘密の入力", log)
 
 
 if __name__ == "__main__":
