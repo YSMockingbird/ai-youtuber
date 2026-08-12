@@ -16,7 +16,7 @@
     "minimum_importance": 0.65
   },
   "stream_theme": {
-    "review_utterance_count": 12
+    "review_utterance_count": 20
   },
   "autonomous_speech": {
     "silence_seconds": 3,

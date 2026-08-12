@@ -72,7 +72,7 @@ class StreamThemeManager:
     ):
         theme_config = config.get("stream_theme", {})
         self.review_utterance_count = int(
-            theme_config.get("review_utterance_count", 12)
+            theme_config.get("review_utterance_count", 20)
         )
         if not 5 <= self.review_utterance_count <= 30:
             raise ValueError(
