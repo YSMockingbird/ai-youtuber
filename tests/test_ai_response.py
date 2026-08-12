@@ -166,13 +166,13 @@ class ParseAiResponseTest(unittest.TestCase):
         prompt = generate_mock.call_args.args[0]
         self.assertIn("配信元: テストニュース", prompt)
         self.assertIn("タイトル: 新しい技術が発表", prompt)
-        self.assertIn("ニュース情報は使わず現在の枝の続きを話してください", prompt)
+        self.assertIn("つながらなければ記事を使わず", prompt)
         self.assertNotIn("[ガン奈の記録済みエピソード]", prompt)
         self.assertIn("確認できた情報源は一媒体です", prompt)
-        self.assertIn("炎上、物議、卒業、活動休止", prompt)
-        self.assertIn("冷蔵庫、食べ物、身体、日用品", prompt)
-        self.assertIn("キャラクター設定を締めとして付け足さない", prompt)
-        self.assertIn("知的で無難な感想で締めず", prompt)
+        self.assertIn("人物やファンを攻撃せず", prompt)
+        self.assertIn("無関係な物やキャラクター設定を足さず", prompt)
+        self.assertIn("文学的・無難な結論を避け", prompt)
+        self.assertIn("事件、事故、災害ではブラックジョーク", prompt)
         self.assertEqual(response["emotion"], "surprised")
 
     @patch("ai_response._generate_structured_response")
