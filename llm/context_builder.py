@@ -41,15 +41,20 @@ class ContextBuilder:
             "[Relevant Memories]\n[Stream Summary]\n"
             "[Recent Conversation]\n[Current Input]\n"
         )
+        system_prompt_tokens = estimate_tokens(self.character_prompt)
+        current_input_tokens = estimate_tokens(current_input)
         mandatory_tokens = (
-            estimate_tokens(self.character_prompt)
-            + estimate_tokens(current_input)
+            system_prompt_tokens
+            + current_input_tokens
             + section_overhead_tokens
         )
         if mandatory_tokens >= total_budget:
             raise RuntimeError(
                 "System Promptと今回の入力だけでコンテキスト予算を超えました。"
-                f"estimated_tokens={mandatory_tokens} budget={total_budget}"
+                f" system_prompt_tokens={system_prompt_tokens}"
+                f" current_input_tokens={current_input_tokens}"
+                f" overhead_tokens={section_overhead_tokens}"
+                f" total_tokens={mandatory_tokens} budget={total_budget}"
             )
 
         remaining_budget = total_budget - mandatory_tokens
@@ -110,6 +115,9 @@ class ContextBuilder:
         if actual_tokens > total_budget:
             raise RuntimeError(
                 "構築したコンテキストがトークン予算を超えました。"
-                f"estimated_tokens={actual_tokens} budget={total_budget}"
+                f" system_prompt_tokens={system_prompt_tokens}"
+                f" current_input_tokens={current_input_tokens}"
+                f" recent_tokens={used_recent}"
+                f" total_tokens={actual_tokens} budget={total_budget}"
             )
         return prompt

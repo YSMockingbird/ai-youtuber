@@ -2,3 +2,5 @@ openai
 python-dotenv
 requests
 urllib3<2
+google-auth
+google-auth-oauthlib

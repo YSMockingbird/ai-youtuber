@@ -1,0 +1,108 @@
+<!doctype html>
+<html lang="ja">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>ガン奈の記憶</title>
+    <style>
+      :root { color-scheme: dark; font-family: -apple-system, BlinkMacSystemFont, "Hiragino Sans", "Yu Gothic", sans-serif; background: #090b10; color: #f5f7fb; }
+      * { box-sizing: border-box; }
+      body { margin: 0; min-height: 100vh; background: radial-gradient(circle at 90% 0%, rgba(112,79,184,.22), transparent 32%), radial-gradient(circle at 4% 28%, rgba(44,130,110,.12), transparent 26%), #090b10; }
+      main { width: min(940px, calc(100% - 28px)); margin: 0 auto; padding: 26px 0 64px; }
+      header { display: flex; align-items: flex-start; justify-content: space-between; gap: 18px; margin-bottom: 22px; }
+      h1 { margin: 0 0 7px; font-size: clamp(25px, 4vw, 34px); }
+      .subtitle { margin: 0; color: #979eae; font-size: 14px; line-height: 1.6; }
+      .back { flex: none; padding: 9px 12px; border: 1px solid #353b49; border-radius: 10px; color: #cbd5ff; background: rgba(20,24,32,.84); font-size: 13px; text-decoration: none; }
+      .toolbar { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 16px; }
+      .tabs { display: inline-flex; gap: 4px; padding: 4px; border: 1px solid #292e3a; border-radius: 13px; background: #11141b; }
+      button { min-height: 40px; padding: 0 14px; border: 1px solid transparent; border-radius: 9px; color: #f4f6fb; background: #202633; font: inherit; font-size: 13px; font-weight: 750; cursor: pointer; }
+      button:hover:not(:disabled) { filter: brightness(1.12); }
+      button:disabled { cursor: wait; opacity: .52; }
+      .tab { color: #aeb5c4; background: transparent; }
+      .tab.active { color: #fff; background: #485eaa; }
+      .refresh { border-color: #383e4c; background: #171b24; }
+      .summary { display: flex; align-items: center; gap: 9px; min-height: 24px; margin: 0 2px 12px; color: #9ca4b4; font-size: 13px; }
+      .count { min-width: 26px; padding: 2px 8px; border-radius: 999px; background: #292f3d; color: #dce1eb; text-align: center; }
+      .list { display: grid; gap: 12px; }
+      .memory { padding: 18px; border: 1px solid #282e3a; border-radius: 16px; background: rgba(18,21,29,.94); box-shadow: 0 14px 40px rgba(0,0,0,.22); }
+      .memory-top { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 12px; }
+      .badges { display: flex; flex-wrap: wrap; gap: 7px; }
+      .badge { padding: 4px 8px; border: 1px solid #3a4254; border-radius: 999px; color: #c5ccda; font-size: 11px; }
+      .badge.kind { border-color: #51467a; color: #cfc1ff; }
+      .importance { color: #8e96a7; font-size: 12px; white-space: nowrap; }
+      .content { margin: 0; color: #f2f4f8; font-size: 16px; line-height: 1.75; overflow-wrap: anywhere; }
+      .meta { margin-top: 12px; color: #7f8797; font-size: 11px; line-height: 1.6; }
+      .actions { display: flex; gap: 9px; margin-top: 15px; }
+      .approve { background: #276f52; border-color: #358c68; }
+      .reject { background: #55292d; border-color: #7c3b42; }
+      .empty, .error-box { padding: 44px 20px; border: 1px dashed #343a48; border-radius: 16px; color: #8f97a7; text-align: center; line-height: 1.7; }
+      .error-box { border-color: #704047; color: #ff9da2; }
+      .toast { position: fixed; right: 18px; bottom: 18px; max-width: min(420px, calc(100% - 36px)); padding: 12px 15px; border: 1px solid #347b5d; border-radius: 11px; background: #143528; color: #aaf0cc; box-shadow: 0 14px 34px rgba(0,0,0,.34); opacity: 0; transform: translateY(10px); pointer-events: none; transition: 160ms ease; }
+      .toast.visible { opacity: 1; transform: translateY(0); }
+      .toast.failure { border-color: #704047; background: #452227; color: #ffb0b4; }
+      @media (max-width: 620px) { header { flex-direction: column; } .toolbar { align-items: stretch; flex-direction: column; } .tabs { display: grid; grid-template-columns: repeat(3,1fr); } .memory-top { align-items: flex-start; } .actions button { flex: 1; } }
+    </style>
+  </head>
+  <body>
+    <main>
+      <header>
+        <div>
+          <h1>ガン奈の記憶</h1>
+          <p class="subtitle">配信中に生まれた思い出候補です。承認した記憶だけが、今後の会話で使われます。</p>
+        </div>
+        <a class="back" href="/admin">配信管理へ戻る</a>
+      </header>
+      <div class="toolbar">
+        <div class="tabs" role="tablist" aria-label="記憶の状態">
+          <button class="tab active" data-status="draft">未確認</button>
+          <button class="tab" data-status="approved">承認済み</button>
+          <button class="tab" data-status="rejected">却下済み</button>
+        </div>
+        <button id="refresh" class="refresh">更新</button>
+      </div>
+      <div class="summary"><span id="count" class="count">0</span><span id="summaryText">読み込み中です</span></div>
+      <div id="list" class="list" aria-live="polite"></div>
+    </main>
+    <div id="toast" class="toast" role="status" aria-live="polite"></div>
+    <script>
+      const labels = {draft:'未確認の記憶', approved:'承認済みの記憶', rejected:'却下済みの記憶', episode:'小さな出来事', relationship:'共有イベント', belief_change:'考えの変化', autonomous_speech:'自発雑談', comment_reply:'コメント返信', news:'ニュース雑談'};
+      const state = {status:'draft', busy:false};
+      const list = document.getElementById('list');
+      const count = document.getElementById('count');
+      const summaryText = document.getElementById('summaryText');
+      const refresh = document.getElementById('refresh');
+      const toast = document.getElementById('toast');
+      function textElement(tag, className, text) { const element = document.createElement(tag); element.className = className; element.textContent = text; return element; }
+      function formatDate(value) { const date = new Date(value); return Number.isNaN(date.getTime()) ? value : new Intl.DateTimeFormat('ja-JP', {dateStyle:'medium', timeStyle:'short'}).format(date); }
+      function showToast(message, failure=false) { toast.textContent = message; toast.classList.toggle('failure', failure); toast.classList.add('visible'); window.clearTimeout(showToast.timer); showToast.timer = window.setTimeout(() => toast.classList.remove('visible'), 2600); }
+      function setBusy(value) { state.busy = value; refresh.disabled = value; document.querySelectorAll('.actions button').forEach(button => { button.disabled = value; }); }
+      function render(memories) {
+        list.replaceChildren(); count.textContent = memories.length; summaryText.textContent = `${labels[state.status]}が ${memories.length} 件あります`;
+        if (!memories.length) { const messages = {draft:'未確認の思い出候補はありません。配信で候補が生まれると、ここへ表示されます。', approved:'承認済みの記憶はまだありません。', rejected:'却下済みの記憶はありません。'}; list.append(textElement('div','empty',messages[state.status])); return; }
+        for (const memory of memories) {
+          const card = document.createElement('article'); card.className = 'memory';
+          const top = document.createElement('div'); top.className = 'memory-top';
+          const badges = document.createElement('div'); badges.className = 'badges';
+          badges.append(textElement('span','badge kind',labels[memory.category] || memory.category), textElement('span','badge',labels[memory.source] || memory.source));
+          top.append(badges, textElement('span','importance',`重要度 ${Number(memory.importance).toFixed(2)}`));
+          card.append(top, textElement('p','content',memory.content), textElement('div','meta',`${formatDate(memory.created_at)} · ID ${memory.memory_id.slice(0,8)}`));
+          if (state.status === 'draft') { const actions = document.createElement('div'); actions.className = 'actions'; const approve = textElement('button','approve','承認する'); const reject = textElement('button','reject','却下する'); approve.addEventListener('click', () => review(memory.memory_id,'approved')); reject.addEventListener('click', () => review(memory.memory_id,'rejected')); actions.append(approve,reject); card.append(actions); }
+          list.append(card);
+        }
+      }
+      async function loadMemories() {
+        setBusy(true); summaryText.textContent = '読み込み中です';
+        try { const response = await fetch(`/api/character-memories?status=${encodeURIComponent(state.status)}`, {cache:'no-store'}); const body = await response.json(); if (!response.ok) throw new Error(body.error || `取得エラー (${response.status})`); render(body.memories); }
+        catch (error) { count.textContent = '—'; summaryText.textContent = '読み込めませんでした'; list.replaceChildren(textElement('div','error-box',error.message)); }
+        finally { setBusy(false); }
+      }
+      async function review(memoryId, status) {
+        const verb = status === 'approved' ? '承認' : '却下'; setBusy(true);
+        try { const response = await fetch('/api/character-memories/review', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({memory_id:memoryId,status})}); const body = await response.json(); if (!response.ok) throw new Error(body.error || `${verb}エラー (${response.status})`); showToast(`記憶を${verb}しました。`); await loadMemories(); }
+        catch (error) { showToast(error.message,true); setBusy(false); }
+      }
+      document.querySelectorAll('.tab').forEach(tab => tab.addEventListener('click', () => { if (state.busy || tab.dataset.status === state.status) return; state.status = tab.dataset.status; document.querySelectorAll('.tab').forEach(item => item.classList.toggle('active', item === tab)); loadMemories(); }));
+      refresh.addEventListener('click', loadMemories); loadMemories(); window.setInterval(() => { if (!state.busy && state.status === 'draft') loadMemories(); }, 10000);
+    </script>
+  </body>
+</html>

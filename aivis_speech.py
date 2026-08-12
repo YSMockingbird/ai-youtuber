@@ -3,6 +3,11 @@ import requests
 
 DEFAULT_AIVIS_API_URL = "http://127.0.0.1:10101"
 DEFAULT_VOICE_SPEED_SCALE = 1.2
+VOICE_SPEED_SCALE_BY_STYLE = {
+    "slow": 1.0,
+    "normal": DEFAULT_VOICE_SPEED_SCALE,
+    "fast": 1.4,
+}
 VOICE_SETTINGS_BY_EMOTION = {}
 PRONUNCIATION_REPLACEMENTS = (
     ("才羽 ガン奈", "さいばね がんな"),
@@ -70,7 +75,13 @@ class AivisSpeechClient:
                 )
         return styles
 
-    def synthesize(self, text, speaker_id, emotion="neutral"):
+    def synthesize(
+        self,
+        text,
+        speaker_id,
+        emotion="neutral",
+        speech_style="normal",
+    ):
         normalized_text = text.strip()
         if not normalized_text:
             raise ValueError("音声合成する文章が空です。")
@@ -78,6 +89,14 @@ class AivisSpeechClient:
             raise ValueError("音声合成する文章は1,000文字以内で指定してください。")
         if not isinstance(speaker_id, int):
             raise ValueError("AivisSpeechのスタイルIDは整数で指定してください。")
+        if (
+            not isinstance(speech_style, str)
+            or speech_style not in VOICE_SPEED_SCALE_BY_STYLE
+        ):
+            raise ValueError(
+                "未対応のspeech_styleです。"
+                f"speech_style={speech_style}"
+            )
 
         speech_text = apply_pronunciation_replacements(normalized_text)
 
@@ -93,10 +112,10 @@ class AivisSpeechClient:
                 "AivisSpeechの音声合成クエリをJSONとして読み取れませんでした。"
             ) from exc
 
-        # 全感情の基準話速を適用し、必要な場合だけ感情別設定で上書きします。
+        # 感情別設定とは独立して、AIが選んだ話速を適用します。
         voice_settings = {
-            "speedScale": DEFAULT_VOICE_SPEED_SCALE,
             **VOICE_SETTINGS_BY_EMOTION.get(emotion, {}),
+            "speedScale": VOICE_SPEED_SCALE_BY_STYLE[speech_style],
         }
         audio_query.update(voice_settings)
 

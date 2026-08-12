@@ -1,31 +1,222 @@
 import unittest
-from unittest.mock import Mock, patch
+from unittest.mock import Mock, call, patch
 
 from main import (
     generate_and_deliver_ai_response,
     generate_and_deliver_news_commentary,
     get_autonomous_speech_interval_seconds,
     get_mock_live_delay_seconds,
+    process_next_admin_command,
     run_ai_youtuber_loop,
     run_mock_live,
 )
 
 
 class GenerateAndDeliverAiResponseTest(unittest.TestCase):
+    def test_admin_pause_command_pauses_only_autonomous_buffer(self):
+        runtime = Mock()
+        runtime.get_next_admin_command.return_value = {
+            "action": "pause_autonomous",
+        }
+        autonomous_buffer = Mock()
+        stream_context = Mock()
+
+        handled = process_next_admin_command(
+            runtime,
+            autonomous_buffer,
+            stream_context,
+        )
+
+        self.assertTrue(handled)
+        autonomous_buffer.pause.assert_called_once_with()
+        runtime.update_admin_status.assert_called_once_with(
+            autonomous_paused=True,
+            phase="paused",
+            message="自発発話を一時停止しました。コメント返信は継続します。",
+        )
+
+    def test_admin_direct_speech_bypasses_llm_and_reschedules(
+        self,
+    ):
+        runtime = Mock()
+        runtime.get_next_admin_command.return_value = {
+            "action": "direct_speech",
+            "text": "そのまま読む文章",
+            "emotion": "relaxed",
+            "speech_style": "normal",
+            "motion": None,
+        }
+        runtime.speak.return_value = (
+            {"duration_ms": 1800},
+            1,
+        )
+        autonomous_buffer = Mock(paused=False)
+        stream_context = Mock()
+
+        handled = process_next_admin_command(
+            runtime,
+            autonomous_buffer,
+            stream_context,
+        )
+
+        self.assertTrue(handled)
+        autonomous_buffer.cancel_next.assert_called_once_with()
+        autonomous_buffer.schedule_after_external_speech.assert_called_once_with(
+            1800
+        )
+        runtime.speak.assert_called_once_with(
+            "そのまま読む文章",
+            "relaxed",
+            None,
+            None,
+            "normal",
+        )
+
+    def test_admin_direct_speech_accepts_string_motion(self):
+        runtime = Mock()
+        runtime.get_next_admin_command.return_value = {
+            "action": "direct_speech",
+            "text": "手を振るよ。",
+            "emotion": "happy",
+            "speech_style": "normal",
+            "motion": "greeting",
+        }
+        runtime.speak.return_value = (
+            {"duration_ms": 1500},
+            1,
+        )
+        autonomous_buffer = Mock(paused=False)
+
+        handled = process_next_admin_command(
+            runtime,
+            autonomous_buffer,
+            Mock(),
+        )
+
+        self.assertTrue(handled)
+        runtime.speak.assert_called_once_with(
+            "手を振るよ。",
+            "happy",
+            "greeting",
+            None,
+            "normal",
+        )
+
+    @patch("main.deliver_generated_response_with_command")
+    @patch("main.generate_admin_directed_speech")
+    def test_closing_greeting_pauses_autonomous_speech(
+        self,
+        generate_mock,
+        deliver_mock,
+    ):
+        runtime = Mock()
+        runtime.get_next_admin_command.return_value = {
+            "action": "closing_greeting",
+        }
+        generate_mock.return_value = {
+            "text": "今日はここまで。またね。",
+            "emotion": "relaxed",
+            "motion": None,
+        }
+        deliver_mock.return_value = (
+            generate_mock.return_value,
+            1,
+            {"duration_ms": 2000},
+        )
+        autonomous_buffer = Mock(paused=False)
+
+        handled = process_next_admin_command(
+            runtime,
+            autonomous_buffer,
+            Mock(),
+        )
+
+        self.assertTrue(handled)
+        autonomous_buffer.pause.assert_called_once_with()
+        autonomous_buffer.schedule_after_external_speech.assert_not_called()
+        generate_mock.assert_called_once()
+
+    @patch("main.deliver_generated_response_with_command")
+    @patch("main.generate_ai_response")
+    @patch("main.AutonomousSpeechBuffer")
+    @patch("main.SpeechScheduler.from_config")
+    @patch("main.StreamContextManager")
+    @patch("main.load_llm_config")
+    @patch("main.iter_chat_messages")
+    @patch("main.get_live_chat_id")
+    def test_live_loop_marks_selected_comment_as_reply_target(
+        self,
+        live_chat_id_mock,
+        iter_messages_mock,
+        load_config_mock,
+        context_manager_mock,
+        scheduler_factory_mock,
+        buffer_class_mock,
+        generate_mock,
+        deliver_mock,
+    ):
+        live_chat_id_mock.return_value = "live-chat-id"
+        target_message = {
+            "message_id": "message-1",
+            "user_id": "channel-1",
+            "user_name": "視聴者",
+            "comment": "どのコメントに返事してる？",
+            "published_at": "2026-08-12T00:00:00Z",
+        }
+        iter_messages_mock.return_value = iter(
+            [{"messages": [target_message], "next_page_token": None}]
+        )
+        load_config_mock.return_value = {
+            "autonomous_speech": {"silence_seconds": 3}
+        }
+        stream_context = context_manager_mock.return_value
+        scheduler_factory_mock.return_value.silence_seconds = 3
+        autonomous_buffer = buffer_class_mock.return_value
+        autonomous_buffer.theme_manager.describe.return_value = "テーマ"
+        generate_mock.return_value = {
+            "text": "このコメントに返しているよ。",
+            "emotion": "happy",
+            "motion": None,
+        }
+        deliver_mock.return_value = (
+            generate_mock.return_value,
+            1,
+            {"duration_ms": 2400},
+        )
+        runtime = Mock()
+
+        run_ai_youtuber_loop(max_loops=1, runtime=runtime)
+
+        runtime.publish_chat_messages.assert_called_once_with([target_message])
+        self.assertEqual(
+            runtime.publish_chat_reply_state.call_args_list,
+            [
+                call("message-1", "thinking"),
+                call("message-1", "speaking", 2400),
+            ],
+        )
+
     @patch("main.generate_ai_response")
     def test_openai_response_is_delivered_to_external_control(self, generate_mock):
         generate_mock.return_value = {
             "text": "今日は調子がいいよ。",
             "emotion": "happy",
+            "speech_style": "fast",
             "motion": {
                 "name": "peace_sign",
                 "speed": 1.0,
                 "intensity": 0.8,
                 "head": "nod",
             },
+            "view_action": "full_body",
         }
         runtime = Mock()
-        runtime.speak.return_value = ({"type": "speak"}, 1)
+        prepared_speech = object()
+        runtime.prepare_speech.return_value = prepared_speech
+        runtime.publish_prepared_speech.return_value = (
+            {"type": "speak", "duration_ms": 1500},
+            1,
+        )
 
         response, delivered_count = generate_and_deliver_ai_response(
             runtime,
@@ -37,15 +228,20 @@ class GenerateAndDeliverAiResponseTest(unittest.TestCase):
             "テストユーザー",
             "今日の調子はどう？",
         )
-        runtime.speak.assert_called_once_with(
+        runtime.prepare_speech.assert_called_once_with(
             "今日は調子がいいよ。",
             "happy",
+            "fast",
+        )
+        runtime.publish_prepared_speech.assert_called_once_with(
+            prepared_speech,
             {
                 "name": "peace_sign",
                 "speed": 1.0,
                 "intensity": 0.8,
                 "head": "nod",
             },
+            "full_body",
         )
         self.assertEqual(response["emotion"], "happy")
         self.assertEqual(delivered_count, 1)
@@ -58,16 +254,26 @@ class GenerateAndDeliverAiResponseTest(unittest.TestCase):
             "motion": None,
         }
         runtime = Mock()
-        runtime.speak.return_value = ({"type": "speak"}, 1)
+        prepared_speech = object()
+        runtime.prepare_speech.return_value = prepared_speech
+        runtime.publish_prepared_speech.return_value = (
+            {"type": "speak", "duration_ms": 1500},
+            1,
+        )
 
         response, delivered_count = generate_and_deliver_news_commentary(
             runtime,
             {"title": "新しい技術が発表"},
         )
 
-        runtime.speak.assert_called_once_with(
+        runtime.prepare_speech.assert_called_once_with(
             "新しい技術、少し気になるね。",
             "surprised",
+            "normal",
+        )
+        runtime.publish_prepared_speech.assert_called_once_with(
+            prepared_speech,
+            None,
             None,
         )
         self.assertEqual(response["emotion"], "surprised")

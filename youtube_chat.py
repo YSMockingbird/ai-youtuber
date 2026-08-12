@@ -8,16 +8,32 @@ YOUTUBE_VIDEO_API_URL = "https://www.googleapis.com/youtube/v3/videos"
 YOUTUBE_LIVE_CHAT_API_URL = "https://www.googleapis.com/youtube/v3/liveChat/messages"
 
 
+def resolve_youtube_video_id():
+    # 手動IDを優先し、未設定の場合だけOAuthで現在ライブ中の配信を検索します。
+    configured_video_id = os.getenv("YOUTUBE_VIDEO_ID", "").strip()
+    if configured_video_id and "your_" not in configured_video_id:
+        print(f"設定済みのYouTube動画IDを使用します：{configured_video_id}")
+        return configured_video_id
+
+    # 手動ID利用時はOAuthライブラリを読み込まず、従来どおり動作させます。
+    from youtube_oauth import find_active_youtube_broadcast
+
+    broadcast = find_active_youtube_broadcast()
+    print(
+        "現在ライブ中の配信を自動取得しました："
+        f"{broadcast['title']} / video_id={broadcast['video_id']}"
+    )
+    return broadcast["video_id"]
+
+
 def get_live_chat_id():
-    # .envからYouTube APIキーと配信動画IDを読み込みます。
+    # 手動またはOAuthで動画IDを決定し、ライブチャットIDを取得します。
     api_key = os.getenv("YOUTUBE_API_KEY", "").strip()
-    video_id = os.getenv("YOUTUBE_VIDEO_ID", "").strip()
 
     if not api_key or "your_" in api_key:
         raise RuntimeError("YOUTUBE_API_KEYが未設定です。.envにYouTube Data APIキーを設定してください。")
 
-    if not video_id or "your_" in video_id:
-        raise RuntimeError("YOUTUBE_VIDEO_IDが未設定です。.envにYouTube Liveの動画IDを設定してください。")
+    video_id = resolve_youtube_video_id()
 
     params = {
         "part": "liveStreamingDetails",
@@ -109,8 +125,15 @@ def fetch_chat_messages(live_chat_id, page_token=None):
     }
 
 
-def iter_chat_messages(live_chat_id, max_loops=None):
+def iter_chat_messages(
+    live_chat_id,
+    max_loops=None,
+    wait_callback=None,
+    wait_step_seconds=0.25,
+):
     # pollingIntervalMillisに従って、YouTube Liveコメントを継続取得します。
+    if float(wait_step_seconds) <= 0:
+        raise ValueError("wait_step_secondsは0より大きくしてください。")
     page_token = None
     loop_count = 0
 
@@ -124,5 +147,10 @@ def iter_chat_messages(live_chat_id, max_loops=None):
         if max_loops is not None and loop_count >= max_loops:
             break
 
-        wait_seconds = result["polling_interval_millis"] / 1000
-        time.sleep(wait_seconds)
+        remaining_seconds = result["polling_interval_millis"] / 1000
+        while remaining_seconds > 0:
+            if wait_callback is not None:
+                wait_callback()
+            sleep_seconds = min(float(wait_step_seconds), remaining_seconds)
+            time.sleep(sleep_seconds)
+            remaining_seconds -= sleep_seconds

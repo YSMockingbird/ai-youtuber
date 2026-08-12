@@ -1,7 +1,7 @@
 {
   "provider": "openai",
   "context": {
-    "total_token_budget": 2400,
+    "total_token_budget": 4800,
     "relevant_memory_token_budget": 300,
     "stream_summary_token_budget": 300,
     "recent_conversation_token_budget": 700,
@@ -12,13 +12,19 @@
   "memory": {
     "minimum_importance": 0.65
   },
+  "character_memory": {
+    "minimum_importance": 0.65
+  },
+  "stream_theme": {
+    "review_utterance_count": 12
+  },
   "autonomous_speech": {
     "silence_seconds": 3,
     "topic_weights": {
-      "news": 0.35,
-      "trivia": 0.35,
-      "observation": 0.2,
-      "character_thought": 0.1
+      "news": 0.08,
+      "trivia": 0.12,
+      "observation": 0.58,
+      "character_thought": 0.22
     },
     "estimated_characters_per_second": 7.0,
     "minimum_duration_seconds": 2.0,

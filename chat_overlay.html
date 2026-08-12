@@ -1,0 +1,312 @@
+<!doctype html>
+<html lang="ja">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>AI YouTuber Chat Overlay</title>
+    <style>
+      :root {
+        color-scheme: dark;
+        font-family: -apple-system, BlinkMacSystemFont, "Hiragino Sans",
+          "Yu Gothic", sans-serif;
+      }
+
+      * {
+        box-sizing: border-box;
+      }
+
+      html,
+      body {
+        width: 100%;
+        height: 100%;
+        margin: 0;
+        overflow: hidden;
+        background: transparent;
+      }
+
+      .chat-panel {
+        position: absolute;
+        inset: 0;
+        display: flex;
+        flex-direction: column;
+        justify-content: flex-end;
+        gap: 10px;
+        padding: 18px;
+        overflow: hidden;
+      }
+
+      .message {
+        position: relative;
+        flex: 0 0 auto;
+        padding: 11px 14px 12px;
+        overflow: hidden;
+        border: 1px solid rgba(255, 255, 255, 0.12);
+        border-radius: 14px;
+        background: linear-gradient(
+          135deg,
+          rgba(12, 15, 24, 0.82),
+          rgba(25, 26, 37, 0.72)
+        );
+        box-shadow: 0 5px 18px rgba(0, 0, 0, 0.28);
+        backdrop-filter: blur(7px);
+        animation: message-in 240ms ease-out both;
+        transition: border-color 180ms ease, box-shadow 180ms ease,
+          opacity 180ms ease;
+      }
+
+      .message[data-reply-state="thinking"],
+      .message[data-reply-state="speaking"] {
+        border-color: rgba(94, 229, 255, 0.95);
+        box-shadow: 0 0 0 2px rgba(94, 229, 255, 0.22),
+          0 0 24px rgba(49, 190, 255, 0.42);
+      }
+
+      .message[data-reply-state="thinking"] {
+        animation: reply-pulse 1.15s ease-in-out infinite alternate;
+      }
+
+      .message[data-reply-state="completed"] {
+        border-color: rgba(144, 238, 184, 0.45);
+        opacity: 0.88;
+      }
+
+      .reply-badge {
+        position: absolute;
+        top: 9px;
+        right: 10px;
+        display: none;
+        padding: 4px 8px;
+        border-radius: 999px;
+        background: rgba(34, 173, 217, 0.92);
+        color: #fff;
+        font-size: 12px;
+        font-weight: 800;
+        letter-spacing: 0.04em;
+        box-shadow: 0 2px 8px rgba(0, 0, 0, 0.35);
+      }
+
+      .message[data-reply-state] .reply-badge {
+        display: block;
+      }
+
+      .message[data-reply-state="completed"] .reply-badge {
+        background: rgba(59, 139, 99, 0.88);
+      }
+
+      .user-name {
+        margin-bottom: 4px;
+        overflow: hidden;
+        color: hsl(var(--name-hue), 82%, 72%);
+        font-size: 18px;
+        font-weight: 750;
+        line-height: 1.25;
+        text-overflow: ellipsis;
+        text-shadow: 0 1px 3px rgba(0, 0, 0, 0.8);
+        white-space: nowrap;
+      }
+
+      .comment {
+        display: -webkit-box;
+        overflow: hidden;
+        color: #fff;
+        font-size: 21px;
+        font-weight: 600;
+        line-height: 1.42;
+        overflow-wrap: anywhere;
+        text-shadow: 0 2px 4px rgba(0, 0, 0, 0.9);
+        white-space: pre-wrap;
+        -webkit-box-orient: vertical;
+        -webkit-line-clamp: 4;
+      }
+
+      .status {
+        align-self: flex-end;
+        padding: 5px 9px;
+        border-radius: 999px;
+        background: rgba(0, 0, 0, 0.55);
+        color: rgba(255, 255, 255, 0.7);
+        font-size: 12px;
+        transition: opacity 300ms ease;
+      }
+
+      .status.connected {
+        opacity: 0;
+      }
+
+      @keyframes message-in {
+        from {
+          opacity: 0;
+          transform: translateY(18px) scale(0.98);
+        }
+        to {
+          opacity: 1;
+          transform: translateY(0) scale(1);
+        }
+      }
+
+      @keyframes reply-pulse {
+        from {
+          box-shadow: 0 0 0 2px rgba(94, 229, 255, 0.18),
+            0 0 14px rgba(49, 190, 255, 0.24);
+        }
+        to {
+          box-shadow: 0 0 0 3px rgba(94, 229, 255, 0.32),
+            0 0 28px rgba(49, 190, 255, 0.58);
+        }
+      }
+    </style>
+  </head>
+  <body>
+    <main id="chat" class="chat-panel" aria-live="polite">
+      <div id="status" class="status">接続中...</div>
+    </main>
+    <script>
+      const MAX_VISIBLE_MESSAGES = 12;
+      const chat = document.getElementById('chat');
+      const status = document.getElementById('status');
+      const messageElements = new Map();
+      const completionTimers = new Map();
+      const events = new EventSource('/chat-events');
+
+      function hueFromName(name) {
+        let hash = 0;
+        for (const character of name) {
+          hash = ((hash << 5) - hash + character.codePointAt(0)) | 0;
+        }
+        return Math.abs(hash) % 360;
+      }
+
+      function removeOverflow() {
+        while (messageElements.size > MAX_VISIBLE_MESSAGES) {
+          const oldestId = Array.from(messageElements.entries()).find(
+            ([, element]) => !['thinking', 'speaking'].includes(
+              element.dataset.replyState
+            )
+          )?.[0];
+          if (!oldestId) break;
+          const element = messageElements.get(oldestId);
+          messageElements.delete(oldestId);
+          window.clearTimeout(completionTimers.get(oldestId));
+          completionTimers.delete(oldestId);
+          element?.remove();
+        }
+      }
+
+      function setReplyState(messageId, state, replyUntilMs = null) {
+        const element = messageElements.get(messageId);
+        if (!element) return;
+        window.clearTimeout(completionTimers.get(messageId));
+        completionTimers.delete(messageId);
+
+        const badge = element.querySelector('.reply-badge');
+        if (state === 'clear') {
+          delete element.dataset.replyState;
+          badge.textContent = '';
+          removeOverflow();
+          return;
+        }
+        if (!['thinking', 'speaking', 'completed'].includes(state)) return;
+        element.dataset.replyState = state;
+        badge.textContent = {
+          thinking: '考え中',
+          speaking: '返信中',
+          completed: '返信済み',
+        }[state];
+
+        if (state === 'speaking' && Number.isFinite(replyUntilMs)) {
+          const remainingMs = Math.max(replyUntilMs - Date.now(), 0);
+          const timerId = window.setTimeout(() => {
+            setReplyState(messageId, 'completed');
+          }, remainingMs);
+          completionTimers.set(messageId, timerId);
+        }
+      }
+
+      function addMessage(message, animate = true) {
+        if (!message || typeof message.message_id !== 'string') return;
+        if (messageElements.has(message.message_id)) return;
+        if (typeof message.comment !== 'string' || !message.comment.trim()) return;
+
+        const userName = typeof message.user_name === 'string'
+          ? message.user_name
+          : 'unknown';
+        const wrapper = document.createElement('article');
+        const name = document.createElement('div');
+        const comment = document.createElement('div');
+        const badge = document.createElement('div');
+        wrapper.className = 'message';
+        if (!animate) wrapper.style.animation = 'none';
+        wrapper.style.setProperty('--name-hue', hueFromName(userName));
+        name.className = 'user-name';
+        comment.className = 'comment';
+        badge.className = 'reply-badge';
+
+        // 視聴者の入力をHTMLとして解釈せず、安全なテキストとして表示します。
+        name.textContent = userName;
+        comment.textContent = message.comment;
+        wrapper.append(name, comment, badge);
+        chat.insertBefore(wrapper, status);
+        messageElements.set(message.message_id, wrapper);
+        if (message.reply_state === 'thinking') {
+          setReplyState(message.message_id, 'thinking');
+        } else if (message.reply_state === 'speaking') {
+          const replyUntilMs = Number(message.reply_until_ms);
+          setReplyState(
+            message.message_id,
+            Number.isFinite(replyUntilMs) && replyUntilMs <= Date.now()
+              ? 'completed'
+              : 'speaking',
+            replyUntilMs
+          );
+        }
+        removeOverflow();
+      }
+
+      function replaceMessages(messages) {
+        for (const element of messageElements.values()) element.remove();
+        for (const timerId of completionTimers.values()) {
+          window.clearTimeout(timerId);
+        }
+        messageElements.clear();
+        completionTimers.clear();
+        for (const message of messages.slice(-MAX_VISIBLE_MESSAGES)) {
+          addMessage(message, false);
+        }
+      }
+
+      events.onopen = () => {
+        status.textContent = '接続済み';
+        status.classList.add('connected');
+      };
+
+      events.onmessage = (event) => {
+        try {
+          const command = JSON.parse(event.data);
+          if (command.type === 'chat_snapshot') {
+            if (!Array.isArray(command.messages)) return;
+            replaceMessages(command.messages);
+          } else if (command.type === 'chat_messages') {
+            if (!Array.isArray(command.messages)) return;
+            for (const message of command.messages) addMessage(message);
+          } else if (command.type === 'chat_reply_state') {
+            if (!messageElements.has(command.message_id) && command.message) {
+              addMessage(command.message);
+            }
+            setReplyState(
+              command.message_id,
+              command.state,
+              Number(command.reply_until_ms)
+            );
+          }
+        } catch (error) {
+          console.error('チャットイベントを処理できませんでした。', error);
+        }
+      };
+
+      events.onerror = () => {
+        status.textContent = '再接続中...';
+        status.classList.remove('connected');
+      };
+    </script>
+  </body>
+</html>

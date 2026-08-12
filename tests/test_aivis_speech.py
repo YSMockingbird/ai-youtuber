@@ -78,6 +78,48 @@ class AivisSpeechClientTest(unittest.TestCase):
         self.assertEqual(synthesis_request.kwargs["json"]["speedScale"], 1.2)
 
     @patch("aivis_speech.requests.request")
+    def test_slow_speech_style_uses_speed_1_0(self, request_mock):
+        query_response = Mock()
+        query_response.json.return_value = {"speedScale": 1.2}
+        synthesis_response = Mock()
+        synthesis_response.content = b"RIFF-test-wav"
+        request_mock.side_effect = [query_response, synthesis_response]
+
+        AivisSpeechClient().synthesize(
+            "ゆっくり話すね",
+            101,
+            speech_style="slow",
+        )
+
+        synthesis_request = request_mock.call_args_list[1]
+        self.assertEqual(synthesis_request.kwargs["json"]["speedScale"], 1.0)
+
+    @patch("aivis_speech.requests.request")
+    def test_fast_speech_style_uses_speed_1_4(self, request_mock):
+        query_response = Mock()
+        query_response.json.return_value = {"speedScale": 1.2}
+        synthesis_response = Mock()
+        synthesis_response.content = b"RIFF-test-wav"
+        request_mock.side_effect = [query_response, synthesis_response]
+
+        AivisSpeechClient().synthesize(
+            "急いで話すよ",
+            101,
+            speech_style="fast",
+        )
+
+        synthesis_request = request_mock.call_args_list[1]
+        self.assertEqual(synthesis_request.kwargs["json"]["speedScale"], 1.4)
+
+    def test_unknown_speech_style_is_rejected(self):
+        with self.assertRaisesRegex(ValueError, "未対応のspeech_style"):
+            AivisSpeechClient().synthesize(
+                "話すよ",
+                101,
+                speech_style="very_fast",
+            )
+
+    @patch("aivis_speech.requests.request")
     def test_synthesize_sends_corrected_pronunciation(self, request_mock):
         query_response = Mock()
         query_response.json.return_value = {"speedScale": 1.0}

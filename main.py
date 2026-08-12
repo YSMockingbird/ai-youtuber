@@ -6,11 +6,14 @@ from dotenv import load_dotenv
 
 from aivis_speech import AivisSpeechClient, DEFAULT_AIVIS_API_URL
 from ai_response import (
+    generate_admin_directed_speech,
     generate_ai_response,
     generate_autonomous_speech,
     generate_news_commentary,
 )
 from autonomous_topics import AutonomousTopicSelector, TOPIC_INSTRUCTIONS
+from autonomous_buffer import AutonomousSpeechBuffer
+from character_memory import get_character_memory_repository
 from control_server import ALLOWED_EMOTIONS, ExternalControlServer
 from llm.config import load_llm_config
 from llm.session import StreamContextManager
@@ -31,6 +34,45 @@ def run_openai_test():
     print(f"AI：{ai_response['text']}")
     print(f"emotion：{ai_response['emotion']}")
     print(f"motion：{ai_response['motion']}")
+
+
+def run_character_memory_list(status="draft"):
+    repository = get_character_memory_repository()
+    memories = repository.list(status)
+    if not memories:
+        print(f"キャラクター記憶はありません。status={status}")
+        return
+    for memory in memories:
+        print(
+            f"ID: {memory['memory_id']}\n"
+            f"状態: {memory['status']} / 種類: {memory['category']} / "
+            f"重要度: {memory['importance']:.2f}\n"
+            f"出典: {memory['source']} / 作成日時: {memory['created_at']}\n"
+            f"内容: {memory['content']}\n"
+        )
+
+
+def run_character_memory_review(memory_id, status):
+    if not str(memory_id or "").strip():
+        raise RuntimeError(
+            "--character-memory-idへ審査するキャラクター記憶IDを指定してください。"
+        )
+    repository = get_character_memory_repository()
+    repository.review(memory_id, status)
+    result = "承認" if status == "approved" else "却下"
+    print(f"キャラクター記憶を{result}しました。memory_id={memory_id}")
+
+
+def record_ai_speech_with_character_event(stream_context, ai_response, source):
+    candidate = ai_response.get("character_event_candidate")
+    if candidate:
+        stream_context.record_ai_speech(
+            ai_response["text"],
+            candidate,
+            source=source,
+        )
+    else:
+        stream_context.record_ai_speech(ai_response["text"])
 
 
 def create_aivis_client():
@@ -155,6 +197,9 @@ def print_external_control_server_info(version, speaker_id, port):
     )
     print(f"SSE URL: http://127.0.0.1:{port}/events")
     print(f"OBS字幕URL: http://127.0.0.1:{port}/overlay")
+    print(f"OBSチャットURL: http://127.0.0.1:{port}/chat-overlay")
+    print(f"配信管理画面: http://127.0.0.1:{port}/admin")
+    print(f"記憶管理画面: http://127.0.0.1:{port}/character-memories")
     print(f"確認URL: http://127.0.0.1:{port}/health")
 
 
@@ -203,6 +248,26 @@ def run_external_control_server():
 
 
 def deliver_generated_response(runtime, ai_response):
+    filtered_response, delivered_count, _ = (
+        deliver_generated_response_with_command(runtime, ai_response)
+    )
+    return filtered_response, delivered_count
+
+
+def deliver_generated_response_with_command(runtime, ai_response):
+    prepared_speech = runtime.prepare_speech(
+        ai_response["text"],
+        ai_response["emotion"],
+        ai_response.get("speech_style", "normal"),
+    )
+    return deliver_prepared_response(
+        runtime,
+        ai_response,
+        prepared_speech,
+    )
+
+
+def deliver_prepared_response(runtime, ai_response, prepared_speech):
     # ランタイムごとにモーション間隔を管理し、発話経路を共通化します。
     runtime_state = vars(runtime)
     motion_limiter = runtime_state.get("_ai_motion_limiter")
@@ -214,12 +279,12 @@ def deliver_generated_response(runtime, ai_response):
     filtered_response["motion"] = motion_limiter.filter(
         ai_response.get("motion")
     )
-    _, delivered_count = runtime.speak(
-        filtered_response["text"],
-        filtered_response["emotion"],
+    command, delivered_count = runtime.publish_prepared_speech(
+        prepared_speech,
         filtered_response["motion"],
+        filtered_response.get("view_action"),
     )
-    return filtered_response, delivered_count
+    return filtered_response, delivered_count, command
 
 
 def generate_and_deliver_ai_response(
@@ -238,6 +303,9 @@ def generate_and_deliver_ai_response(
             comment,
             context_builder=stream_context.context_builder,
             user_id=user_id,
+            character_memory_repository=(
+                stream_context.character_memory_repository
+            ),
         )
         stream_context.record_comment_exchange(
             user_id,
@@ -300,9 +368,18 @@ def generate_and_deliver_news_commentary(
         context_builder=(
             stream_context.context_builder if stream_context else None
         ),
+        character_memory_repository=(
+            stream_context.character_memory_repository
+            if stream_context
+            else None
+        ),
     )
     if stream_context is not None:
-        stream_context.record_ai_speech(ai_response["text"])
+        record_ai_speech_with_character_event(
+            stream_context,
+            ai_response,
+            source="news",
+        )
     return deliver_generated_response(runtime, ai_response)
 
 
@@ -357,10 +434,19 @@ def deliver_autonomous_speech(
         context_builder=(
             stream_context.context_builder if stream_context else None
         ),
+        character_memory_repository=(
+            stream_context.character_memory_repository
+            if stream_context
+            else None
+        ),
     )
     recent_utterances.append(ai_response["text"])
     if stream_context is not None:
-        stream_context.record_ai_speech(ai_response["text"])
+        record_ai_speech_with_character_event(
+            stream_context,
+            ai_response,
+            source="autonomous_speech",
+        )
     return deliver_generated_response(runtime, ai_response)
 
 
@@ -545,6 +631,130 @@ def is_reply_candidate(message):
     return True
 
 
+def process_next_admin_command(runtime, autonomous_buffer, stream_context):
+    command = runtime.get_next_admin_command()
+    if command is None:
+        return False
+
+    action = command["action"]
+    try:
+        if action == "pause_autonomous":
+            autonomous_buffer.pause()
+            runtime.update_admin_status(
+                autonomous_paused=True,
+                phase="paused",
+                message="自発発話を一時停止しました。コメント返信は継続します。",
+            )
+            print("管理画面：自発発話を一時停止しました。")
+            return True
+
+        if action == "resume_autonomous":
+            autonomous_buffer.resume()
+            runtime.update_admin_status(
+                autonomous_paused=False,
+                phase="waiting",
+                message="自発発話を再開しました。",
+            )
+            print("管理画面：自発発話を再開しました。")
+            return True
+
+        if action == "cancel_next":
+            autonomous_buffer.cancel_next()
+            runtime.update_admin_status(
+                phase=("paused" if autonomous_buffer.paused else "waiting"),
+                message="先読み済みの次の自発発話をキャンセルしました。",
+            )
+            print("管理画面：次の自発発話をキャンセルしました。")
+            return True
+
+        autonomous_buffer.cancel_next()
+        runtime.update_admin_status(
+            phase="processing",
+            message=(
+                "終了挨拶を生成しています。"
+                if action == "closing_greeting"
+                else "管理者の発話指示を処理しています。"
+            ),
+        )
+
+        if action == "direct_speech":
+            generated_response = {
+                "text": command["text"],
+                "emotion": command["emotion"],
+                "speech_style": command["speech_style"],
+                "motion": command.get("motion"),
+                "view_action": None,
+            }
+        else:
+            instruction = (
+                "その配信らしい自然な終了挨拶をしてください。"
+                if action == "closing_greeting"
+                else command["text"]
+            )
+            generated_response = generate_admin_directed_speech(
+                instruction,
+                context_builder=stream_context.context_builder,
+                closing_greeting=(action == "closing_greeting"),
+            )
+
+        if action == "direct_speech":
+            speech_command, delivered_count = runtime.speak(
+                generated_response["text"],
+                generated_response["emotion"],
+                generated_response.get("motion"),
+                generated_response.get("view_action"),
+                generated_response.get("speech_style", "normal"),
+            )
+            ai_response = generated_response
+        else:
+            ai_response, delivered_count, speech_command = (
+                deliver_generated_response_with_command(
+                    runtime,
+                    generated_response,
+                )
+            )
+        record_ai_speech_with_character_event(
+            stream_context,
+            ai_response,
+            source="admin_instruction",
+        )
+        if action == "closing_greeting":
+            autonomous_buffer.pause()
+        else:
+            autonomous_buffer.schedule_after_external_speech(
+                speech_command["duration_ms"]
+            )
+        runtime.update_admin_status(
+            autonomous_paused=(
+                True
+                if action == "closing_greeting"
+                else autonomous_buffer.paused
+            ),
+            phase="speaking",
+            message=(
+                "終了挨拶を再生しています。自発発話は停止しました。"
+                "OBSとYouTubeは停止しません。"
+                if action == "closing_greeting"
+                else "管理者指定の発話を再生しています。"
+            ),
+            speaking_until_ms=round(
+                time.time() * 1000 + speech_command["duration_ms"]
+            ),
+        )
+        print(f"--- 管理画面からの発話 / action={action} ---")
+        print(f"AI：{ai_response['text']}")
+        print(f"emotion：{ai_response['emotion']}")
+        print(f"接続中クライアント数：{delivered_count}")
+        return True
+    except (RuntimeError, ValueError) as exc:
+        runtime.update_admin_status(
+            phase="error",
+            message=f"管理命令の処理に失敗しました: {exc}",
+        )
+        print(f"管理命令エラー: action={action} detail={exc}")
+        return True
+
+
 def run_ai_youtuber_once():
     # コメントを1回取得し、最初の1件にAIキャラクターとして返答します。
     live_chat_id = get_live_chat_id()
@@ -562,7 +772,7 @@ def run_ai_youtuber_once():
     print(f"emotion：{ai_response['emotion']}")
 
 
-def run_ai_youtuber_loop(max_loops, runtime=None):
+def run_ai_youtuber_loop(max_loops, runtime=None, stream_topic=None):
     # コメントを優先し、音声終了後の無言時間が続いたら自発発話します。
     live_chat_id = get_live_chat_id()
     processed_message_ids = set()
@@ -571,18 +781,55 @@ def run_ai_youtuber_loop(max_loops, runtime=None):
     stream_context = StreamContextManager(config=llm_config)
     speech_scheduler = SpeechScheduler.from_config(llm_config)
     topic_selector = AutonomousTopicSelector(llm_config)
+    autonomous_buffer = None
+    if runtime is not None:
+        autonomous_buffer = AutonomousSpeechBuffer(
+            runtime=runtime,
+            stream_context=stream_context,
+            config=llm_config,
+            publish_callback=deliver_prepared_response,
+            stream_topic=stream_topic,
+        )
     recent_utterances = []
     previous_autonomous_topic = None
     has_received_comment = False
 
     print("AI YouTuberループを開始します。")
     print(f"最大取得回数：{max_loops}")
+    if autonomous_buffer is not None:
+        print(autonomous_buffer.theme_manager.describe())
+        runtime.update_admin_status(
+            available=True,
+            autonomous_paused=False,
+            phase="waiting",
+            message="コメントまたは次の発話を待っています。",
+            stream_theme=autonomous_buffer.theme_manager.state.main_theme,
+        )
     print(
         "自発発話の無言時間："
-        f"{speech_scheduler.silence_seconds:g}秒（音声終了見込みから計測）"
+        f"{speech_scheduler.silence_seconds:g}秒"
+        "（ライブ音声ではWAVの実時間から計測）"
     )
 
-    for index, result in enumerate(iter_chat_messages(live_chat_id, max_loops=max_loops), start=1):
+    def process_live_wait():
+        if autonomous_buffer is None:
+            return False
+        if process_next_admin_command(
+            runtime,
+            autonomous_buffer,
+            stream_context,
+        ):
+            return True
+        return autonomous_buffer.tick()
+
+    chat_results = iter_chat_messages(
+        live_chat_id,
+        max_loops=max_loops,
+        wait_callback=(
+            process_live_wait if autonomous_buffer is not None else None
+        ),
+    )
+    for index, result in enumerate(chat_results, start=1):
         messages = [
             message
             for message in result["messages"]
@@ -592,11 +839,22 @@ def run_ai_youtuber_loop(max_loops, runtime=None):
 
         print(f"--- {index}回目 / 新規コメント数：{len(messages)} ---")
 
+        if runtime is not None and messages:
+            runtime.publish_chat_messages(messages)
+
         for message in messages:
             processed_message_ids.add(message["message_id"])
 
         if target_message is None:
             print("返答対象のコメントはありませんでした。")
+            if autonomous_buffer is not None:
+                if not autonomous_buffer.tick():
+                    print(
+                        "次の準備済み自発発話まで："
+                        f"約{autonomous_buffer.seconds_until_next_speech()}秒"
+                    )
+                continue
+
             if not speech_scheduler.should_speak_autonomously():
                 print(
                     "次の自発発話まで："
@@ -623,6 +881,9 @@ def run_ai_youtuber_loop(max_loops, runtime=None):
                     ai_response = generate_news_commentary(
                         article,
                         context_builder=stream_context.context_builder,
+                        character_memory_repository=(
+                            stream_context.character_memory_repository
+                        ),
                     )
                     used_news_links.add(article["link"])
                 else:
@@ -639,6 +900,9 @@ def run_ai_youtuber_loop(max_loops, runtime=None):
                         recent_utterances,
                         context_builder=stream_context.context_builder,
                         topic_instruction=TOPIC_INSTRUCTIONS[selected_topic],
+                        character_memory_repository=(
+                            stream_context.character_memory_repository
+                        ),
                     )
 
                 delivered_count = None
@@ -646,7 +910,15 @@ def run_ai_youtuber_loop(max_loops, runtime=None):
                     ai_response, delivered_count = deliver_generated_response(
                         runtime, ai_response
                     )
-                stream_context.record_ai_speech(ai_response["text"])
+                record_ai_speech_with_character_event(
+                    stream_context,
+                    ai_response,
+                    source=(
+                        "news"
+                        if selected_topic == "news"
+                        else "autonomous_speech"
+                    ),
+                )
                 recent_utterances.append(ai_response["text"])
                 recent_utterances = recent_utterances[-8:]
                 estimated_duration = speech_scheduler.record_speech(
@@ -673,43 +945,93 @@ def run_ai_youtuber_loop(max_loops, runtime=None):
                 speech_scheduler.record_failed_attempt(retry_seconds=10)
             continue
 
-        ai_response = generate_ai_response(
-            target_message["user_name"],
-            target_message["comment"],
-            context_builder=stream_context.context_builder,
-            user_id=target_message.get("user_id", ""),
-        )
+        if autonomous_buffer is not None:
+            autonomous_buffer.cancel_for_comment()
+
+        if runtime is not None:
+            runtime.publish_chat_reply_state(
+                target_message["message_id"],
+                "thinking",
+            )
+        try:
+            ai_response = generate_ai_response(
+                target_message["user_name"],
+                target_message["comment"],
+                context_builder=stream_context.context_builder,
+                user_id=target_message.get("user_id", ""),
+                character_memory_repository=(
+                    stream_context.character_memory_repository
+                ),
+            )
+        except (RuntimeError, ValueError):
+            if runtime is not None:
+                runtime.publish_chat_reply_state(
+                    target_message["message_id"],
+                    "clear",
+                )
+            raise
         has_received_comment = True
 
         print(f"{target_message['user_name']}：{target_message['comment']}")
         print(f"AI：{ai_response['text']}")
         print(f"emotion：{ai_response['emotion']}")
+        command = None
         if runtime is not None:
-            ai_response, delivered_count = deliver_generated_response(
-                runtime,
-                ai_response,
-            )
+            try:
+                ai_response, delivered_count, command = (
+                    deliver_generated_response_with_command(
+                        runtime,
+                        ai_response,
+                    )
+                )
+            except (RuntimeError, ValueError):
+                runtime.publish_chat_reply_state(
+                    target_message["message_id"],
+                    "clear",
+                )
+                raise
             print(f"motion：{ai_response['motion']}")
             print(f"接続中クライアント数：{delivered_count}")
+            runtime.publish_chat_reply_state(
+                target_message["message_id"],
+                "speaking",
+                command["duration_ms"],
+            )
         stream_context.record_comment_exchange(
             target_message.get("user_id", ""),
             target_message["user_name"],
             target_message["comment"],
             ai_response,
         )
-        recent_utterances.append(ai_response["text"])
-        recent_utterances = recent_utterances[-8:]
-        speech_scheduler.record_speech(ai_response["text"])
+        if autonomous_buffer is not None:
+            autonomous_buffer.resume_after_comment(
+                ai_response,
+                command["duration_ms"],
+                comment=target_message["comment"],
+            )
+        else:
+            recent_utterances.append(ai_response["text"])
+            recent_utterances = recent_utterances[-8:]
+            speech_scheduler.record_speech(ai_response["text"])
 
 
-def run_ai_youtuber_live(max_loops):
+def run_ai_youtuber_live(max_loops, stream_topic=None):
     # YouTube、OpenAI、AivisSpeech、AITuber OnAirをまとめて実行します。
     server, version, speaker_id, port = start_external_control_server()
     print_external_control_server_info(version, speaker_id, port)
 
     try:
-        run_ai_youtuber_loop(max_loops, runtime=server.runtime)
+        run_ai_youtuber_loop(
+            max_loops,
+            runtime=server.runtime,
+            stream_topic=stream_topic,
+        )
     finally:
+        server.runtime.update_admin_status(
+            available=False,
+            phase="stopped",
+            message="ライブ制御は停止しています。",
+        )
         server.stop()
         print("外部制御サーバーを停止しました。")
 
@@ -732,6 +1054,10 @@ def parse_args():
             "news-voice",
             "ai-youtuber-live",
             "mock-live",
+            "character-memory-drafts",
+            "character-memory-approved",
+            "character-memory-approve",
+            "character-memory-reject",
         ],
         default="openai-test",
         help="実行する確認処理を選びます。",
@@ -747,6 +1073,19 @@ def parse_args():
         type=float,
         default=None,
         help="mock-liveモードで各発話の間に待つ秒数です。",
+    )
+    parser.add_argument(
+        "--stream-topic",
+        default=None,
+        help=(
+            "ai-youtuber-liveのメインテーマを手動指定します。"
+            "省略した場合は配信開始時にAIが自動決定します。"
+        ),
+    )
+    parser.add_argument(
+        "--character-memory-id",
+        default=None,
+        help="character-memory-approveまたはcharacter-memory-rejectの対象IDです。",
     )
     return parser.parse_args()
 
@@ -780,9 +1119,17 @@ def main():
         elif args.mode == "news-voice":
             run_news_voice_test()
         elif args.mode == "ai-youtuber-live":
-            run_ai_youtuber_live(args.max_loops)
+            run_ai_youtuber_live(args.max_loops, args.stream_topic)
         elif args.mode == "mock-live":
             run_mock_live(args.mock_delay_seconds)
+        elif args.mode == "character-memory-drafts":
+            run_character_memory_list("draft")
+        elif args.mode == "character-memory-approved":
+            run_character_memory_list("approved")
+        elif args.mode == "character-memory-approve":
+            run_character_memory_review(args.character_memory_id, "approved")
+        elif args.mode == "character-memory-reject":
+            run_character_memory_review(args.character_memory_id, "rejected")
     except (RuntimeError, ValueError) as exc:
         print(f"エラー: {exc}")
         return

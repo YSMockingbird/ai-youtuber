@@ -2,6 +2,7 @@ import os
 from pathlib import Path
 
 from character import CHARACTER_PROMPT
+from character_memory import get_character_memory_repository
 from llm.config import PROJECT_ROOT, load_llm_config
 from llm.context_builder import ContextBuilder
 from llm.conversation import ConversationState
@@ -9,7 +10,12 @@ from llm.memory import SQLiteMemoryRepository, is_safe_memory_content
 
 
 class StreamContextManager:
-    def __init__(self, config=None, memory_repository=None):
+    def __init__(
+        self,
+        config=None,
+        memory_repository=None,
+        character_memory_repository=None,
+    ):
         self.config = config or load_llm_config()
         context_config = self.config.get("context", {})
         self.conversation = ConversationState(
@@ -29,6 +35,9 @@ class StreamContextManager:
                 raise RuntimeError("MEMORY_DB_PATHが空です。")
             memory_repository = SQLiteMemoryRepository(Path(database_path))
         self.memory_repository = memory_repository
+        self.character_memory_repository = (
+            character_memory_repository or get_character_memory_repository()
+        )
         self.context_builder = ContextBuilder(
             character_prompt=CHARACTER_PROMPT,
             config=self.config,
@@ -55,9 +64,22 @@ class StreamContextManager:
             user_name,
             ai_response.get("memory_candidate"),
         )
+        self._save_character_event_candidate(
+            ai_response.get("character_event_candidate"),
+            source="comment_reply",
+        )
 
-    def record_ai_speech(self, text):
+    def record_ai_speech(
+        self,
+        text,
+        character_event_candidate=None,
+        source="autonomous_speech",
+    ):
         self.conversation.add("assistant", text)
+        self._save_character_event_candidate(
+            character_event_candidate,
+            source=source,
+        )
 
     def _save_memory_candidate(self, user_id, user_name, candidate):
         if not candidate or not str(user_id or "").strip():
@@ -75,5 +97,25 @@ class StreamContextManager:
             content=content,
             category=candidate.get("category", "profile"),
             importance=importance,
+        )
+        return True
+
+    def _save_character_event_candidate(self, candidate, source):
+        if not candidate:
+            return False
+        minimum_importance = float(
+            self.config.get("character_memory", {}).get(
+                "minimum_importance",
+                0.65,
+            )
+        )
+        importance = float(candidate.get("importance", 0))
+        if importance < minimum_importance:
+            return False
+        self.character_memory_repository.save_draft(
+            content=candidate.get("content", ""),
+            category=candidate.get("category", "episode"),
+            importance=importance,
+            source=source,
         )
         return True

@@ -1,0 +1,373 @@
+<!doctype html>
+<html lang="ja">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>ガン奈 配信管理</title>
+    <style>
+      :root {
+        color-scheme: dark;
+        font-family: -apple-system, BlinkMacSystemFont, "Hiragino Sans",
+          "Yu Gothic", sans-serif;
+        background: #090b10;
+        color: #f5f7fb;
+      }
+      * { box-sizing: border-box; }
+      body {
+        margin: 0;
+        min-height: 100vh;
+        background:
+          radial-gradient(circle at 90% 5%, rgba(76, 98, 188, 0.2), transparent 34%),
+          #090b10;
+      }
+      main {
+        width: min(980px, calc(100% - 32px));
+        margin: 0 auto;
+        padding: 28px 0 56px;
+      }
+      header {
+        display: flex;
+        align-items: flex-start;
+        justify-content: space-between;
+        gap: 20px;
+        margin-bottom: 18px;
+      }
+      h1 { margin: 0 0 6px; font-size: 28px; }
+      .subtle { margin: 0; color: #9299aa; font-size: 14px; }
+      .connection {
+        padding: 7px 11px;
+        border: 1px solid #394052;
+        border-radius: 999px;
+        color: #b6bdcc;
+        font-size: 13px;
+      }
+      .connection.online { border-color: #317b5d; color: #87e7b8; }
+      .header-actions { display: flex; align-items: center; gap: 9px; }
+      .memory-link {
+        padding: 8px 11px;
+        border: 1px solid #51467a;
+        border-radius: 10px;
+        color: #d7ccff;
+        background: rgba(41, 34, 62, 0.72);
+        font-size: 13px;
+        text-decoration: none;
+      }
+      .status-card, .card {
+        border: 1px solid #252a36;
+        border-radius: 18px;
+        background: rgba(18, 21, 29, 0.9);
+        box-shadow: 0 18px 50px rgba(0, 0, 0, 0.25);
+      }
+      .status-card {
+        display: grid;
+        grid-template-columns: auto 1fr auto;
+        align-items: center;
+        gap: 14px;
+        margin-bottom: 16px;
+        padding: 16px 18px;
+      }
+      .status-dot {
+        width: 11px;
+        height: 11px;
+        border-radius: 50%;
+        background: #7d8494;
+        box-shadow: 0 0 0 5px rgba(125, 132, 148, 0.12);
+      }
+      .status-dot.active { background: #64d69a; box-shadow: 0 0 0 5px rgba(100, 214, 154, 0.12); }
+      .status-dot.busy { background: #62c8f5; box-shadow: 0 0 0 5px rgba(98, 200, 245, 0.15); }
+      .status-dot.error { background: #fa6f73; box-shadow: 0 0 0 5px rgba(250, 111, 115, 0.14); }
+      .status-title { margin-bottom: 3px; font-size: 15px; font-weight: 750; }
+      .status-message { color: #aab1c0; font-size: 13px; }
+      .queue { color: #7f8798; font-size: 12px; }
+      .theme {
+        margin: -5px 0 18px;
+        padding: 0 6px;
+        color: #abb2c1;
+        font-size: 13px;
+      }
+      .grid {
+        display: grid;
+        grid-template-columns: 1.15fr 0.85fr;
+        gap: 16px;
+      }
+      .card { padding: 20px; }
+      .card.full { grid-column: 1 / -1; }
+      h2 { margin: 0 0 7px; font-size: 18px; }
+      .description { margin: 0 0 16px; color: #9299aa; font-size: 13px; line-height: 1.6; }
+      label { display: block; margin: 13px 0 7px; color: #cbd0dc; font-size: 13px; font-weight: 700; }
+      textarea, select {
+        width: 100%;
+        border: 1px solid #333947;
+        border-radius: 11px;
+        outline: none;
+        background: #0d1017;
+        color: #f6f7fb;
+        font: inherit;
+      }
+      textarea { min-height: 112px; padding: 12px 13px; line-height: 1.55; resize: vertical; }
+      textarea:focus, select:focus { border-color: #6687ea; box-shadow: 0 0 0 3px rgba(102, 135, 234, 0.14); }
+      select { height: 42px; padding: 0 10px; }
+      .selects { display: grid; grid-template-columns: repeat(3, 1fr); gap: 10px; }
+      button {
+        min-height: 42px;
+        padding: 0 15px;
+        border: 1px solid transparent;
+        border-radius: 11px;
+        background: #526fd0;
+        color: #fff;
+        font: inherit;
+        font-size: 14px;
+        font-weight: 760;
+        cursor: pointer;
+        transition: transform 120ms ease, filter 120ms ease, opacity 120ms ease;
+      }
+      button:hover:not(:disabled) { filter: brightness(1.12); transform: translateY(-1px); }
+      button:disabled { cursor: not-allowed; opacity: 0.42; }
+      button.secondary { border-color: #363d4d; background: #1a1f2a; color: #d9deea; }
+      button.warning { border-color: #8f6a30; background: #6c4d1e; }
+      button.danger { border-color: #8d3c43; background: #662a30; }
+      .action-row { display: flex; flex-wrap: wrap; gap: 9px; margin-top: 14px; }
+      .action-row button { flex: 1; }
+      .quick-actions { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+      .quick-actions button { min-height: 58px; }
+      .notice {
+        margin-top: 14px;
+        padding: 11px 13px;
+        border: 1px solid #5d492b;
+        border-radius: 11px;
+        background: rgba(89, 62, 24, 0.22);
+        color: #d9bd87;
+        font-size: 12px;
+        line-height: 1.55;
+      }
+      .result {
+        min-height: 24px;
+        margin-top: 14px;
+        color: #8fe1ba;
+        font-size: 13px;
+      }
+      .result.error { color: #ff8d91; }
+      @media (max-width: 760px) {
+        .grid { grid-template-columns: 1fr; }
+        .card.full { grid-column: auto; }
+        .selects { grid-template-columns: 1fr; }
+        header { flex-direction: column; }
+      }
+    </style>
+  </head>
+  <body>
+    <main>
+      <header>
+        <div>
+          <h1>ガン奈 配信管理</h1>
+          <p class="subtle">配信に映さない、ローカル専用の操作画面です。</p>
+        </div>
+        <div class="header-actions">
+          <a class="memory-link" href="/character-memories">記憶を確認</a>
+          <div id="connection" class="connection">接続確認中</div>
+        </div>
+      </header>
+
+      <section class="status-card">
+        <div id="statusDot" class="status-dot"></div>
+        <div>
+          <div id="statusTitle" class="status-title">起動状態を確認しています</div>
+          <div id="statusMessage" class="status-message">しばらくお待ちください。</div>
+        </div>
+        <div id="queue" class="queue"></div>
+      </section>
+      <div id="theme" class="theme"></div>
+
+      <div class="grid">
+        <section class="card">
+          <h2>AIへの指示</h2>
+          <p class="description">指示文をそのまま読まず、ガン奈自身の自然な発言に変換します。</p>
+          <label for="instruction">非公開の指示</label>
+          <textarea id="instruction" maxlength="500" placeholder="例：今の話から麻雀の話題へ自然に移って"></textarea>
+          <div class="action-row">
+            <button id="sendInstruction">AIへ指示を送る</button>
+          </div>
+        </section>
+
+        <section class="card">
+          <h2>進行操作</h2>
+          <p class="description">コメント返信は止めず、自発的な独り言だけを制御します。</p>
+          <div class="quick-actions">
+            <button id="pause" class="secondary">自発発話を停止</button>
+            <button id="resume" class="secondary">自発発話を再開</button>
+            <button id="cancel" class="secondary">次の発言を取消</button>
+            <button id="closing" class="warning">終了挨拶を生成</button>
+          </div>
+          <div class="notice">終了挨拶をしてもOBS・YouTubeは停止しません。配信停止は引き続き手動です。</div>
+        </section>
+
+        <section class="card full">
+          <h2>文章をそのまま発話</h2>
+          <p class="description">LLMを使わず、入力した文章をそのままAivisSpeechで読ませます。</p>
+          <label for="directText">発話文章</label>
+          <textarea id="directText" maxlength="300" placeholder="例：少し待ってね。いま裏で設定を確認してるよ。"></textarea>
+          <div class="selects">
+            <div>
+              <label for="emotion">表情</label>
+              <select id="emotion">
+                <option value="neutral">neutral</option>
+                <option value="happy">happy</option>
+                <option value="angry">angry</option>
+                <option value="sad">sad</option>
+                <option value="surprised">surprised</option>
+                <option value="relaxed">relaxed</option>
+              </select>
+            </div>
+            <div>
+              <label for="speechStyle">話速</label>
+              <select id="speechStyle">
+                <option value="normal">normal</option>
+                <option value="slow">slow</option>
+                <option value="fast">fast</option>
+              </select>
+            </div>
+            <div>
+              <label for="motion">モーション</label>
+              <select id="motion">
+                <option value="none">なし</option>
+                <option value="greeting">greeting</option>
+                <option value="peace_sign">peace_sign</option>
+                <option value="show_body">show_body</option>
+                <option value="spin">spin</option>
+                <option value="model_pose">model_pose</option>
+                <option value="squat">squat</option>
+              </select>
+            </div>
+          </div>
+          <div class="action-row">
+            <button id="speakDirectly">そのまま発話</button>
+          </div>
+        </section>
+      </div>
+      <div id="result" class="result" role="status" aria-live="polite"></div>
+    </main>
+
+    <script>
+      const elements = {
+        connection: document.getElementById('connection'),
+        statusDot: document.getElementById('statusDot'),
+        statusTitle: document.getElementById('statusTitle'),
+        statusMessage: document.getElementById('statusMessage'),
+        queue: document.getElementById('queue'),
+        theme: document.getElementById('theme'),
+        result: document.getElementById('result'),
+        instruction: document.getElementById('instruction'),
+        directText: document.getElementById('directText'),
+        emotion: document.getElementById('emotion'),
+        speechStyle: document.getElementById('speechStyle'),
+        motion: document.getElementById('motion'),
+        sendInstruction: document.getElementById('sendInstruction'),
+        pause: document.getElementById('pause'),
+        resume: document.getElementById('resume'),
+        cancel: document.getElementById('cancel'),
+        closing: document.getElementById('closing'),
+        speakDirectly: document.getElementById('speakDirectly'),
+      };
+      const commandButtons = [
+        elements.sendInstruction, elements.pause, elements.resume,
+        elements.cancel, elements.closing, elements.speakDirectly,
+      ];
+      let latestStatus = null;
+
+      function showResult(message, isError = false) {
+        elements.result.textContent = message;
+        elements.result.classList.toggle('error', isError);
+      }
+
+      function renderStatus(status) {
+        latestStatus = status;
+        elements.connection.textContent = 'Python接続済み';
+        elements.connection.classList.add('online');
+        const titles = {
+          starting: '起動中', waiting: '待機中', paused: '自発発話停止中',
+          processing: '指示を処理中', speaking: '発話中', error: 'エラー',
+          stopped: 'ライブ制御停止中',
+        };
+        elements.statusTitle.textContent = titles[status.phase] || status.phase;
+        elements.statusMessage.textContent = status.message || '';
+        elements.queue.textContent = status.queued_commands
+          ? `待機命令 ${status.queued_commands}件`
+          : '';
+        elements.theme.textContent = status.stream_theme
+          ? `配信テーマ：${status.stream_theme}`
+          : '';
+        elements.statusDot.className = 'status-dot';
+        if (status.phase === 'error') elements.statusDot.classList.add('error');
+        else if (['processing', 'speaking'].includes(status.phase)) elements.statusDot.classList.add('busy');
+        else if (status.available) elements.statusDot.classList.add('active');
+
+        const available = Boolean(status.available);
+        for (const button of commandButtons) button.disabled = !available;
+        elements.pause.disabled = !available || Boolean(status.autonomous_paused);
+        elements.resume.disabled = !available || !status.autonomous_paused;
+      }
+
+      async function refreshStatus() {
+        try {
+          const response = await fetch('/api/admin/status', {cache: 'no-store'});
+          if (!response.ok) throw new Error(`状態取得エラー (${response.status})`);
+          renderStatus(await response.json());
+        } catch (error) {
+          elements.connection.textContent = 'Python未接続';
+          elements.connection.classList.remove('online');
+          elements.statusTitle.textContent = '接続できません';
+          elements.statusMessage.textContent = error.message;
+          for (const button of commandButtons) button.disabled = true;
+        }
+      }
+
+      async function sendCommand(command, successMessage) {
+        showResult('命令を送信しています...');
+        try {
+          const response = await fetch('/api/admin/command', {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify(command),
+          });
+          const body = await response.json();
+          if (!response.ok) throw new Error(body.error || `送信エラー (${response.status})`);
+          showResult(successMessage);
+          await refreshStatus();
+        } catch (error) {
+          showResult(error.message, true);
+        }
+      }
+
+      elements.sendInstruction.addEventListener('click', () => {
+        const text = elements.instruction.value.trim();
+        if (!text) return showResult('AIへの指示を入力してください。', true);
+        sendCommand({action: 'ai_instruction', text}, 'AIへの指示を受け付けました。');
+      });
+      elements.speakDirectly.addEventListener('click', () => {
+        const text = elements.directText.value.trim();
+        if (!text) return showResult('発話文章を入力してください。', true);
+        sendCommand({
+          action: 'direct_speech', text,
+          emotion: elements.emotion.value,
+          speech_style: elements.speechStyle.value,
+          motion: elements.motion.value,
+        }, '直接発話を受け付けました。');
+      });
+      elements.pause.addEventListener('click', () => sendCommand(
+        {action: 'pause_autonomous'}, '自発発話の停止命令を受け付けました。'
+      ));
+      elements.resume.addEventListener('click', () => sendCommand(
+        {action: 'resume_autonomous'}, '自発発話の再開命令を受け付けました。'
+      ));
+      elements.cancel.addEventListener('click', () => sendCommand(
+        {action: 'cancel_next'}, '次の発言のキャンセル命令を受け付けました。'
+      ));
+      elements.closing.addEventListener('click', () => sendCommand(
+        {action: 'closing_greeting'}, '終了挨拶の生成命令を受け付けました。'
+      ));
+
+      refreshStatus();
+      window.setInterval(refreshStatus, 1000);
+    </script>
+  </body>
+</html>

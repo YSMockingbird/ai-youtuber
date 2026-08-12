@@ -5,6 +5,7 @@ from pathlib import Path
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_CONFIG_PATH = PROJECT_ROOT / "config" / "llm_config.json"
 DEFAULT_CHARACTER_PROMPT_PATH = PROJECT_ROOT / "config" / "character_prompt.txt"
+DEFAULT_CHARACTER_BIBLE_PATH = PROJECT_ROOT / "config" / "character_bible.json"
 
 
 def load_llm_config(path=None):
@@ -34,3 +35,21 @@ def load_character_prompt(path=None):
     if not prompt:
         raise RuntimeError("キャラクタープロンプトが空です。")
     return prompt
+
+
+def load_character_bible(path=None):
+    bible_path = Path(path) if path else DEFAULT_CHARACTER_BIBLE_PATH
+    try:
+        with bible_path.open("r", encoding="utf-8") as bible_file:
+            bible = json.load(bible_file)
+    except FileNotFoundError as exc:
+        raise RuntimeError(
+            f"キャラクター設定集が見つかりません: {bible_path}"
+        ) from exc
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(
+            f"キャラクター設定集をJSONとして読み取れません: {bible_path}"
+        ) from exc
+    if not isinstance(bible, dict):
+        raise RuntimeError("キャラクター設定集のルートはJSONオブジェクトにしてください。")
+    return bible

@@ -1,4 +1,5 @@
 import unittest
+from unittest.mock import Mock
 
 from llm.session import StreamContextManager
 
@@ -27,6 +28,7 @@ class StreamContextManagerTest(unittest.TestCase):
                 "memory": {"minimum_importance": 0.65},
             },
             memory_repository=self.repository,
+            character_memory_repository=Mock(),
         )
 
     def test_important_memory_candidate_is_saved(self):
@@ -46,6 +48,23 @@ class StreamContextManagerTest(unittest.TestCase):
 
         self.assertEqual(len(self.repository.saved), 1)
         self.assertEqual(self.repository.saved[0]["user_id"], "channel-1")
+
+    def test_character_event_candidate_is_saved_as_draft(self):
+        self.manager.record_ai_speech(
+            "野菜室を少し見直したよ。",
+            {
+                "content": "野菜室を少し見直した。",
+                "category": "belief_change",
+                "importance": 0.8,
+            },
+        )
+
+        self.manager.character_memory_repository.save_draft.assert_called_once_with(
+            content="野菜室を少し見直した。",
+            category="belief_change",
+            importance=0.8,
+            source="autonomous_speech",
+        )
 
     def test_sensitive_or_low_importance_memory_is_not_saved(self):
         for content, importance in (("住所は東京都", 0.9), ("猫を見た", 0.3)):

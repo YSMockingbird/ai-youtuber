@@ -4,12 +4,16 @@ import math
 import queue
 import sys
 import threading
+import time
 import uuid
 import wave
-from collections import OrderedDict
+from collections import OrderedDict, deque
+from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import urlparse
+from urllib.parse import parse_qs, urlparse
+
+from character_memory import get_character_memory_repository
 
 
 ALLOWED_EMOTIONS = {
@@ -42,7 +46,39 @@ ALLOWED_HEAD_MOTIONS = {
     "tilt_right",
 }
 
+ALLOWED_VIEW_ACTIONS = {
+    "full_body",
+    "upper_body",
+    "turn_left",
+    "turn_right",
+    "reset",
+}
+
+ALLOWED_SPEECH_STYLES = {"slow", "normal", "fast"}
+
 SUBTITLE_OVERLAY_PATH = Path(__file__).with_name("subtitle_overlay.html")
+CHAT_OVERLAY_PATH = Path(__file__).with_name("chat_overlay.html")
+ADMIN_PANEL_PATH = Path(__file__).with_name("admin_panel.html")
+CHARACTER_MEMORY_PANEL_PATH = Path(__file__).with_name(
+    "character_memory_panel.html"
+)
+ALLOWED_ADMIN_ACTIONS = {
+    "direct_speech",
+    "ai_instruction",
+    "closing_greeting",
+    "pause_autonomous",
+    "resume_autonomous",
+    "cancel_next",
+}
+
+
+@dataclass(frozen=True)
+class PreparedSpeech:
+    text: str
+    emotion: str
+    speech_style: str
+    audio_data: bytes
+    duration_ms: int
 
 
 def get_wav_duration_ms(audio_data):
@@ -114,6 +150,14 @@ def normalize_motion_command(motion):
     }
 
 
+def normalize_view_action(view_action):
+    if view_action is None:
+        return None
+    if not isinstance(view_action, str) or view_action not in ALLOWED_VIEW_ACTIONS:
+        raise ValueError(f"未対応のview_actionです。view_action={view_action}")
+    return view_action
+
+
 class AudioStore:
     def __init__(self, max_items=32):
         self.max_items = max_items
@@ -176,52 +220,334 @@ class EventBroker:
             return min(len(self._subscribers), 1)
 
 
+class ChatEventBroker:
+    def __init__(self, history_size=20):
+        self._subscribers = []
+        self._history = deque(maxlen=history_size)
+        self._lock = threading.Lock()
+
+    def subscribe(self):
+        subscriber = queue.Queue(maxsize=16)
+        with self._lock:
+            self._subscribers.append(subscriber)
+            subscriber.put_nowait(
+                {
+                    "type": "chat_snapshot",
+                    "messages": list(self._history),
+                }
+            )
+        return subscriber
+
+    def unsubscribe(self, subscriber):
+        with self._lock:
+            if subscriber in self._subscribers:
+                self._subscribers.remove(subscriber)
+
+    def publish(self, messages):
+        normalized_messages = list(messages)
+        if not normalized_messages:
+            return 0
+        command = {
+            "type": "chat_messages",
+            "messages": normalized_messages,
+        }
+        with self._lock:
+            self._history.extend(normalized_messages)
+            subscriber = self._subscribers[-1] if self._subscribers else None
+        if subscriber is None:
+            return 0
+        try:
+            subscriber.put_nowait(command)
+            return 1
+        except queue.Full:
+            return 0
+
+    def publish_reply_state(self, message_id, state, duration_ms=None):
+        normalized_id = str(message_id or "").strip()
+        if not normalized_id:
+            raise ValueError("返信状態のmessage_idが空です。")
+        if state not in {"thinking", "speaking", "clear"}:
+            raise ValueError(f"未対応の返信状態です。state={state}")
+        if duration_ms is not None and (
+            isinstance(duration_ms, bool)
+            or not isinstance(duration_ms, (int, float))
+            or duration_ms < 0
+        ):
+            raise ValueError("返信状態のduration_msは0以上の数値にしてください。")
+
+        with self._lock:
+            target_message = None
+            for message in self._history:
+                if message.get("message_id") == normalized_id:
+                    target_message = message
+                    break
+            if target_message is None:
+                return 0
+            if state == "clear":
+                target_message.pop("reply_state", None)
+                target_message.pop("reply_until_ms", None)
+            else:
+                target_message["reply_state"] = state
+                target_message.pop("reply_until_ms", None)
+                if state == "speaking" and duration_ms is not None:
+                    target_message["reply_until_ms"] = round(
+                        time.time() * 1000 + duration_ms
+                    )
+            command = {
+                "type": "chat_reply_state",
+                "message_id": normalized_id,
+                "state": state,
+                "message": dict(target_message),
+            }
+            if "reply_until_ms" in target_message:
+                command["reply_until_ms"] = target_message["reply_until_ms"]
+            subscriber = self._subscribers[-1] if self._subscribers else None
+
+        if subscriber is None:
+            return 0
+        try:
+            subscriber.put_nowait(command)
+            return 1
+        except queue.Full:
+            return 0
+
+    def subscriber_count(self):
+        with self._lock:
+            return min(len(self._subscribers), 1)
+
+
 class ExternalControlRuntime:
-    def __init__(self, aivis_client, speaker_id, public_base_url):
+    def __init__(
+        self,
+        aivis_client,
+        speaker_id,
+        public_base_url,
+        character_memory_repository=None,
+    ):
         self.aivis_client = aivis_client
         self.speaker_id = speaker_id
         self.public_base_url = public_base_url.rstrip("/")
         self.audio_store = AudioStore()
         self.event_broker = EventBroker()
         self.subtitle_event_broker = EventBroker(retain_latest=True)
+        self.chat_event_broker = ChatEventBroker(history_size=20)
+        self.admin_command_queue = queue.Queue(maxsize=32)
+        self.character_memory_repository = character_memory_repository
+        self._admin_status_lock = threading.Lock()
+        self._admin_status = {
+            "available": False,
+            "autonomous_paused": False,
+            "phase": "starting",
+            "message": "ライブ制御の開始を待っています。",
+            "stream_theme": "",
+            "updated_at_ms": round(time.time() * 1000),
+        }
 
-    def speak(self, text, emotion="neutral", motion=None):
+    def enqueue_admin_command(self, command):
+        if not isinstance(command, dict):
+            raise ValueError("管理命令はJSONオブジェクトで指定してください。")
+        action = str(command.get("action", "")).strip()
+        if action not in ALLOWED_ADMIN_ACTIONS:
+            raise ValueError(f"未対応の管理命令です。action={action}")
+        normalized = {"action": action, "id": uuid.uuid4().hex}
+        if action in {"direct_speech", "ai_instruction"}:
+            text = str(command.get("text", "")).strip()
+            maximum_length = 500 if action == "ai_instruction" else 300
+            if not text:
+                raise ValueError("管理画面から送る文章が空です。")
+            if len(text) > maximum_length:
+                raise ValueError(
+                    f"文章は{maximum_length}文字以内にしてください。"
+                )
+            normalized["text"] = text
+        if action == "direct_speech":
+            emotion = str(command.get("emotion", "neutral")).strip()
+            speech_style = str(
+                command.get("speech_style", "normal")
+            ).strip()
+            motion = command.get("motion")
+            if emotion not in ALLOWED_EMOTIONS:
+                raise ValueError(f"未対応のemotionです。emotion={emotion}")
+            if speech_style not in ALLOWED_SPEECH_STYLES:
+                raise ValueError(
+                    "未対応のspeech_styleです。"
+                    f"speech_style={speech_style}"
+                )
+            if isinstance(motion, str) and motion in {"", "none"}:
+                motion = None
+            normalized["emotion"] = emotion
+            normalized["speech_style"] = speech_style
+            normalized["motion"] = normalize_motion_command(motion)
+        try:
+            self.admin_command_queue.put_nowait(normalized)
+        except queue.Full as exc:
+            raise RuntimeError(
+                "管理命令が混み合っています。処理完了後に再度送信してください。"
+            ) from exc
+        return normalized
+
+    def get_next_admin_command(self):
+        try:
+            return self.admin_command_queue.get_nowait()
+        except queue.Empty:
+            return None
+
+    def update_admin_status(self, **changes):
+        with self._admin_status_lock:
+            self._admin_status.update(changes)
+            self._admin_status["updated_at_ms"] = round(time.time() * 1000)
+
+    def get_admin_status(self):
+        with self._admin_status_lock:
+            speaking_until_ms = self._admin_status.get("speaking_until_ms")
+            if (
+                self._admin_status.get("phase") == "speaking"
+                and isinstance(speaking_until_ms, (int, float))
+                and speaking_until_ms <= time.time() * 1000
+            ):
+                self._admin_status["phase"] = (
+                    "paused"
+                    if self._admin_status.get("autonomous_paused")
+                    else "waiting"
+                )
+                self._admin_status["message"] = (
+                    "自発発話は一時停止中です。"
+                    if self._admin_status.get("autonomous_paused")
+                    else "コメントまたは次の発話を待っています。"
+                )
+                self._admin_status.pop("speaking_until_ms", None)
+                self._admin_status["updated_at_ms"] = round(
+                    time.time() * 1000
+                )
+            status = dict(self._admin_status)
+        status["queued_commands"] = self.admin_command_queue.qsize()
+        return status
+
+    def list_character_memories(self, status):
+        if self.character_memory_repository is None:
+            raise RuntimeError("キャラクター記憶の保存先が設定されていません。")
+        return self.character_memory_repository.list(status)
+
+    def review_character_memory(self, memory_id, status):
+        if self.character_memory_repository is None:
+            raise RuntimeError("キャラクター記憶の保存先が設定されていません。")
+        self.character_memory_repository.review(memory_id, status)
+
+    def publish_chat_messages(self, messages):
+        # 表示に必要な公開情報だけをチャット画面へ送り、Channel IDは渡しません。
+        normalized_messages = []
+        for message in messages:
+            if not isinstance(message, dict):
+                raise ValueError("チャットメッセージはJSONオブジェクトで指定してください。")
+            message_id = str(message.get("message_id", "")).strip()
+            user_name = str(message.get("user_name", "")).strip()
+            comment = str(message.get("comment", "")).strip()
+            if not message_id:
+                raise ValueError("チャットメッセージのmessage_idが空です。")
+            if not user_name:
+                user_name = "unknown"
+            if not comment:
+                continue
+            normalized_messages.append(
+                {
+                    "message_id": message_id,
+                    "user_name": user_name[:100],
+                    "comment": comment[:500],
+                    "published_at": str(
+                        message.get("published_at", "")
+                    ).strip(),
+                }
+            )
+        return self.chat_event_broker.publish(normalized_messages)
+
+    def publish_chat_reply_state(self, message_id, state, duration_ms=None):
+        return self.chat_event_broker.publish_reply_state(
+            message_id,
+            state,
+            duration_ms,
+        )
+
+    def prepare_speech(self, text, emotion="neutral", speech_style="normal"):
+        # 再生中に次の音声を先読みできるよう、合成と配信を分離します。
         normalized_text = text.strip()
         if not normalized_text:
             raise ValueError("発話する文章が空です。")
         if emotion not in ALLOWED_EMOTIONS:
             raise ValueError(f"未対応のemotionです。emotion={emotion}")
-        normalized_motion = normalize_motion_command(motion)
+        if (
+            not isinstance(speech_style, str)
+            or speech_style not in ALLOWED_SPEECH_STYLES
+        ):
+            raise ValueError(
+                "未対応のspeech_styleです。"
+                f"speech_style={speech_style}"
+            )
 
         audio_data = self.aivis_client.synthesize(
             normalized_text,
             self.speaker_id,
             emotion,
+            speech_style,
         )
         duration_ms = get_wav_duration_ms(audio_data)
-        audio_id = self.audio_store.put(audio_data)
+        return PreparedSpeech(
+            text=normalized_text,
+            emotion=emotion,
+            speech_style=speech_style,
+            audio_data=audio_data,
+            duration_ms=duration_ms,
+        )
+
+    def publish_prepared_speech(
+        self,
+        prepared_speech,
+        motion=None,
+        view_action=None,
+    ):
+        if not isinstance(prepared_speech, PreparedSpeech):
+            raise ValueError("prepared_speechが正しい形式ではありません。")
+        normalized_motion = normalize_motion_command(motion)
+        normalized_view_action = normalize_view_action(view_action)
+        audio_id = self.audio_store.put(prepared_speech.audio_data)
         command = {
             "type": "speak",
             "id": uuid.uuid4().hex,
-            "text": normalized_text,
-            "emotion": emotion,
+            "text": prepared_speech.text,
+            "emotion": prepared_speech.emotion,
             "audio_url": f"{self.public_base_url}/audio/{audio_id}.wav",
-            "duration_ms": duration_ms,
+            "duration_ms": prepared_speech.duration_ms,
             "interrupt": True,
         }
         if normalized_motion is not None:
             command["motion"] = normalized_motion
+        if normalized_view_action is not None:
+            command["view_action"] = normalized_view_action
         delivered_count = self.event_broker.publish(command)
         self.subtitle_event_broker.publish(
             {
                 "type": "subtitle",
                 "id": command["id"],
-                "text": normalized_text,
-                "emotion": emotion,
-                "duration_ms": duration_ms,
+                "text": prepared_speech.text,
+                "emotion": prepared_speech.emotion,
+                "duration_ms": prepared_speech.duration_ms,
             }
         )
         return command, delivered_count
+
+    def speak(
+        self,
+        text,
+        emotion="neutral",
+        motion=None,
+        view_action=None,
+        speech_style="normal",
+    ):
+        prepared_speech = self.prepare_speech(text, emotion, speech_style)
+        return self.publish_prepared_speech(
+            prepared_speech,
+            motion,
+            view_action,
+        )
 
     def move(self, motion):
         normalized_motion = normalize_motion_command(motion)
@@ -272,15 +598,34 @@ class ExternalControlRequestHandler(BaseHTTPRequestHandler):
         return self.server.runtime
 
     def do_GET(self):
-        path = urlparse(self.path).path
+        parsed_url = urlparse(self.path)
+        path = parsed_url.path
         if path == "/events":
             self._serve_events(self.runtime.event_broker)
             return
         if path == "/subtitle-events":
             self._serve_events(self.runtime.subtitle_event_broker)
             return
+        if path == "/chat-events":
+            self._serve_events(self.runtime.chat_event_broker)
+            return
         if path in {"/overlay", "/overlay/"}:
             self._serve_subtitle_overlay()
+            return
+        if path in {"/chat-overlay", "/chat-overlay/"}:
+            self._serve_chat_overlay()
+            return
+        if path in {"/admin", "/admin/"}:
+            self._serve_admin_panel()
+            return
+        if path in {"/character-memories", "/character-memories/"}:
+            self._serve_character_memory_panel()
+            return
+        if path == "/api/admin/status":
+            self._send_json(200, self.runtime.get_admin_status())
+            return
+        if path == "/api/character-memories":
+            self._handle_character_memory_list(parsed_url.query)
             return
         if path == "/health":
             self._send_json(
@@ -290,6 +635,9 @@ class ExternalControlRequestHandler(BaseHTTPRequestHandler):
                     "sse_clients": self.runtime.event_broker.subscriber_count(),
                     "subtitle_sse_clients": (
                         self.runtime.subtitle_event_broker.subscriber_count()
+                    ),
+                    "chat_sse_clients": (
+                        self.runtime.chat_event_broker.subscriber_count()
                     ),
                 },
             )
@@ -313,6 +661,12 @@ class ExternalControlRequestHandler(BaseHTTPRequestHandler):
                 200,
                 {"command": command, "delivered_clients": delivered_count},
             )
+            return
+        if path == "/api/admin/command":
+            self._handle_admin_command()
+            return
+        if path == "/api/character-memories/review":
+            self._handle_character_memory_review()
             return
         self._send_json(404, {"error": "指定されたエンドポイントはありません。"})
 
@@ -365,6 +719,60 @@ class ExternalControlRequestHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(payload)
 
+    def _serve_chat_overlay(self):
+        try:
+            payload = CHAT_OVERLAY_PATH.read_bytes()
+        except OSError as exc:
+            print(f"チャットオーバーレイを読み込めませんでした: {exc}")
+            self._send_json(
+                500,
+                {"error": "チャットオーバーレイのHTMLを読み込めませんでした。"},
+            )
+            return
+
+        self.send_response(200)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(payload)))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        self.wfile.write(payload)
+
+    def _serve_admin_panel(self):
+        try:
+            payload = ADMIN_PANEL_PATH.read_bytes()
+        except OSError as exc:
+            print(f"配信管理画面を読み込めませんでした: {exc}")
+            self._send_json(
+                500,
+                {"error": "配信管理画面のHTMLを読み込めませんでした。"},
+            )
+            return
+
+        self.send_response(200)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(payload)))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        self.wfile.write(payload)
+
+    def _serve_character_memory_panel(self):
+        try:
+            payload = CHARACTER_MEMORY_PANEL_PATH.read_bytes()
+        except OSError as exc:
+            print(f"キャラクター記憶管理画面を読み込めませんでした: {exc}")
+            self._send_json(
+                500,
+                {"error": "キャラクター記憶管理画面のHTMLを読み込めませんでした。"},
+            )
+            return
+
+        self.send_response(200)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(payload)))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        self.wfile.write(payload)
+
     def _serve_audio(self, path):
         filename = path.rsplit("/", 1)[-1]
         audio_id = filename[:-4]
@@ -393,6 +801,8 @@ class ExternalControlRequestHandler(BaseHTTPRequestHandler):
         text = body.get("text", "")
         emotion = body.get("emotion", "neutral")
         motion = body.get("motion")
+        view_action = body.get("view_action")
+        speech_style = body.get("speech_style", "normal")
         if not isinstance(text, str) or not isinstance(emotion, str):
             self._send_json(
                 400,
@@ -401,7 +811,13 @@ class ExternalControlRequestHandler(BaseHTTPRequestHandler):
             return
 
         try:
-            command, delivered_count = self.runtime.speak(text, emotion, motion)
+            command, delivered_count = self.runtime.speak(
+                text,
+                emotion,
+                motion,
+                view_action,
+                speech_style,
+            )
         except ValueError as exc:
             self._send_json(400, {"error": str(exc)})
             return
@@ -430,6 +846,70 @@ class ExternalControlRequestHandler(BaseHTTPRequestHandler):
         self._send_json(
             200,
             {"command": command, "delivered_clients": delivered_count},
+        )
+
+    def _handle_admin_command(self):
+        body = self._read_json_object()
+        if body is None:
+            return
+        try:
+            command = self.runtime.enqueue_admin_command(body)
+        except ValueError as exc:
+            self._send_json(400, {"error": str(exc)})
+            return
+        except RuntimeError as exc:
+            self._send_json(503, {"error": str(exc)})
+            return
+        self._send_json(
+            202,
+            {
+                "status": "accepted",
+                "command_id": command["id"],
+                "action": command["action"],
+            },
+        )
+
+    def _handle_character_memory_list(self, query):
+        status = parse_qs(query).get("status", ["draft"])[0]
+        if status not in {"draft", "approved", "rejected"}:
+            self._send_json(400, {"error": "statusが不正です。"})
+            return
+        try:
+            memories = self.runtime.list_character_memories(status)
+        except (RuntimeError, ValueError) as exc:
+            self._send_json(500, {"error": str(exc)})
+            return
+        self._send_json(200, {"status": status, "memories": memories})
+
+    def _handle_character_memory_review(self):
+        body = self._read_json_object()
+        if body is None:
+            return
+        memory_id = body.get("memory_id")
+        status = body.get("status")
+        if not isinstance(memory_id, str) or not isinstance(status, str):
+            self._send_json(
+                400,
+                {"error": "memory_idとstatusは文字列で指定してください。"},
+            )
+            return
+        if status not in {"approved", "rejected"}:
+            self._send_json(
+                400,
+                {"error": "statusはapprovedまたはrejectedにしてください。"},
+            )
+            return
+        try:
+            self.runtime.review_character_memory(memory_id, status)
+        except ValueError as exc:
+            self._send_json(400, {"error": str(exc)})
+            return
+        except RuntimeError as exc:
+            self._send_json(409, {"error": str(exc)})
+            return
+        self._send_json(
+            200,
+            {"memory_id": memory_id, "status": status},
         )
 
     def _read_json_object(self):
@@ -493,12 +973,23 @@ def is_allowed_local_origin(origin):
 
 
 class ExternalControlServer:
-    def __init__(self, aivis_client, speaker_id, host="127.0.0.1", port=8765):
+    def __init__(
+        self,
+        aivis_client,
+        speaker_id,
+        host="127.0.0.1",
+        port=8765,
+        character_memory_repository=None,
+    ):
         public_base_url = f"http://127.0.0.1:{port}"
         self.runtime = ExternalControlRuntime(
             aivis_client=aivis_client,
             speaker_id=speaker_id,
             public_base_url=public_base_url,
+            character_memory_repository=(
+                character_memory_repository
+                or get_character_memory_repository()
+            ),
         )
         self.http_server = ExternalControlHttpServer((host, port), self.runtime)
         self._thread = None

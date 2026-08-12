@@ -1,5 +1,8 @@
 import os
+import logging
 from abc import ABC, abstractmethod
+
+from pydantic import ValidationError
 
 from openai import (
     APIConnectionError,
@@ -42,13 +45,73 @@ class OpenAiLlmClient(LlmClient):
         response_model,
         max_output_tokens,
     ):
+        retry_tokens = max(int(max_output_tokens) * 2, 1200)
+        token_limits = (int(max_output_tokens), retry_tokens)
+
+        for attempt, token_limit in enumerate(token_limits):
+            try:
+                response = self._request_structured(
+                    instructions=instructions,
+                    input_text=input_text,
+                    response_model=response_model,
+                    max_output_tokens=token_limit,
+                )
+            except ValidationError as exc:
+                if attempt == 0 and _is_incomplete_json_error(exc):
+                    logging.warning(
+                        "OpenAI APIのJSONが途中で終了したため、"
+                        "出力上限を増やして1回再試行します。"
+                        " max_output_tokens=%s->%s",
+                        token_limit,
+                        retry_tokens,
+                    )
+                    continue
+                raise RuntimeError(
+                    "OpenAI APIの構造化出力を検証できませんでした。"
+                    f" detail={_validation_error_summary(exc)}"
+                ) from exc
+
+            parsed = response.output_parsed
+            if parsed is not None:
+                return parsed
+
+            status, incomplete_reason, error_code = _response_diagnostics(
+                response
+            )
+            if attempt == 0 and incomplete_reason == "max_output_tokens":
+                logging.warning(
+                    "OpenAI APIの出力上限に達したため、"
+                    "上限を増やして1回再試行します。"
+                    " max_output_tokens=%s->%s",
+                    token_limit,
+                    retry_tokens,
+                )
+                continue
+            raise RuntimeError(
+                "OpenAI APIから構造化された返答を取得できませんでした。"
+                f" status={status} incomplete_reason={incomplete_reason}"
+                f" error_code={error_code}"
+            )
+
+        raise RuntimeError(
+            "OpenAI APIの構造化出力を再試行後も取得できませんでした。"
+        )
+
+    def _request_structured(
+        self,
+        instructions,
+        input_text,
+        response_model,
+        max_output_tokens,
+    ):
         try:
-            response = self.client.responses.parse(
+            return self.client.responses.parse(
                 model=self.model,
                 instructions=instructions,
                 input=input_text,
                 text_format=response_model,
                 max_output_tokens=max_output_tokens,
+                reasoning={"effort": "low"},
             )
         except AuthenticationError as exc:
             raise RuntimeError(
@@ -68,10 +131,34 @@ class OpenAiLlmClient(LlmClient):
                 f"OpenAI APIでエラーが発生しました。status_code={exc.status_code}"
             ) from exc
 
-        parsed = response.output_parsed
-        if parsed is None:
-            raise RuntimeError("OpenAI APIから構造化された返答を取得できませんでした。")
-        return parsed
+
+def _is_incomplete_json_error(error):
+    for detail in error.errors():
+        if detail.get("type") != "json_invalid":
+            continue
+        message = str(detail.get("msg", "")).lower()
+        if "eof" in message or "end of input" in message:
+            return True
+    return False
+
+
+def _validation_error_summary(error):
+    details = error.errors()
+    if not details:
+        return "unknown"
+    first = details[0]
+    return f"type={first.get('type', 'unknown')} msg={first.get('msg', '')}"
+
+
+def _response_diagnostics(response):
+    status = getattr(response, "status", None) or "unknown"
+    incomplete_details = getattr(response, "incomplete_details", None)
+    incomplete_reason = (
+        getattr(incomplete_details, "reason", None) or "none"
+    )
+    error = getattr(response, "error", None)
+    error_code = getattr(error, "code", None) or "none"
+    return status, incomplete_reason, error_code
 
 
 def create_llm_client(config=None):
