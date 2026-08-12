@@ -4,6 +4,7 @@ from unittest.mock import Mock
 from character_lore import (
     build_character_lore_context,
     build_public_character_context,
+    build_relevant_public_character_context,
 )
 
 
@@ -65,6 +66,48 @@ class CharacterLoreTest(unittest.TestCase):
 
         self.assertIn("野菜室を待機画面だと思っていた。", context)
         self.assertNotIn("括弧が閉じるほうが安心する。", context)
+
+    def test_public_identity_is_only_loaded_for_related_topic(self):
+        context, score = build_relevant_public_character_context(
+            "どうやって動いてるの？",
+            self.bible,
+        )
+
+        self.assertGreater(score, 0)
+        self.assertIn("Pythonプログラムを土台に動くAI", context)
+        self.assertNotIn("まず1万人、その先は100万人", context)
+
+    def test_public_goals_are_only_loaded_for_related_topic(self):
+        context, score = build_relevant_public_character_context(
+            "将来の登録者目標を教えて",
+            self.bible,
+        )
+
+        self.assertGreater(score, 0)
+        self.assertIn("まず1万人、その先は100万人", context)
+        self.assertNotIn("認証情報は公開しない", context)
+
+    def test_public_context_is_not_loaded_for_unrelated_topic(self):
+        context, score = build_relevant_public_character_context(
+            "今日の晩ごはんについて話そう",
+            self.bible,
+        )
+
+        self.assertEqual(context, "")
+        self.assertEqual(score, 0)
+
+    def test_related_public_context_is_selected_by_lore_router(self):
+        repository = Mock()
+        repository.find_relevant_approved.return_value = []
+
+        context = build_character_lore_context(
+            "将来の登録者目標を教えて",
+            self.bible,
+            repository,
+        )
+
+        self.assertIn("まず1万人、その先は100万人", context)
+        self.assertNotIn("Pythonプログラムを土台に動くAI", context)
 
     def test_unrelated_episode_is_not_injected(self):
         repository = Mock()

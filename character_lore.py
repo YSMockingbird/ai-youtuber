@@ -2,6 +2,38 @@ from character_memory import get_character_memory_repository
 from llm.config import load_character_bible
 
 
+PUBLIC_IDENTITY_KEYWORDS = (
+    "正体",
+    "何者",
+    "どうやって動",
+    "仕組み",
+    "python",
+    "プログラム",
+    "制作環境",
+    "アバター",
+    "3dモデル",
+    "vrm",
+    "音声モデル",
+    "ガン奈の声",
+    "機械っぽ",
+    "人間らし",
+    "人間っぽ",
+    "自然な会話",
+)
+PUBLIC_GOAL_KEYWORDS = (
+    "目標",
+    "夢",
+    "将来",
+    "世界平和",
+    "登録者",
+    "人気者",
+    "活動資金",
+    "オリジナルモデル",
+    "オリジナルアバター",
+    "成長したい",
+)
+
+
 def build_public_character_context(bible=None):
     source = bible if bible is not None else load_character_bible()
     identity = source.get("public_identity")
@@ -48,6 +80,31 @@ def build_public_character_context(bible=None):
     )
 
 
+def build_relevant_public_character_context(reference_text, bible=None):
+    # 自己紹介や目標が話題になったときだけ、固定プロンプトから外した事実を渡します。
+    normalized_reference = str(reference_text or "").lower()
+    identity_score = _keyword_match_score(
+        normalized_reference,
+        PUBLIC_IDENTITY_KEYWORDS,
+    )
+    goal_score = _keyword_match_score(
+        normalized_reference,
+        PUBLIC_GOAL_KEYWORDS,
+    )
+    if identity_score <= 0 and goal_score <= 0:
+        return "", 0
+
+    source = bible if bible is not None else load_character_bible()
+    full_context = build_public_character_context(source)
+    lines = full_context.splitlines()
+    selected = [lines[0]]
+    if identity_score > 0:
+        selected.extend(lines[1:5])
+    if goal_score > 0:
+        selected.extend(lines[5:])
+    return "\n".join(selected), identity_score + goal_score
+
+
 def build_character_lore_context(
     reference_text,
     bible=None,
@@ -63,6 +120,12 @@ def build_character_lore_context(
 
     normalized_reference = str(reference_text or "").lower()
     candidates = []
+    public_context, public_score = build_relevant_public_character_context(
+        reference_text,
+        source,
+    )
+    if public_context:
+        candidates.append((public_score, 3, 0, "public", public_context))
     for index, episode in enumerate(episodes):
         if not isinstance(episode, dict):
             raise RuntimeError(
@@ -172,6 +235,8 @@ def build_character_lore_context(
         candidates,
         key=lambda item: item[:3],
     )
+    if selected_kind == "public":
+        return selected
     if selected_kind == "stance":
         boundaries = selected.get("boundaries")
         if boundaries is None:
@@ -215,4 +280,12 @@ def _match_score(text, reference):
         1
         for index in range(max(len(normalized_text) - 1, 0))
         if normalized_text[index : index + 2] in reference
+    )
+
+
+def _keyword_match_score(reference, keywords):
+    return sum(
+        1
+        for keyword in keywords
+        if str(keyword).strip().lower() in reference
     )
