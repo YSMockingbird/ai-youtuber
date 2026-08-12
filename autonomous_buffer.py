@@ -1,4 +1,5 @@
 import math
+import threading
 import time
 from dataclasses import dataclass
 
@@ -26,6 +27,7 @@ class AutonomousSpeechBuffer:
         stream_topic=None,
         theme_manager=None,
         now=None,
+        prepare_in_background=True,
     ):
         autonomous_config = config.get("autonomous_speech", {})
         self.silence_seconds = float(
@@ -48,6 +50,12 @@ class AutonomousSpeechBuffer:
         self.has_received_comment = False
         self.prepared = None
         self.discarded_for_comment_count = 0
+        self.prepare_in_background = bool(prepare_in_background)
+        self._preparation_lock = threading.Lock()
+        self._preparation_thread = None
+        self._preparation_thread_generation = None
+        self._preparation_result = None
+        self._preparation_generation = 0
         self.paused = False
         self.retry_at = 0.0
         current_time = time.monotonic() if now is None else float(now)
@@ -57,6 +65,7 @@ class AutonomousSpeechBuffer:
         if self.paused:
             return False
         current_time = time.monotonic() if now is None else float(now)
+        self._collect_preparation(current_time)
         self._ensure_prepared(current_time)
         if self.prepared is None or current_time < self.next_speech_at:
             return False
@@ -107,7 +116,7 @@ class AutonomousSpeechBuffer:
 
     def cancel_for_comment(self):
         # コメント返信を優先し、まだ再生していない自発発話を破棄します。
-        if self.prepared is not None:
+        if self._invalidate_preparation():
             self.discarded_for_comment_count += 1
             print(
                 "先読み済み自発発話を破棄しました："
@@ -117,27 +126,26 @@ class AutonomousSpeechBuffer:
             self.runtime.update_admin_status(
                 discarded_prefetches=self.discarded_for_comment_count,
             )
-        self.prepared = None
         self.next_speech_at = math.inf
         self.retry_at = math.inf
 
     def pause(self):
         # 管理者操作中は、未再生の自発発話を破棄して新規生成も止めます。
         self.paused = True
-        self.prepared = None
+        self._invalidate_preparation()
         self.next_speech_at = math.inf
         self.retry_at = math.inf
 
     def resume(self, now=None):
         self.paused = False
         current_time = time.monotonic() if now is None else float(now)
-        self.prepared = None
+        self._invalidate_preparation()
         self.retry_at = 0.0
         self.next_speech_at = current_time + self.silence_seconds
 
     def cancel_next(self, now=None):
         # 現在再生中の音声は止めず、先読み済みの次の発話だけを破棄します。
-        self.prepared = None
+        self._invalidate_preparation()
         if self.paused:
             return
         current_time = time.monotonic() if now is None else float(now)
@@ -146,7 +154,7 @@ class AutonomousSpeechBuffer:
 
     def schedule_after_external_speech(self, duration_ms, now=None):
         # 管理者発話の音声終了後から通常の無言時間を計測します。
-        self.prepared = None
+        self._invalidate_preparation()
         if self.paused:
             self.next_speech_at = math.inf
             self.retry_at = math.inf
@@ -175,7 +183,7 @@ class AutonomousSpeechBuffer:
             current_time + float(duration_ms) / 1000 + self.silence_seconds
         )
         self.retry_at = 0.0
-        self.prepared = None
+        self._invalidate_preparation()
         self._ensure_prepared(current_time)
         return self.tick(now=(None if now is None else current_time))
 
@@ -186,16 +194,86 @@ class AutonomousSpeechBuffer:
         return max(0, math.ceil(self.next_speech_at - current_time))
 
     def _ensure_prepared(self, current_time):
+        self._collect_preparation(current_time)
         if (
             self.paused
             or self.prepared is not None
             or current_time < self.retry_at
         ):
             return
+        if not self.prepare_in_background:
+            try:
+                self.prepared = self._prepare_next()
+            except (RuntimeError, ValueError) as exc:
+                self._record_error("自発発話の先読み", exc, time.monotonic())
+            return
+
+        with self._preparation_lock:
+            if self._preparation_thread is not None:
+                return
+            generation = self._preparation_generation
+            thread = threading.Thread(
+                target=self._prepare_in_worker,
+                args=(generation,),
+                name="autonomous-speech-prefetch",
+                daemon=True,
+            )
+            self._preparation_thread = thread
+            self._preparation_thread_generation = generation
+        thread.start()
+
+    def _prepare_in_worker(self, generation):
+        item = None
+        error = None
         try:
-            self.prepared = self._prepare_next()
+            item = self._prepare_next()
         except (RuntimeError, ValueError) as exc:
-            self._record_error("自発発話の先読み", exc, time.monotonic())
+            error = exc
+        except Exception as exc:  # noqa: BLE001
+            error = RuntimeError(
+                "自発発話のバックグラウンド先読みで予期しないエラーが発生しました。"
+                f" type={type(exc).__name__} detail={exc}"
+            )
+        with self._preparation_lock:
+            self._preparation_result = (generation, item, error)
+            self._preparation_thread = None
+            self._preparation_thread_generation = None
+
+    def _collect_preparation(self, current_time):
+        with self._preparation_lock:
+            result = self._preparation_result
+            self._preparation_result = None
+            generation = self._preparation_generation
+        if result is None:
+            return
+        result_generation, item, error = result
+        if result_generation != generation:
+            return
+        if error is not None:
+            self._record_error("自発発話の先読み", error, current_time)
+            return
+        if not self.paused:
+            self.prepared = item
+
+    def _invalidate_preparation(self):
+        discarded = self.prepared is not None
+        self.prepared = None
+        with self._preparation_lock:
+            if (
+                self._preparation_thread is not None
+                and self._preparation_thread_generation
+                == self._preparation_generation
+            ):
+                discarded = True
+            if (
+                self._preparation_result is not None
+                and self._preparation_result[0]
+                == self._preparation_generation
+            ):
+                discarded = True
+                self._preparation_result = None
+            self._preparation_generation += 1
+        return discarded
 
     def _prepare_next(self):
         selected_topic = self.topic_selector.select(self.previous_topic)

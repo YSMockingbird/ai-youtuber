@@ -147,10 +147,13 @@ def iter_chat_messages(
         if max_loops is not None and loop_count >= max_loops:
             break
 
-        remaining_seconds = result["polling_interval_millis"] / 1000
-        while remaining_seconds > 0:
+        wait_seconds = result["polling_interval_millis"] / 1000
+        deadline = time.monotonic() + wait_seconds
+        while time.monotonic() < deadline:
             if wait_callback is not None:
                 wait_callback()
+            remaining_seconds = deadline - time.monotonic()
+            if remaining_seconds <= 0:
+                break
             sleep_seconds = min(float(wait_step_seconds), remaining_seconds)
             time.sleep(sleep_seconds)
-            remaining_seconds -= sleep_seconds

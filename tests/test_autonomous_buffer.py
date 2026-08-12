@@ -1,4 +1,5 @@
 import unittest
+import threading
 from unittest.mock import Mock, patch
 
 from autonomous_buffer import AutonomousSpeechBuffer
@@ -49,6 +50,7 @@ class AutonomousSpeechBufferTest(unittest.TestCase):
             publish_callback=self.publish_callback,
             stream_topic="インターネットと集中力",
             now=100,
+            prepare_in_background=False,
         )
 
         buffer.pause()
@@ -73,6 +75,7 @@ class AutonomousSpeechBufferTest(unittest.TestCase):
             publish_callback=self.publish_callback,
             stream_topic="インターネットと集中力",
             now=100,
+            prepare_in_background=False,
         )
 
         buffer.schedule_after_external_speech(2500, now=100)
@@ -93,6 +96,7 @@ class AutonomousSpeechBufferTest(unittest.TestCase):
             publish_callback=self.publish_callback,
             stream_topic="インターネットと集中力",
             now=100,
+            prepare_in_background=False,
         )
 
         self.assertFalse(buffer.tick(now=100))
@@ -124,6 +128,7 @@ class AutonomousSpeechBufferTest(unittest.TestCase):
             publish_callback=self.publish_callback,
             stream_topic="インターネットと集中力",
             now=100,
+            prepare_in_background=False,
         )
         buffer.tick(now=100)
 
@@ -162,6 +167,7 @@ class AutonomousSpeechBufferTest(unittest.TestCase):
             publish_callback=self.publish_callback,
             stream_topic="インターネットと集中力",
             now=100,
+            prepare_in_background=False,
         )
 
         buffer.cancel_for_comment()
@@ -179,6 +185,7 @@ class AutonomousSpeechBufferTest(unittest.TestCase):
             publish_callback=self.publish_callback,
             stream_topic="インターネットと集中力",
             now=100,
+            prepare_in_background=False,
         )
 
         buffer.tick(now=100)
@@ -189,6 +196,67 @@ class AutonomousSpeechBufferTest(unittest.TestCase):
             "メインテーマ: インターネットと集中力",
             generate_mock.call_args.kwargs["theme_context"],
         )
+
+    @patch("autonomous_buffer.generate_autonomous_speech")
+    def test_background_preparation_does_not_block_tick(self, generate_mock):
+        started = threading.Event()
+        release = threading.Event()
+
+        def delayed_response(*args, **kwargs):
+            started.set()
+            release.wait(timeout=1)
+            return self.ai_response
+
+        generate_mock.side_effect = delayed_response
+        buffer = AutonomousSpeechBuffer(
+            runtime=self.runtime,
+            stream_context=self.stream_context,
+            config=create_config(),
+            publish_callback=self.publish_callback,
+            stream_topic="インターネットと集中力",
+            now=100,
+        )
+
+        self.assertFalse(buffer.tick(now=100))
+        self.assertTrue(started.wait(timeout=1))
+        self.assertIsNone(buffer.prepared)
+
+        thread = buffer._preparation_thread
+        release.set()
+        thread.join(timeout=1)
+        self.assertFalse(buffer.tick(now=100))
+        self.assertIsNotNone(buffer.prepared)
+
+    @patch("autonomous_buffer.generate_autonomous_speech")
+    def test_comment_invalidates_in_flight_preparation(self, generate_mock):
+        started = threading.Event()
+        release = threading.Event()
+
+        def delayed_response(*args, **kwargs):
+            started.set()
+            release.wait(timeout=1)
+            return self.ai_response
+
+        generate_mock.side_effect = delayed_response
+        buffer = AutonomousSpeechBuffer(
+            runtime=self.runtime,
+            stream_context=self.stream_context,
+            config=create_config(),
+            publish_callback=self.publish_callback,
+            stream_topic="インターネットと集中力",
+            now=100,
+        )
+        buffer.tick(now=100)
+        self.assertTrue(started.wait(timeout=1))
+
+        buffer.cancel_for_comment()
+        thread = buffer._preparation_thread
+        release.set()
+        thread.join(timeout=1)
+        buffer.tick(now=100)
+
+        self.assertEqual(buffer.discarded_for_comment_count, 1)
+        self.assertIsNone(buffer.prepared)
 
 
 if __name__ == "__main__":
