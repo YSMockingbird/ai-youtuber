@@ -1,4 +1,6 @@
 import os
+import queue
+import threading
 import time
 
 import requests
@@ -130,6 +132,7 @@ def iter_chat_messages(
     max_loops=None,
     wait_callback=None,
     wait_step_seconds=0.25,
+    stop_event=None,
 ):
     # pollingIntervalMillisに従って、YouTube Liveコメントを継続取得します。
     if float(wait_step_seconds) <= 0:
@@ -139,6 +142,8 @@ def iter_chat_messages(
     previous_fetch_at = None
 
     while True:
+        if stop_event is not None and stop_event.is_set():
+            return
         fetch_started_at = time.monotonic()
         result = fetch_chat_messages(live_chat_id, page_token)
         page_token = result["next_page_token"]
@@ -165,10 +170,140 @@ def iter_chat_messages(
         wait_seconds = recommended_seconds
         deadline = time.monotonic() + wait_seconds
         while time.monotonic() < deadline:
+            if stop_event is not None and stop_event.is_set():
+                return
             if wait_callback is not None:
                 wait_callback()
             remaining_seconds = deadline - time.monotonic()
             if remaining_seconds <= 0:
                 break
             sleep_seconds = min(float(wait_step_seconds), remaining_seconds)
-            time.sleep(sleep_seconds)
+            if stop_event is not None:
+                if stop_event.wait(timeout=sleep_seconds):
+                    return
+            else:
+                time.sleep(sleep_seconds)
+
+
+class YouTubeChatPoller:
+    """YouTubeコメント取得とOBS表示を返信生成から分離します。"""
+
+    def __init__(self, live_chat_id, max_loops=None, message_callback=None):
+        self.live_chat_id = live_chat_id
+        self.max_loops = max_loops
+        self.message_callback = message_callback
+        self._result_queue = queue.Queue(maxsize=256)
+        self._stop_event = threading.Event()
+        self._finished_event = threading.Event()
+        self._error = None
+        self._seen_message_ids = set()
+        self._thread = None
+
+    def start(self):
+        if self._thread is not None:
+            raise RuntimeError("YouTubeコメント取得スレッドはすでに開始されています。")
+        self._thread = threading.Thread(
+            target=self._run,
+            name="youtube-chat-poller",
+            daemon=True,
+        )
+        self._thread.start()
+        return self
+
+    def _run(self):
+        try:
+            for result in iter_chat_messages(
+                self.live_chat_id,
+                max_loops=self.max_loops,
+                stop_event=self._stop_event,
+            ):
+                messages = []
+                for message in result.get("messages", []):
+                    message_id = message.get("message_id", "")
+                    if message_id and message_id in self._seen_message_ids:
+                        continue
+                    if message_id:
+                        self._seen_message_ids.add(message_id)
+                    messages.append(message)
+
+                published_result = dict(result)
+                published_result["messages"] = messages
+                if messages and self.message_callback is not None:
+                    self.message_callback(messages)
+
+                # 返信生成中は空の取得結果を一件だけ残し、コメント用の空きを守ります。
+                if not messages and not self._result_queue.empty():
+                    continue
+                try:
+                    self._result_queue.put(published_result, timeout=1)
+                except queue.Full:
+                    print(
+                        "YouTubeコメント返信キューが満杯です。"
+                        "OBSには表示済みですが、この取得分は返信候補から除外します。"
+                    )
+        except (RuntimeError, ValueError) as exc:
+            self._error = exc
+        except Exception as exc:
+            self._error = RuntimeError(
+                f"YouTubeコメント取得スレッドで予期しないエラーが発生しました: {exc}"
+            )
+        finally:
+            self._finished_event.set()
+
+    def iter_results(self, wait_callback=None, wait_step_seconds=0.25):
+        if float(wait_step_seconds) <= 0:
+            raise ValueError("wait_step_secondsは0より大きくしてください。")
+        if self._thread is None:
+            raise RuntimeError("YouTubeコメント取得スレッドが開始されていません。")
+
+        try:
+            while True:
+                try:
+                    first_result = self._result_queue.get(
+                        timeout=float(wait_step_seconds)
+                    )
+                except queue.Empty:
+                    if wait_callback is not None:
+                        wait_callback()
+                    if self._finished_event.is_set() and self._result_queue.empty():
+                        self._raise_if_failed()
+                        return
+                    continue
+
+                # 返信生成中に到着した複数回分をまとめ、最新候補から一度だけ選別します。
+                results = [first_result]
+                while True:
+                    try:
+                        results.append(self._result_queue.get_nowait())
+                    except queue.Empty:
+                        break
+
+                merged_result = dict(results[-1])
+                merged_result["messages"] = [
+                    message
+                    for result in results
+                    for message in result.get("messages", [])
+                ]
+                yield merged_result
+
+                if self._finished_event.is_set() and self._result_queue.empty():
+                    self._raise_if_failed()
+                    return
+        finally:
+            self.stop()
+
+    def _raise_if_failed(self):
+        if self._error is not None:
+            raise RuntimeError(
+                f"YouTubeコメント取得スレッドが停止しました: {self._error}"
+            ) from self._error
+
+    def stop(self):
+        self._stop_event.set()
+        if self._thread is not None:
+            self._thread.join(timeout=11)
+            if self._thread.is_alive():
+                print(
+                    "YouTubeコメント取得スレッドが停止待ち時間内に終了しませんでした。"
+                    "通信タイムアウト後に自動終了します。"
+                )

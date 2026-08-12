@@ -1,13 +1,14 @@
 import unittest
 from contextlib import redirect_stdout
 from io import StringIO
-from unittest.mock import Mock, patch
+from unittest.mock import call, Mock, patch
 
 from youtube_chat import (
     fetch_chat_messages,
     get_live_chat_id,
     iter_chat_messages,
     resolve_youtube_video_id,
+    YouTubeChatPoller,
 )
 
 
@@ -221,6 +222,99 @@ class YouTubeChatTest(unittest.TestCase):
         result = fetch_chat_messages("live-chat-id")
 
         self.assertEqual(result["messages"][0]["user_id"], "channel-1")
+
+    @patch("youtube_chat.iter_chat_messages")
+    def test_poller_publishes_comments_before_main_loop_consumes_them(
+        self,
+        iter_messages_mock,
+    ):
+        first_message = {"message_id": "message-1", "comment": "最初"}
+        second_message = {"message_id": "message-2", "comment": "次"}
+        iter_messages_mock.return_value = iter(
+            [
+                {"messages": [first_message], "next_page_token": "next"},
+                {"messages": [second_message], "next_page_token": None},
+            ]
+        )
+        callback = Mock()
+        poller = YouTubeChatPoller(
+            "live-chat-id",
+            max_loops=2,
+            message_callback=callback,
+        ).start()
+        poller._thread.join(timeout=1)
+
+        self.assertFalse(poller._thread.is_alive())
+        self.assertEqual(
+            callback.call_args_list,
+            [
+                call([first_message]),
+                call([second_message]),
+            ],
+        )
+        results = list(poller.iter_results())
+        self.assertEqual(
+            [message["message_id"] for message in results[0]["messages"]],
+            ["message-1", "message-2"],
+        )
+
+    @patch("youtube_chat.iter_chat_messages")
+    def test_poller_removes_duplicate_comments(self, iter_messages_mock):
+        message = {"message_id": "message-1", "comment": "重複"}
+        iter_messages_mock.return_value = iter(
+            [
+                {"messages": [message], "next_page_token": "next"},
+                {"messages": [message], "next_page_token": None},
+            ]
+        )
+        callback = Mock()
+        poller = YouTubeChatPoller(
+            "live-chat-id",
+            max_loops=2,
+            message_callback=callback,
+        ).start()
+        poller._thread.join(timeout=1)
+
+        results = list(poller.iter_results())
+
+        callback.assert_called_once_with([message])
+        self.assertEqual(len(results[0]["messages"]), 1)
+
+    @patch("youtube_chat.iter_chat_messages")
+    def test_poller_coalesces_empty_results_while_reply_is_busy(
+        self,
+        iter_messages_mock,
+    ):
+        message = {"message_id": "message-1", "comment": "届いた"}
+        iter_messages_mock.return_value = iter(
+            [
+                {"messages": [], "next_page_token": "next-1"},
+                {"messages": [], "next_page_token": "next-2"},
+                {"messages": [message], "next_page_token": None},
+            ]
+        )
+        poller = YouTubeChatPoller("live-chat-id", max_loops=3).start()
+        poller._thread.join(timeout=1)
+
+        results = list(poller.iter_results())
+
+        self.assertEqual(len(results), 1)
+        self.assertEqual(results[0]["messages"], [message])
+
+    @patch("youtube_chat.iter_chat_messages")
+    def test_poller_reports_fetch_thread_error(self, iter_messages_mock):
+        def failed_iterator(*args, **kwargs):
+            raise RuntimeError("API接続失敗")
+            yield
+
+        iter_messages_mock.side_effect = failed_iterator
+        poller = YouTubeChatPoller("live-chat-id").start()
+
+        with self.assertRaisesRegex(
+            RuntimeError,
+            "YouTubeコメント取得スレッドが停止しました: API接続失敗",
+        ):
+            list(poller.iter_results())
 
 
 if __name__ == "__main__":

@@ -20,7 +20,12 @@ from llm.session import StreamContextManager
 from motion_control import MotionRateLimiter
 from news_source import fetch_news_articles, select_news_article
 from speech_scheduler import SpeechScheduler
-from youtube_chat import fetch_chat_messages, get_live_chat_id, iter_chat_messages
+from youtube_chat import (
+    fetch_chat_messages,
+    get_live_chat_id,
+    iter_chat_messages,
+    YouTubeChatPoller,
+)
 
 
 def run_openai_test():
@@ -822,12 +827,15 @@ def run_ai_youtuber_loop(max_loops, runtime=None, stream_topic=None):
             return True
         return autonomous_buffer.tick()
 
-    chat_results = iter_chat_messages(
+    chat_poller = YouTubeChatPoller(
         live_chat_id,
         max_loops=max_loops,
-        wait_callback=(
-            process_live_wait if autonomous_buffer is not None else None
+        message_callback=(
+            runtime.publish_chat_messages if runtime is not None else None
         ),
+    ).start()
+    chat_results = chat_poller.iter_results(
+        wait_callback=(process_live_wait if autonomous_buffer is not None else None)
     )
     for index, result in enumerate(chat_results, start=1):
         messages = [
@@ -838,9 +846,6 @@ def run_ai_youtuber_loop(max_loops, runtime=None, stream_topic=None):
         target_message = select_reply_target(messages)
 
         print(f"--- {index}回目 / 新規コメント数：{len(messages)} ---")
-
-        if runtime is not None and messages:
-            runtime.publish_chat_messages(messages)
 
         for message in messages:
             processed_message_ids.add(message["message_id"])

@@ -142,12 +142,12 @@ class GenerateAndDeliverAiResponseTest(unittest.TestCase):
     @patch("main.SpeechScheduler.from_config")
     @patch("main.StreamContextManager")
     @patch("main.load_llm_config")
-    @patch("main.iter_chat_messages")
+    @patch("main.YouTubeChatPoller")
     @patch("main.get_live_chat_id")
     def test_live_loop_marks_selected_comment_as_reply_target(
         self,
         live_chat_id_mock,
-        iter_messages_mock,
+        poller_class_mock,
         load_config_mock,
         context_manager_mock,
         scheduler_factory_mock,
@@ -163,7 +163,9 @@ class GenerateAndDeliverAiResponseTest(unittest.TestCase):
             "comment": "どのコメントに返事してる？",
             "published_at": "2026-08-12T00:00:00Z",
         }
-        iter_messages_mock.return_value = iter(
+        poller = poller_class_mock.return_value
+        poller.start.return_value = poller
+        poller.iter_results.return_value = iter(
             [{"messages": [target_message], "next_page_token": None}]
         )
         load_config_mock.return_value = {
@@ -187,7 +189,10 @@ class GenerateAndDeliverAiResponseTest(unittest.TestCase):
 
         run_ai_youtuber_loop(max_loops=1, runtime=runtime)
 
-        runtime.publish_chat_messages.assert_called_once_with([target_message])
+        self.assertIs(
+            poller_class_mock.call_args.kwargs["message_callback"],
+            runtime.publish_chat_messages,
+        )
         self.assertEqual(
             runtime.publish_chat_reply_state.call_args_list,
             [
@@ -305,19 +310,21 @@ class GenerateAndDeliverAiResponseTest(unittest.TestCase):
     @patch("main.SpeechScheduler.from_config")
     @patch("main.StreamContextManager")
     @patch("main.load_llm_config")
-    @patch("main.iter_chat_messages")
+    @patch("main.YouTubeChatPoller")
     @patch("main.get_live_chat_id")
     def test_live_loop_generates_autonomous_speech_after_fixed_silence(
         self,
         live_chat_id_mock,
-        iter_messages_mock,
+        poller_class_mock,
         load_config_mock,
         context_manager_mock,
         scheduler_factory_mock,
         autonomous_mock,
     ):
         live_chat_id_mock.return_value = "live-chat-id"
-        iter_messages_mock.return_value = iter(
+        poller = poller_class_mock.return_value
+        poller.start.return_value = poller
+        poller.iter_results.return_value = iter(
             [{"messages": [], "next_page_token": None}]
         )
         load_config_mock.return_value = {
