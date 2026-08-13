@@ -38,12 +38,15 @@ class AutonomousTopicSelectorTest(unittest.TestCase):
 
         self.assertEqual(selector.select(previous_topic="trivia"), "trivia")
 
-    def test_default_prioritizes_surreal_observations_over_information(self):
+    def test_default_prioritizes_news_over_abstract_free_talk(self):
         selector = AutonomousTopicSelector({})
 
-        self.assertLess(selector.weights["news"], 0.1)
-        self.assertLessEqual(selector.weights["trivia"], 0.12)
-        self.assertGreater(selector.weights["observation"], 0.5)
+        self.assertEqual(selector.weights["news"], 0.4)
+        self.assertLessEqual(selector.weights["trivia"], 0.05)
+        self.assertGreater(
+            selector.weights["news"],
+            selector.weights["observation"],
+        )
 
     def test_unknown_topic_is_rejected_with_meaningful_error(self):
         with self.assertRaisesRegex(ValueError, "未対応の種類"):

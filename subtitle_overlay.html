@@ -72,9 +72,17 @@
       const DISPLAY_MS_PER_CHARACTER = 120;
       const FINAL_HOLD_MS = 1200;
       const subtitle = document.getElementById('subtitle');
-      const events = new EventSource('/subtitle-events');
+      // ローカルファイルとしてOBSへ読み込んでも、Python起動後に自動接続します。
+      const events = new EventSource('http://127.0.0.1:8765/subtitle-events');
       let subtitleTimerId = null;
       let playbackToken = 0;
+
+      events.onopen = () => {
+        window.parent.postMessage(
+          {type: 'ai-youtuber-overlay-status', overlay: 'subtitle', connected: true},
+          '*',
+        );
+      };
 
       function characterCount(text) {
         return Array.from(text).length;
@@ -238,6 +246,10 @@
 
       events.onerror = () => {
         console.error('字幕サーバーとの接続が切れました。再接続を待機します。');
+        window.parent.postMessage(
+          {type: 'ai-youtuber-overlay-status', overlay: 'subtitle', connected: false},
+          '*',
+        );
       };
     </script>
   </body>

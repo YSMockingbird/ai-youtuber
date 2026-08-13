@@ -1,6 +1,9 @@
 import argparse
 import os
+import re
 import time
+import unicodedata
+from pathlib import Path
 
 from dotenv import load_dotenv
 
@@ -19,13 +22,97 @@ from llm.config import load_llm_config
 from llm.session import StreamContextManager
 from motion_control import MotionRateLimiter
 from news_source import fetch_news_articles, select_news_article
+from obs_websocket import ObsWebSocketClient
 from speech_scheduler import SpeechScheduler
 from youtube_chat import (
     fetch_chat_messages,
     get_live_chat_id,
     iter_chat_messages,
+    YouTubeLiveEndedError,
+    YouTubeLiveNotStartedError,
     YouTubeChatPoller,
 )
+
+
+class YouTubeBroadcastEndCoordinator:
+    """終了挨拶の再生完了後にYouTube配信を安全に終了します。"""
+
+    def __init__(
+        self,
+        video_id,
+        runtime,
+        complete_callback=None,
+        stop_obs_callback=None,
+        now=None,
+    ):
+        self.video_id = video_id
+        self.runtime = runtime
+        self.complete_callback = complete_callback
+        self.stop_obs_callback = stop_obs_callback
+        self.now = now or time.monotonic
+        self.end_at = None
+        self.completed = False
+
+    def schedule(self, duration_ms):
+        # ブラウザ側の再生開始遅延を考慮し、WAV終了時刻に0.75秒だけ余裕を持たせます。
+        self.end_at = self.now() + float(duration_ms) / 1000 + 0.75
+        self.runtime.update_admin_status(
+            autonomous_paused=True,
+            phase="speaking",
+            message="終了挨拶の再生後、YouTube配信を自動終了します。",
+            speaking_until_ms=round(time.time() * 1000 + duration_ms),
+        )
+
+    def tick(self):
+        if self.completed or self.end_at is None or self.now() < self.end_at:
+            return False
+        self.runtime.update_admin_status(
+            autonomous_paused=True,
+            phase="ending_youtube",
+            message="YouTubeライブを終了しています。",
+        )
+        try:
+            if self.complete_callback is None:
+                from youtube_oauth import complete_youtube_broadcast
+
+                complete_callback = complete_youtube_broadcast
+            else:
+                complete_callback = self.complete_callback
+            status = complete_callback(self.video_id)
+        except (RuntimeError, ValueError) as exc:
+            self.runtime.update_admin_status(
+                autonomous_paused=True,
+                phase="error",
+                message=f"YouTubeライブを自動終了できませんでした: {exc}",
+            )
+            raise
+        self.completed = True
+        obs_message = "OBSの配信出力は手動停止が必要です。"
+        if self.stop_obs_callback is not None:
+            try:
+                stopped = self.stop_obs_callback()
+                obs_message = (
+                    "OBSの配信出力も停止しました。"
+                    if stopped
+                    else "OBSの配信出力はすでに停止していました。"
+                )
+            except (RuntimeError, ValueError) as exc:
+                obs_message = (
+                    "OBSの自動停止に失敗しました。OBSを手動停止してください。"
+                )
+                print(f"OBS自動停止エラー: {exc}")
+        self.runtime.update_admin_status(
+            autonomous_paused=True,
+            phase="youtube_ended",
+            message=f"YouTubeライブを終了しました。{obs_message} Pythonを停止します。",
+        )
+        print(f"YouTubeライブを自動終了しました：status={status}")
+        print(obs_message)
+        return True
+
+
+class AdminRequestedBroadcastEnd(RuntimeError):
+    """管理画面からYouTube配信を正常終了したことをメインループへ通知します。"""
 
 
 def run_openai_test():
@@ -39,6 +126,62 @@ def run_openai_test():
     print(f"AI：{ai_response['text']}")
     print(f"emotion：{ai_response['emotion']}")
     print(f"motion：{ai_response['motion']}")
+
+
+def run_obs_websocket_test():
+    # ライブを開始せず、OBS WebSocketの接続と配信状態取得だけを確認します。
+    client = ObsWebSocketClient.from_env()
+    if client is None:
+        raise RuntimeError(
+            "OBS_WEBSOCKET_ENABLEDがfalseです。.envでtrueにしてください。"
+        )
+    output_active = client.get_stream_status()
+    print("OBS WebSocket接続テストに成功しました。")
+    print(f"OBS配信出力：{'稼働中' if output_active else '停止中'}")
+
+
+def run_x_post_draft(topic=None):
+    # Xへは送信せず、確認用の投稿候補だけを表示します。
+    try:
+        # X機能の依存関係や障害をライブ起動経路から分離します。
+        from x_post import generate_x_post_draft
+
+        draft = generate_x_post_draft(topic=topic)
+    except (RuntimeError, ValueError) as exc:
+        print(f"X投稿案生成エラー: {exc}")
+        return False
+    print("X投稿案:")
+    print(draft["text"])
+    print(f"文字数: {len(draft['text'])}")
+    return True
+
+
+def run_x_post(topic=None, confirm=False, input_func=input):
+    # 明示確認がない限りXへ送信せず、候補の表示だけで終了します。
+    try:
+        from x_post import generate_x_post_draft, publish_x_post
+
+        draft = generate_x_post_draft(topic=topic)
+        text = draft["text"]
+        print("X投稿候補:")
+        print(text)
+        print(f"文字数: {len(text)}")
+        if not confirm:
+            print("投稿していません。投稿する場合は--confirmを付けて再実行してください。")
+            return False
+
+        answer = input_func("投稿する場合は POST と入力してください: ").strip()
+        if answer != "POST":
+            print("Xへの投稿をキャンセルしました。")
+            return False
+
+        result = publish_x_post(text)
+    except (RuntimeError, ValueError) as exc:
+        print(f"X投稿エラー: {exc}")
+        return False
+
+    print(f"Xへ投稿しました。post_id={result['post_id']}")
+    return True
 
 
 def run_character_memory_list(status="draft"):
@@ -158,6 +301,90 @@ def get_control_server_port():
     return port
 
 
+def get_obs_overlay_wait_seconds():
+    raw_seconds = os.getenv("OBS_OVERLAY_WAIT_SECONDS", "120").strip()
+    try:
+        wait_seconds = float(raw_seconds)
+    except ValueError as exc:
+        raise RuntimeError(
+            "OBS_OVERLAY_WAIT_SECONDSは数値で設定してください。"
+        ) from exc
+    if not 0 <= wait_seconds <= 600:
+        raise RuntimeError(
+            "OBS_OVERLAY_WAIT_SECONDSは0〜600秒で設定してください。"
+        )
+    return wait_seconds
+
+
+def get_youtube_live_wait_settings():
+    raw_interval = os.getenv("YOUTUBE_LIVE_WAIT_INTERVAL_SECONDS", "10").strip()
+    raw_timeout = os.getenv("YOUTUBE_LIVE_WAIT_TIMEOUT_SECONDS", "0").strip()
+    try:
+        interval_seconds = float(raw_interval)
+        timeout_seconds = float(raw_timeout)
+    except ValueError as exc:
+        raise RuntimeError(
+            "YouTubeライブ待機時間は数値で設定してください。"
+        ) from exc
+    if not 5 <= interval_seconds <= 300:
+        raise RuntimeError(
+            "YOUTUBE_LIVE_WAIT_INTERVAL_SECONDSは5〜300秒で設定してください。"
+        )
+    if not 0 <= timeout_seconds <= 86400:
+        raise RuntimeError(
+            "YOUTUBE_LIVE_WAIT_TIMEOUT_SECONDSは0〜86400秒で設定してください。"
+        )
+    return interval_seconds, timeout_seconds
+
+
+def wait_for_youtube_live(runtime=None):
+    # ライブ未開始だけを待機し、認証・通信・APIエラーはそのまま通知します。
+    interval_seconds, timeout_seconds = get_youtube_live_wait_settings()
+    started_at = time.monotonic()
+    attempt = 0
+    while True:
+        attempt += 1
+        try:
+            live_chat_id, video_id = get_live_chat_id(return_video_id=True)
+        except YouTubeLiveNotStartedError as exc:
+            elapsed_seconds = time.monotonic() - started_at
+            if timeout_seconds and elapsed_seconds >= timeout_seconds:
+                raise RuntimeError(
+                    "YouTubeライブ開始の待機時間を超えました。"
+                    f" timeout_seconds={timeout_seconds:g}"
+                ) from exc
+            message = (
+                "YouTubeライブ開始を待っています。"
+                f"次回確認={interval_seconds:g}秒後"
+            )
+            if runtime is not None:
+                runtime.update_admin_status(
+                    phase="waiting_for_youtube",
+                    message=message,
+                    youtube_wait_attempts=attempt,
+                )
+            print(f"{message} 確認回数={attempt}")
+            time.sleep(interval_seconds)
+            continue
+        if runtime is not None:
+            runtime.update_admin_status(
+                phase="preparing",
+                message="YouTubeライブを確認しました。配信を準備しています。",
+                youtube_wait_attempts=attempt,
+            )
+        return live_chat_id, video_id
+
+
+def _create_youtube_live_status_callback(video_id):
+    # OAuth依存はライブ開始後だけ読み込み、同じ配信の終了状態を追跡します。
+    def check_live_status():
+        from youtube_oauth import is_youtube_broadcast_live
+
+        return is_youtube_broadcast_live(video_id)
+
+    return check_live_status
+
+
 def parse_interactive_speech_command(command):
     # 通常入力はneutral、/emotion指定時は指定された感情で発話します。
     if not command.startswith("/emotion "):
@@ -203,6 +430,9 @@ def print_external_control_server_info(version, speaker_id, port):
     print(f"SSE URL: http://127.0.0.1:{port}/events")
     print(f"OBS字幕URL: http://127.0.0.1:{port}/overlay")
     print(f"OBSチャットURL: http://127.0.0.1:{port}/chat-overlay")
+    project_root = Path(__file__).resolve().parent
+    print(f"OBS固定字幕ファイル: {project_root / 'subtitle_overlay.html'}")
+    print(f"OBS固定チャットファイル: {project_root / 'chat_overlay.html'}")
     print(f"配信管理画面: http://127.0.0.1:{port}/admin")
     print(f"記憶管理画面: http://127.0.0.1:{port}/character-memories")
     print(f"確認URL: http://127.0.0.1:{port}/health")
@@ -617,7 +847,7 @@ def select_reply_target(messages):
 
 
 def is_reply_candidate(message):
-    # 空コメントや短すぎるコメントは返答対象から外します。
+    # 空コメント、長すぎるコメント、意味の薄い文字列は返答対象から外します。
     comment = message.get("comment", "").strip()
 
     if len(comment) < 2:
@@ -629,20 +859,50 @@ def is_reply_candidate(message):
     if comment.startswith("@"):
         return False
 
-    meaningful_chars = [char for char in comment if char.isalnum()]
+    normalized_comment = unicodedata.normalize("NFKC", comment).lower()
+    compact_comment = "".join(
+        char for char in normalized_comment if not char.isspace()
+    )
+    if re.fullmatch(r"(?:https?://|www\.)\S+", compact_comment):
+        return False
+
+    meaningful_chars = [char for char in compact_comment if char.isalnum()]
     if not meaningful_chars:
         return False
+
+    meaningful_text = "".join(meaningful_chars)
+    if re.fullmatch(r"(?:w{2,}|草+|笑+|8{3,}|っ{3,}[a-z0-9]?)", meaningful_text):
+        return False
+    if set(meaningful_text) <= {"w", "草", "笑", "8"}:
+        return False
+
+    # 「っっっっっf」のように一文字の連打が大半を占める入力を除外します。
+    if len(meaningful_chars) >= 4:
+        most_common_count = max(
+            meaningful_chars.count(char) for char in set(meaningful_chars)
+        )
+        if most_common_count / len(meaningful_chars) >= 0.75:
+            return False
 
     return True
 
 
-def process_next_admin_command(runtime, autonomous_buffer, stream_context):
+def process_next_admin_command(
+    runtime,
+    autonomous_buffer,
+    stream_context,
+    schedule_broadcast_end=None,
+):
     command = runtime.get_next_admin_command()
     if command is None:
         return False
 
     action = command["action"]
     try:
+        if action == "end_broadcast" and schedule_broadcast_end is None:
+            raise RuntimeError(
+                "YouTube自動終了はai-youtuber-liveモードでのみ利用できます。"
+            )
         if action == "pause_autonomous":
             autonomous_buffer.pause()
             runtime.update_admin_status(
@@ -672,12 +932,27 @@ def process_next_admin_command(runtime, autonomous_buffer, stream_context):
             print("管理画面：次の自発発話をキャンセルしました。")
             return True
 
+        if action == "change_stream_plan":
+            runtime.update_admin_status(
+                phase="processing",
+                message="新しい配信構成を作成しています。",
+            )
+            description = autonomous_buffer.replace_program(command["text"])
+            runtime.update_admin_status(
+                **autonomous_buffer.theme_manager.status(),
+                phase="waiting",
+                message="配信企画と話題構成を変更しました。",
+            )
+            print("--- 管理画面から配信構成を変更 ---")
+            print(description)
+            return True
+
         autonomous_buffer.cancel_next()
         runtime.update_admin_status(
             phase="processing",
             message=(
                 "終了挨拶を生成しています。"
-                if action == "closing_greeting"
+                if action in {"closing_greeting", "end_broadcast"}
                 else "管理者の発話指示を処理しています。"
             ),
         )
@@ -693,13 +968,15 @@ def process_next_admin_command(runtime, autonomous_buffer, stream_context):
         else:
             instruction = (
                 "その配信らしい自然な終了挨拶をしてください。"
-                if action == "closing_greeting"
+                if action in {"closing_greeting", "end_broadcast"}
                 else command["text"]
             )
             generated_response = generate_admin_directed_speech(
                 instruction,
                 context_builder=stream_context.context_builder,
-                closing_greeting=(action == "closing_greeting"),
+                closing_greeting=(
+                    action in {"closing_greeting", "end_broadcast"}
+                ),
             )
 
         if action == "direct_speech":
@@ -723,7 +1000,7 @@ def process_next_admin_command(runtime, autonomous_buffer, stream_context):
             ai_response,
             source="admin_instruction",
         )
-        if action == "closing_greeting":
+        if action in {"closing_greeting", "end_broadcast"}:
             autonomous_buffer.pause()
         else:
             autonomous_buffer.schedule_after_external_speech(
@@ -732,20 +1009,26 @@ def process_next_admin_command(runtime, autonomous_buffer, stream_context):
         runtime.update_admin_status(
             autonomous_paused=(
                 True
-                if action == "closing_greeting"
+                if action in {"closing_greeting", "end_broadcast"}
                 else autonomous_buffer.paused
             ),
             phase="speaking",
             message=(
-                "終了挨拶を再生しています。自発発話は停止しました。"
-                "OBSとYouTubeは停止しません。"
-                if action == "closing_greeting"
+                (
+                    "終了挨拶を再生しています。再生後にYouTubeを終了します。"
+                    if action == "end_broadcast"
+                    else "終了挨拶を再生しています。自発発話は停止しました。"
+                    "OBSとYouTubeは停止しません。"
+                )
+                if action in {"closing_greeting", "end_broadcast"}
                 else "管理者指定の発話を再生しています。"
             ),
             speaking_until_ms=round(
                 time.time() * 1000 + speech_command["duration_ms"]
             ),
         )
+        if action == "end_broadcast":
+            schedule_broadcast_end(speech_command["duration_ms"])
         print(f"--- 管理画面からの発話 / action={action} ---")
         print(f"AI：{ai_response['text']}")
         print(f"emotion：{ai_response['emotion']}")
@@ -777,9 +1060,38 @@ def run_ai_youtuber_once():
     print(f"emotion：{ai_response['emotion']}")
 
 
-def run_ai_youtuber_loop(max_loops, runtime=None, stream_topic=None):
+def run_ai_youtuber_loop(
+    max_loops,
+    runtime=None,
+    stream_topic=None,
+    stream_plan=None,
+    obs_websocket_client=None,
+):
     # コメントを優先し、音声終了後の無言時間が続いたら自発発話します。
-    live_chat_id = get_live_chat_id()
+    if runtime is not None:
+        overlay_wait_seconds = get_obs_overlay_wait_seconds()
+        runtime.update_admin_status(
+            available=True,
+            phase="waiting_for_obs",
+            message="OBSの字幕・コメント接続を待っています。",
+        )
+        print(
+            "OBS接続待機：字幕とコメントの接続を待っています。"
+            f"最大={overlay_wait_seconds:g}秒"
+        )
+        if not runtime.wait_for_obs_overlays(overlay_wait_seconds):
+            overlay_status = runtime.get_obs_overlay_status()
+            raise RuntimeError(
+                "OBSの字幕・コメント接続を確認できませんでした。"
+                f" subtitle_connected={overlay_status['subtitle_connected']}"
+                f" chat_connected={overlay_status['chat_connected']} "
+                "OBSのローカルHTML設定を確認してください。"
+            )
+        print("OBS接続確認：字幕・コメントともに接続済みです。")
+        live_chat_id, video_id = wait_for_youtube_live(runtime)
+    else:
+        live_chat_id = get_live_chat_id()
+        video_id = None
     processed_message_ids = set()
     used_news_links = set()
     llm_config = load_llm_config()
@@ -794,21 +1106,31 @@ def run_ai_youtuber_loop(max_loops, runtime=None, stream_topic=None):
             config=llm_config,
             publish_callback=deliver_prepared_response,
             stream_topic=stream_topic,
+            stream_instruction=stream_plan,
         )
     recent_utterances = []
     previous_autonomous_topic = None
     has_received_comment = False
+    broadcast_end_coordinator = (
+        YouTubeBroadcastEndCoordinator(video_id, runtime)
+        if runtime is not None and video_id is not None
+        else None
+    )
+    if broadcast_end_coordinator is not None and obs_websocket_client is not None:
+        broadcast_end_coordinator.stop_obs_callback = (
+            obs_websocket_client.stop_stream
+        )
 
     print("AI YouTuberループを開始します。")
     print(f"最大取得回数：{max_loops}")
     if autonomous_buffer is not None:
         print(autonomous_buffer.theme_manager.describe())
         runtime.update_admin_status(
+            **autonomous_buffer.theme_manager.status(),
             available=True,
             autonomous_paused=False,
-            phase="waiting",
-            message="コメントまたは次の発話を待っています。",
-            stream_theme=autonomous_buffer.theme_manager.state.main_theme,
+            phase="preparing",
+            message="配信構成を準備しました。開始挨拶を再生します。",
         )
     print(
         "自発発話の無言時間："
@@ -819,10 +1141,20 @@ def run_ai_youtuber_loop(max_loops, runtime=None, stream_topic=None):
     def process_live_wait():
         if autonomous_buffer is None:
             return False
+        if (
+            broadcast_end_coordinator is not None
+            and broadcast_end_coordinator.tick()
+        ):
+            raise AdminRequestedBroadcastEnd()
         if process_next_admin_command(
             runtime,
             autonomous_buffer,
             stream_context,
+            schedule_broadcast_end=(
+                broadcast_end_coordinator.schedule
+                if broadcast_end_coordinator is not None
+                else None
+            ),
         ):
             return True
         return autonomous_buffer.tick()
@@ -833,11 +1165,50 @@ def run_ai_youtuber_loop(max_loops, runtime=None, stream_topic=None):
         message_callback=(
             runtime.publish_chat_messages if runtime is not None else None
         ),
+        live_status_callback=(
+            _create_youtube_live_status_callback(video_id)
+            if video_id is not None
+            else None
+        ),
     ).start()
+    if autonomous_buffer is not None:
+        try:
+            autonomous_buffer.publish_opening()
+        except (RuntimeError, ValueError):
+            chat_poller.stop()
+            raise
     chat_results = chat_poller.iter_results(
         wait_callback=(process_live_wait if autonomous_buffer is not None else None)
     )
-    for index, result in enumerate(chat_results, start=1):
+    index = 0
+    while True:
+        try:
+            if (
+                broadcast_end_coordinator is not None
+                and broadcast_end_coordinator.tick()
+            ):
+                print("管理画面の指示によりライブ処理を終了します。")
+                break
+            result = next(chat_results)
+        except StopIteration:
+            break
+        except AdminRequestedBroadcastEnd:
+            print("管理画面の指示によりライブ処理を終了します。")
+            break
+        except YouTubeLiveEndedError as exc:
+            # YouTube側が先に終了した場合は、音声完了を待たずライブ処理を終了します。
+            if autonomous_buffer is not None:
+                autonomous_buffer.pause()
+            if runtime is not None:
+                runtime.update_admin_status(
+                    autonomous_paused=True,
+                    phase="youtube_ended",
+                    message="YouTubeライブ終了を検知しました。Pythonを停止します。",
+                )
+            print(f"YouTubeライブ終了を検知しました：{exc}")
+            print("新しい発話を停止し、音声完了を待たずPythonを終了します。")
+            break
+        index += 1
         messages = [
             message
             for message in result["messages"]
@@ -1020,16 +1391,25 @@ def run_ai_youtuber_loop(max_loops, runtime=None, stream_topic=None):
             speech_scheduler.record_speech(ai_response["text"])
 
 
-def run_ai_youtuber_live(max_loops, stream_topic=None):
+def run_ai_youtuber_live(max_loops, stream_topic=None, stream_plan=None):
     # YouTube、OpenAI、AivisSpeech、AITuber OnAirをまとめて実行します。
     server, version, speaker_id, port = start_external_control_server()
     print_external_control_server_info(version, speaker_id, port)
 
     try:
+        obs_websocket_client = ObsWebSocketClient.from_env()
+        if obs_websocket_client is not None:
+            output_active = obs_websocket_client.get_stream_status()
+            print(
+                "OBS WebSocket接続確認：成功 "
+                f"配信出力={'稼働中' if output_active else '停止中'}"
+            )
         run_ai_youtuber_loop(
             max_loops,
             runtime=server.runtime,
             stream_topic=stream_topic,
+            stream_plan=stream_plan,
+            obs_websocket_client=obs_websocket_client,
         )
     finally:
         server.runtime.update_admin_status(
@@ -1047,6 +1427,7 @@ def parse_args():
         "--mode",
         choices=[
             "openai-test",
+            "obs-test",
             "youtube-chat-id",
             "youtube-messages",
             "youtube-loop",
@@ -1063,9 +1444,21 @@ def parse_args():
             "character-memory-approved",
             "character-memory-approve",
             "character-memory-reject",
+            "x-draft",
+            "x-post",
         ],
         default="openai-test",
         help="実行する確認処理を選びます。",
+    )
+    parser.add_argument(
+        "--x-topic",
+        default=None,
+        help="x-draftまたはx-postモードで投稿案の話題を任意指定します。",
+    )
+    parser.add_argument(
+        "--confirm",
+        action="store_true",
+        help="x-postモードで対話確認を有効にします。",
     )
     parser.add_argument(
         "--max-loops",
@@ -1088,6 +1481,14 @@ def parse_args():
         ),
     )
     parser.add_argument(
+        "--stream-plan",
+        default=None,
+        help=(
+            "配信構成の希望を200文字以内で指定します。"
+            "例：初見向けの自己紹介配信"
+        ),
+    )
+    parser.add_argument(
         "--character-memory-id",
         default=None,
         help="character-memory-approveまたはcharacter-memory-rejectの対象IDです。",
@@ -1103,6 +1504,12 @@ def main():
     try:
         if args.mode == "openai-test":
             run_openai_test()
+        elif args.mode == "obs-test":
+            run_obs_websocket_test()
+        elif args.mode == "x-draft":
+            run_x_post_draft(args.x_topic)
+        elif args.mode == "x-post":
+            run_x_post(args.x_topic, confirm=args.confirm)
         elif args.mode == "youtube-chat-id":
             run_youtube_chat_id_test()
         elif args.mode == "youtube-messages":
@@ -1124,7 +1531,11 @@ def main():
         elif args.mode == "news-voice":
             run_news_voice_test()
         elif args.mode == "ai-youtuber-live":
-            run_ai_youtuber_live(args.max_loops, args.stream_topic)
+            run_ai_youtuber_live(
+                args.max_loops,
+                args.stream_topic,
+                args.stream_plan,
+            )
         elif args.mode == "mock-live":
             run_mock_live(args.mock_delay_seconds)
         elif args.mode == "character-memory-drafts":

@@ -1,6 +1,9 @@
 openai
 python-dotenv
 requests
+requests-oauthlib
 urllib3<2
 google-auth
 google-auth-oauthlib
+google-genai
+websockets>=15,<16

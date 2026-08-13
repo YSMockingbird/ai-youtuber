@@ -3,16 +3,73 @@ from contextlib import redirect_stdout
 from io import StringIO
 from unittest.mock import call, Mock, patch
 
+import requests
+
 from youtube_chat import (
     fetch_chat_messages,
     get_live_chat_id,
     iter_chat_messages,
     resolve_youtube_video_id,
+    YouTubeLiveEndedError,
+    YouTubeLiveNotStartedError,
     YouTubeChatPoller,
 )
 
 
 class YouTubeChatTest(unittest.TestCase):
+    @patch.dict("os.environ", {"YOUTUBE_API_KEY": "test-key"})
+    @patch("youtube_chat.requests.get")
+    def test_live_chat_ended_error_is_distinguished(self, get_mock):
+        response = Mock(status_code=403)
+        response.json.return_value = {
+            "error": {"errors": [{"reason": "liveChatEnded"}]}
+        }
+        response.raise_for_status.side_effect = requests.exceptions.HTTPError(
+            response=response
+        )
+        get_mock.return_value = response
+
+        with self.assertRaisesRegex(YouTubeLiveEndedError, "終了"):
+            fetch_chat_messages("live-chat-id")
+
+    @patch.dict(
+        "os.environ",
+        {"YOUTUBE_API_KEY": "test-key", "YOUTUBE_VIDEO_ID": "scheduled-id"},
+        clear=False,
+    )
+    @patch("youtube_chat.requests.get")
+    def test_scheduled_broadcast_without_chat_is_reported_as_not_started(
+        self,
+        get_mock,
+    ):
+        response = Mock()
+        response.json.return_value = {
+            "items": [{"liveStreamingDetails": {"scheduledStartTime": "later"}}]
+        }
+        get_mock.return_value = response
+
+        with self.assertRaises(YouTubeLiveNotStartedError):
+            get_live_chat_id()
+
+    @patch.dict(
+        "os.environ",
+        {"YOUTUBE_API_KEY": "test-key", "YOUTUBE_VIDEO_ID": "live-id"},
+        clear=False,
+    )
+    @patch("youtube_chat.requests.get")
+    def test_live_broadcast_without_enabled_chat_is_a_configuration_error(
+        self,
+        get_mock,
+    ):
+        response = Mock()
+        response.json.return_value = {
+            "items": [{"liveStreamingDetails": {"actualStartTime": "now"}}]
+        }
+        get_mock.return_value = response
+
+        with self.assertRaisesRegex(RuntimeError, "ライブチャットが有効"):
+            get_live_chat_id()
+
     @patch.dict(
         "os.environ",
         {"YOUTUBE_VIDEO_ID": "manual-video-id"},
@@ -66,6 +123,35 @@ class YouTubeChatTest(unittest.TestCase):
             get_mock.call_args.kwargs["params"]["id"],
             "manual-video-id",
         )
+
+    @patch.dict(
+        "os.environ",
+        {
+            "YOUTUBE_API_KEY": "test-key",
+            "YOUTUBE_VIDEO_ID": "manual-video-id",
+        },
+        clear=False,
+    )
+    @patch("youtube_chat.requests.get")
+    def test_live_chat_id_can_return_video_id_for_status_tracking(
+        self,
+        get_mock,
+    ):
+        response = Mock()
+        response.json.return_value = {
+            "items": [
+                {
+                    "liveStreamingDetails": {
+                        "activeLiveChatId": "live-chat-id"
+                    }
+                }
+            ]
+        }
+        get_mock.return_value = response
+
+        result = get_live_chat_id(return_video_id=True)
+
+        self.assertEqual(result, ("live-chat-id", "manual-video-id"))
 
     @patch("youtube_chat.time.sleep")
     @patch("youtube_chat.time.monotonic")
@@ -315,6 +401,40 @@ class YouTubeChatTest(unittest.TestCase):
             "YouTubeコメント取得スレッドが停止しました: API接続失敗",
         ):
             list(poller.iter_results())
+
+    @patch("youtube_chat.iter_chat_messages")
+    def test_poller_preserves_live_ended_error(self, iter_messages_mock):
+        def ended_iterator(*args, **kwargs):
+            raise YouTubeLiveEndedError("ライブチャット終了")
+            yield
+
+        iter_messages_mock.side_effect = ended_iterator
+        poller = YouTubeChatPoller("live-chat-id").start()
+
+        with self.assertRaises(YouTubeLiveEndedError):
+            list(poller.iter_results())
+
+    @patch("youtube_chat.time.monotonic")
+    @patch("youtube_chat.iter_chat_messages")
+    def test_poller_detects_end_from_broadcast_status(
+        self,
+        iter_messages_mock,
+        monotonic_mock,
+    ):
+        iter_messages_mock.return_value = iter(
+            [{"messages": [], "next_page_token": "next"}]
+        )
+        monotonic_mock.side_effect = [0, 16]
+        live_status_callback = Mock(return_value=False)
+        poller = YouTubeChatPoller(
+            "live-chat-id",
+            live_status_callback=live_status_callback,
+            live_status_interval_seconds=15,
+        ).start()
+
+        with self.assertRaises(YouTubeLiveEndedError):
+            list(poller.iter_results())
+        live_status_callback.assert_called_once_with()
 
 
 if __name__ == "__main__":

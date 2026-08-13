@@ -166,7 +166,8 @@
       const status = document.getElementById('status');
       const messageElements = new Map();
       const completionTimers = new Map();
-      const events = new EventSource('/chat-events');
+      // ローカルファイルとしてOBSへ読み込んでも、Python起動後に自動接続します。
+      const events = new EventSource('http://127.0.0.1:8765/chat-events');
 
       function hueFromName(name) {
         let hash = 0;
@@ -277,6 +278,10 @@
       events.onopen = () => {
         status.textContent = '接続済み';
         status.classList.add('connected');
+        window.parent.postMessage(
+          {type: 'ai-youtuber-overlay-status', overlay: 'chat', connected: true},
+          '*',
+        );
       };
 
       events.onmessage = (event) => {
@@ -306,6 +311,10 @@
       events.onerror = () => {
         status.textContent = '再接続中...';
         status.classList.remove('connected');
+        window.parent.postMessage(
+          {type: 'ai-youtuber-overlay-status', overlay: 'chat', connected: false},
+          '*',
+        );
       };
     </script>
   </body>

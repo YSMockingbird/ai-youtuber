@@ -180,6 +180,23 @@
       <div id="discardedPrefetches" class="theme"></div>
 
       <div class="grid">
+        <section class="card full">
+          <h2>配信企画・話題構成</h2>
+          <p class="description">以後の自発雑談を、指定した企画に沿う3〜5個の話題へ組み直します。コメント返信はそのまま継続します。</p>
+          <label for="planPreset">企画プリセット</label>
+          <select id="planPreset">
+            <option value="daily">AIにおまかせ（日常雑談）</option>
+            <option value="self_intro">自己紹介配信</option>
+            <option value="custom">自由入力</option>
+          </select>
+          <label for="planInstruction">配信内容の希望</label>
+          <textarea id="planInstruction" maxlength="200" placeholder="例：最近ハマっているゲームについて、初心者にも分かる雑談をして"></textarea>
+          <div class="action-row">
+            <button id="changePlan">この内容で話題を組み直す</button>
+          </div>
+          <div class="notice">配信開始時から指定する場合は、起動時に --stream-plan を使ってください。この操作では開始挨拶を繰り返しません。</div>
+        </section>
+
         <section class="card">
           <h2>AIへの指示</h2>
           <p class="description">指示文をそのまま読まず、ガン奈自身の自然な発言に変換します。</p>
@@ -198,8 +215,9 @@
             <button id="resume" class="secondary">自発発話を再開</button>
             <button id="cancel" class="secondary">次の発言を取消</button>
             <button id="closing" class="warning">終了挨拶を生成</button>
+            <button id="endBroadcast" class="danger">終了挨拶して配信終了</button>
           </div>
-          <div class="notice">終了挨拶をしてもOBS・YouTubeは停止しません。配信停止は引き続き手動です。</div>
+          <div class="notice">「終了挨拶を生成」は挨拶のみです。「終了挨拶して配信終了」は音声再生後にYouTubeとPythonを停止します。OBSの停止は現在手動です。</div>
         </section>
 
         <section class="card full">
@@ -259,6 +277,9 @@
         discardedPrefetches: document.getElementById('discardedPrefetches'),
         result: document.getElementById('result'),
         instruction: document.getElementById('instruction'),
+        planPreset: document.getElementById('planPreset'),
+        planInstruction: document.getElementById('planInstruction'),
+        changePlan: document.getElementById('changePlan'),
         directText: document.getElementById('directText'),
         emotion: document.getElementById('emotion'),
         speechStyle: document.getElementById('speechStyle'),
@@ -268,11 +289,14 @@
         resume: document.getElementById('resume'),
         cancel: document.getElementById('cancel'),
         closing: document.getElementById('closing'),
+        endBroadcast: document.getElementById('endBroadcast'),
         speakDirectly: document.getElementById('speakDirectly'),
       };
       const commandButtons = [
         elements.sendInstruction, elements.pause, elements.resume,
-        elements.cancel, elements.closing, elements.speakDirectly,
+        elements.cancel, elements.closing, elements.endBroadcast,
+        elements.speakDirectly,
+        elements.changePlan,
       ];
       let latestStatus = null;
 
@@ -287,7 +311,10 @@
         elements.connection.classList.add('online');
         const titles = {
           starting: '起動中', waiting: '待機中', paused: '自発発話停止中',
+          waiting_for_obs: 'OBS接続待機中',
+          waiting_for_youtube: 'YouTubeライブ待機中', preparing: '配信準備中',
           processing: '指示を処理中', speaking: '発話中', error: 'エラー',
+          ending_youtube: 'YouTube配信終了中', youtube_ended: 'YouTube配信終了',
           stopped: 'ライブ制御停止中',
         };
         elements.statusTitle.textContent = titles[status.phase] || status.phase;
@@ -295,8 +322,11 @@
         elements.queue.textContent = status.queued_commands
           ? `待機命令 ${status.queued_commands}件`
           : '';
+        const segment = status.stream_segment
+          ? ` / 話題 ${status.stream_segment_index || 1}/${status.stream_segment_count || 1}：${status.stream_segment}`
+          : '';
         elements.theme.textContent = status.stream_theme
-          ? `配信テーマ：${status.stream_theme}`
+          ? `配信企画：${status.stream_theme}${segment}`
           : '';
         const discarded = Number(status.discarded_prefetches || 0);
         elements.discardedPrefetches.textContent = discarded
@@ -349,6 +379,20 @@
         if (!text) return showResult('AIへの指示を入力してください。', true);
         sendCommand({action: 'ai_instruction', text}, 'AIへの指示を受け付けました。');
       });
+      elements.changePlan.addEventListener('click', () => {
+        const presets = {
+          daily: '専門的にせず、誰でも想像できる日常的な雑談配信。具体的な内容はAIにおまかせ',
+          self_intro: '初見向けの自己紹介配信。AIとしての仕組み、性格、趣味、活動目的、今後やりたいことを話す',
+        };
+        const text = elements.planPreset.value === 'custom'
+          ? elements.planInstruction.value.trim()
+          : presets[elements.planPreset.value];
+        if (!text) return showResult('配信内容の希望を入力してください。', true);
+        sendCommand(
+          {action: 'change_stream_plan', text},
+          '新しい配信構成の作成を受け付けました。'
+        );
+      });
       elements.speakDirectly.addEventListener('click', () => {
         const text = elements.directText.value.trim();
         if (!text) return showResult('発話文章を入力してください。', true);
@@ -371,6 +415,16 @@
       elements.closing.addEventListener('click', () => sendCommand(
         {action: 'closing_greeting'}, '終了挨拶の生成命令を受け付けました。'
       ));
+      elements.endBroadcast.addEventListener('click', () => {
+        const confirmed = window.confirm(
+          '終了挨拶の再生後、YouTubeライブを終了します。よろしいですか？'
+        );
+        if (!confirmed) return;
+        sendCommand(
+          {action: 'end_broadcast'},
+          '終了挨拶後のYouTube配信終了命令を受け付けました。'
+        );
+      });
 
       refreshStatus();
       window.setInterval(refreshStatus, 1000);

@@ -10,6 +10,27 @@ YOUTUBE_VIDEO_API_URL = "https://www.googleapis.com/youtube/v3/videos"
 YOUTUBE_LIVE_CHAT_API_URL = "https://www.googleapis.com/youtube/v3/liveChat/messages"
 
 
+class YouTubeLiveNotStartedError(RuntimeError):
+    """YouTube配信またはライブチャットがまだ開始されていない状態です。"""
+
+
+class YouTubeLiveEndedError(RuntimeError):
+    """YouTube配信とライブチャットが終了した状態です。"""
+
+
+def _get_youtube_error_reasons(response):
+    # HTTPステータスだけでは配信終了と権限エラーを区別できないため、reasonを確認します。
+    try:
+        data = response.json()
+    except (TypeError, ValueError):
+        return []
+    return [
+        error.get("reason", "")
+        for error in data.get("error", {}).get("errors", [])
+        if isinstance(error, dict)
+    ]
+
+
 def resolve_youtube_video_id():
     # 手動IDを優先し、未設定の場合だけOAuthで現在ライブ中の配信を検索します。
     configured_video_id = os.getenv("YOUTUBE_VIDEO_ID", "").strip()
@@ -18,9 +39,15 @@ def resolve_youtube_video_id():
         return configured_video_id
 
     # 手動ID利用時はOAuthライブラリを読み込まず、従来どおり動作させます。
-    from youtube_oauth import find_active_youtube_broadcast
+    from youtube_oauth import (
+        find_active_youtube_broadcast,
+        NoActiveYouTubeBroadcastError,
+    )
 
-    broadcast = find_active_youtube_broadcast()
+    try:
+        broadcast = find_active_youtube_broadcast()
+    except NoActiveYouTubeBroadcastError as exc:
+        raise YouTubeLiveNotStartedError(str(exc)) from exc
     print(
         "現在ライブ中の配信を自動取得しました："
         f"{broadcast['title']} / video_id={broadcast['video_id']}"
@@ -28,7 +55,7 @@ def resolve_youtube_video_id():
     return broadcast["video_id"]
 
 
-def get_live_chat_id():
+def get_live_chat_id(return_video_id=False):
     # 手動またはOAuthで動画IDを決定し、ライブチャットIDを取得します。
     api_key = os.getenv("YOUTUBE_API_KEY", "").strip()
 
@@ -64,8 +91,19 @@ def get_live_chat_id():
     live_chat_id = live_streaming_details.get("activeLiveChatId")
 
     if not live_chat_id:
-        raise RuntimeError("liveChatIdを取得できませんでした。配信がライブ中か、ライブチャットが有効か確認してください。")
+        actual_start_time = live_streaming_details.get("actualStartTime")
+        actual_end_time = live_streaming_details.get("actualEndTime")
+        if not actual_start_time and not actual_end_time:
+            raise YouTubeLiveNotStartedError(
+                "指定したYouTube配信はまだライブ開始前です。"
+            )
+        raise RuntimeError(
+            "ライブ中の配信からliveChatIdを取得できませんでした。"
+            "YouTube Studioでライブチャットが有効か確認してください。"
+        )
 
+    if return_video_id:
+        return live_chat_id, video_id
     return live_chat_id
 
 
@@ -95,6 +133,15 @@ def fetch_chat_messages(live_chat_id, page_token=None):
         raise RuntimeError("YouTubeコメント取得がタイムアウトしました。ネットワーク接続を確認してください。") from exc
     except requests.exceptions.HTTPError as exc:
         status_code = exc.response.status_code if exc.response is not None else "unknown"
+        error_reasons = (
+            _get_youtube_error_reasons(exc.response)
+            if exc.response is not None
+            else []
+        )
+        if "liveChatEnded" in error_reasons:
+            raise YouTubeLiveEndedError(
+                "YouTubeライブチャットが終了しました。"
+            ) from exc
         raise RuntimeError(f"YouTubeコメント取得でHTTPエラーが発生しました。status_code={status_code}") from exc
     except requests.exceptions.RequestException as exc:
         raise RuntimeError("YouTubeコメント取得に失敗しました。ネットワーク接続を確認してください。") from exc
@@ -188,10 +235,21 @@ def iter_chat_messages(
 class YouTubeChatPoller:
     """YouTubeコメント取得とOBS表示を返信生成から分離します。"""
 
-    def __init__(self, live_chat_id, max_loops=None, message_callback=None):
+    def __init__(
+        self,
+        live_chat_id,
+        max_loops=None,
+        message_callback=None,
+        live_status_callback=None,
+        live_status_interval_seconds=15,
+    ):
         self.live_chat_id = live_chat_id
         self.max_loops = max_loops
         self.message_callback = message_callback
+        self.live_status_callback = live_status_callback
+        self.live_status_interval_seconds = float(live_status_interval_seconds)
+        if self.live_status_interval_seconds <= 0:
+            raise ValueError("配信状態の確認間隔は0より大きくしてください。")
         self._result_queue = queue.Queue(maxsize=256)
         self._stop_event = threading.Event()
         self._finished_event = threading.Event()
@@ -211,6 +269,9 @@ class YouTubeChatPoller:
         return self
 
     def _run(self):
+        next_status_check_at = (
+            time.monotonic() + self.live_status_interval_seconds
+        )
         try:
             for result in iter_chat_messages(
                 self.live_chat_id,
@@ -230,6 +291,18 @@ class YouTubeChatPoller:
                 published_result["messages"] = messages
                 if messages and self.message_callback is not None:
                     self.message_callback(messages)
+
+                if (
+                    self.live_status_callback is not None
+                    and time.monotonic() >= next_status_check_at
+                ):
+                    if not self.live_status_callback():
+                        raise YouTubeLiveEndedError(
+                            "YouTubeライブ配信の終了状態を確認しました。"
+                        )
+                    next_status_check_at = (
+                        time.monotonic() + self.live_status_interval_seconds
+                    )
 
                 # 返信生成中は空の取得結果を一件だけ残し、コメント用の空きを守ります。
                 if not messages and not self._result_queue.empty():
@@ -258,6 +331,12 @@ class YouTubeChatPoller:
 
         try:
             while True:
+                # 配信終了時は古い待機結果を処理せず、終了を最優先でメインへ通知します。
+                if self._finished_event.is_set() and isinstance(
+                    self._error,
+                    YouTubeLiveEndedError,
+                ):
+                    self._raise_if_failed()
                 try:
                     first_result = self._result_queue.get(
                         timeout=float(wait_step_seconds)
@@ -294,6 +373,8 @@ class YouTubeChatPoller:
 
     def _raise_if_failed(self):
         if self._error is not None:
+            if isinstance(self._error, YouTubeLiveEndedError):
+                raise self._error
             raise RuntimeError(
                 f"YouTubeコメント取得スレッドが停止しました: {self._error}"
             ) from self._error

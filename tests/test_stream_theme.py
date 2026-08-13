@@ -1,30 +1,69 @@
 import unittest
+from unittest.mock import Mock, patch
 
 from llm.context_builder import estimate_tokens
 from stream_theme import (
+    generate_stream_theme_plan,
+    StreamSegmentPlan,
     StreamThemeManager,
     StreamThemePlan,
 )
 
 
+def create_plan(theme="休日の過ごし方", prefix="休日"):
+    return StreamThemePlan(
+        theme=theme,
+        core_question=f"{theme}を身近な体験からどう話すか",
+        opening_angle=f"{theme}の分かりやすい入口から始める",
+        opening_greeting=f"こんばんは。今日は{theme}について、のんびり話してみる。",
+        segments=[
+            StreamSegmentPlan(
+                title=f"{prefix}の入口",
+                talking_points=["朝に最初にすること", "予定を決める時の癖"],
+                tangent_ideas=["寝坊した日の話"],
+                target_utterances=3,
+            ),
+            StreamSegmentPlan(
+                title=f"{prefix}の失敗",
+                talking_points=["準備しすぎた失敗", "何もしなかった失敗"],
+                tangent_ideas=["買い物へ出た時の話"],
+                target_utterances=3,
+            ),
+            StreamSegmentPlan(
+                title=f"{prefix}の楽しみ",
+                talking_points=["最近試したこと", "次にやってみたいこと"],
+                tangent_ideas=["趣味との接点"],
+                target_utterances=3,
+            ),
+        ],
+        closing_direction="印象に残った話を一つ振り返って終える",
+    )
+
+
 class StreamThemeManagerTest(unittest.TestCase):
-    def test_manual_theme_is_kept_and_included_in_context(self):
-        manager = StreamThemeManager(
-            {"stream_theme": {"review_utterance_count": 5}},
-            manual_theme="AI時代の人間の仕事",
-        )
+    def test_manual_theme_creates_compatible_program(self):
+        manager = StreamThemeManager({}, manual_theme="AI時代の人間の仕事")
 
         context = manager.build_context("observation")
 
-        self.assertIn("メインテーマ: AI時代の人間の仕事", context)
-        self.assertIn("現在の枝にある対象か違和感を一つ引き継ぎ", context)
-        self.assertIn("今回は最初の一言", context)
+        self.assertIn("配信企画: AI時代の人間の仕事", context)
+        self.assertIn("現在の区間: 1/3", context)
+        self.assertIn("配信企画と最初の話題が分かる", context)
 
-    def test_comment_becomes_temporary_tangent(self):
+    def test_program_instruction_is_passed_to_generator(self):
+        generator = Mock(return_value=create_plan(theme="自己紹介配信"))
+
         manager = StreamThemeManager(
-            {"stream_theme": {"review_utterance_count": 5}},
-            manual_theme="AI時代の人間の仕事",
+            {},
+            program_instruction="初見向けの自己紹介配信",
+            plan_generator=generator,
         )
+
+        generator.assert_called_once_with(None, "初見向けの自己紹介配信")
+        self.assertEqual(manager.state.main_theme, "自己紹介配信")
+
+    def test_comment_becomes_temporary_tangent_without_advancing_segment(self):
+        manager = StreamThemeManager({}, manual_theme="仕事の話")
 
         manager.record_comment_exchange(
             "麻雀は仕事に役立つ？",
@@ -33,78 +72,69 @@ class StreamThemeManagerTest(unittest.TestCase):
         context = manager.build_context("trivia")
 
         self.assertIn("コメントからの枝分かれ: 麻雀は仕事に役立つ？", context)
-        self.assertIn("直前のガン奈の発言: 役割分担を見る練習にはなるかもね。", context)
-        self.assertIn("接点がない雑学へ切り替えない", context)
+        self.assertIn("直前の発言: 役割分担を見る練習にはなるかもね。", context)
+        self.assertEqual(manager.state.segment_utterance_count, 0)
 
-    def test_autonomous_speech_becomes_the_required_next_thread(self):
+    def test_segment_advances_after_target_utterances(self):
         manager = StreamThemeManager(
-            {"stream_theme": {"review_utterance_count": 5}},
-            manual_theme="人が先延ばしをする理由",
+            {},
+            plan_generator=Mock(return_value=create_plan()),
         )
 
-        manager.record_autonomous_speech(
-            "野菜室は保存ではなく、明日の自分への先送り棚だね。",
-            "observation",
-        )
-        context = manager.build_context("character_thought")
+        for index in range(3):
+            manager.record_autonomous_speech(f"発話{index}", "observation")
 
-        self.assertEqual(
-            manager.state.current_focus,
-            "野菜室は保存ではなく、明日の自分への先送り棚だね。",
-        )
-        self.assertIn(
-            "直前のガン奈の発言: 野菜室は保存ではなく、明日の自分への先送り棚だね。",
-            context,
-        )
-        self.assertIn("無関係な名詞から新しい話を始めない", context)
+        context = manager.build_context("observation")
+        self.assertEqual(manager.state.segment_index, 1)
+        self.assertIn("現在の区間: 2/3 休日の失敗", context)
+        self.assertIn("前の区間『休日の入口』から接点", context)
 
-    def test_automatic_theme_is_reviewed_after_configured_utterances(self):
-        plans = iter(
-            [
-                StreamThemePlan(
-                    theme="インターネットと集中力",
-                    core_question="便利さは集中力を奪うのか",
-                    opening_angle="短い動画から考える",
-                ),
-                StreamThemePlan(
-                    theme="退屈が生む創造性",
-                    core_question="退屈は本当に無駄なのか",
-                    opening_angle="待ち時間から考える",
-                ),
+    def test_finished_program_is_replaced_on_next_generation(self):
+        generator = Mock(
+            side_effect=[
+                create_plan(theme="休日の過ごし方", prefix="休日"),
+                create_plan(theme="好きな食べ物", prefix="食事"),
             ]
         )
-
-        def plan_generator(previous_state=None):
-            return next(plans)
-
-        manager = StreamThemeManager(
-            {"stream_theme": {"review_utterance_count": 5}},
-            plan_generator=plan_generator,
-        )
-        for index in range(5):
-            manager.record_autonomous_speech(
-                f"論点{index}",
-                "observation",
-            )
+        manager = StreamThemeManager({}, plan_generator=generator)
+        for index in range(9):
+            manager.record_autonomous_speech(f"発話{index}", "observation")
 
         context = manager.build_context("observation")
 
-        self.assertEqual(manager.state.main_theme, "退屈が生む創造性")
-        self.assertIn("メインテーマ: 退屈が生む創造性", context)
-        self.assertEqual(manager.state.utterances_since_review, 0)
+        self.assertEqual(manager.state.main_theme, "好きな食べ物")
+        self.assertIn("配信企画: 好きな食べ物", context)
+        self.assertEqual(generator.call_count, 2)
 
-    def test_invalid_review_count_is_rejected(self):
-        with self.assertRaisesRegex(ValueError, "5〜30"):
-            StreamThemeManager(
-                {"stream_theme": {"review_utterance_count": 3}},
-                manual_theme="テスト用の配信テーマ",
-            )
+    def test_every_fifth_utterance_reintroduces_current_subject(self):
+        manager = StreamThemeManager(
+            {},
+            plan_generator=Mock(return_value=create_plan()),
+        )
+        manager.state.utterance_count = 5
+        manager.state.segment_utterance_count = 1
+
+        context = manager.build_context("observation")
+
+        self.assertIn("途中参加者向けに", context)
+        self.assertIn("現在の対象を一言示して", context)
+
+    def test_program_can_be_replaced_from_admin_instruction(self):
+        generator = Mock(
+            side_effect=[create_plan(), create_plan(theme="自己紹介配信", prefix="自分")]
+        )
+        manager = StreamThemeManager({}, plan_generator=generator)
+
+        description = manager.replace_program("自己紹介配信をして")
+
+        self.assertIn("配信企画：自己紹介配信", description)
+        self.assertEqual(
+            generator.call_args.args[1],
+            "自己紹介配信をして",
+        )
 
     def test_theme_context_stays_bounded_after_many_utterances(self):
-        manager = StreamThemeManager(
-            {"stream_theme": {"review_utterance_count": 30}},
-            manual_theme="AI時代の人間の仕事",
-        )
+        manager = StreamThemeManager({}, manual_theme="AI時代の人間の仕事")
         for index in range(20):
             manager.record_autonomous_speech(
                 f"論点{index}: " + "長い説明" * 30,
@@ -116,6 +146,20 @@ class StreamThemeManagerTest(unittest.TestCase):
         self.assertLess(estimate_tokens(context), 550)
         self.assertNotIn("論点0:", context)
         self.assertIn("論点19:", context)
+
+    @patch("stream_theme.create_llm_client")
+    def test_plan_prompt_requires_real_world_topics(self, client_factory):
+        client = client_factory.return_value
+        client.generate_structured.return_value = create_plan()
+
+        generate_stream_theme_plan(instruction="AIにおまかせ")
+
+        prompt = client.generate_structured.call_args.kwargs["input_text"]
+        self.assertIn("VTuber、アニメ、ゲーム", prompt)
+        self.assertIn("一般的な日常あるあるを番組の主題にしない", prompt)
+        self.assertIn("一つの実在する話題を3〜5発話", prompt)
+        self.assertIn("『人はなぜ』で始まる学術的な題名を避け", prompt)
+        self.assertIn("開始挨拶と3〜5個の話題区間", prompt)
 
 
 if __name__ == "__main__":

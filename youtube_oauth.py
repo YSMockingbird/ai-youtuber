@@ -9,12 +9,14 @@ from google_auth_oauthlib.flow import InstalledAppFlow
 
 
 PROJECT_ROOT = Path(__file__).resolve().parent
-YOUTUBE_READONLY_SCOPE = (
-    "https://www.googleapis.com/auth/youtube.readonly"
-)
+YOUTUBE_MANAGE_SCOPE = "https://www.googleapis.com/auth/youtube"
 YOUTUBE_LIVE_BROADCASTS_API_URL = (
     "https://www.googleapis.com/youtube/v3/liveBroadcasts"
 )
+
+
+class NoActiveYouTubeBroadcastError(RuntimeError):
+    """認証は成功したが、現在ライブ中の配信がまだないことを表します。"""
 
 
 def get_youtube_oauth_paths():
@@ -52,6 +54,15 @@ def get_youtube_credentials():
         )
 
     credentials = _load_saved_credentials(token_file)
+    if (
+        credentials is not None
+        and not credentials.has_scopes([YOUTUBE_MANAGE_SCOPE])
+    ):
+        print(
+            "保存済みYouTube認証は読み取り専用のため、"
+            "配信管理権限を追加して再認証します。"
+        )
+        credentials = None
     if credentials is not None and credentials.expired:
         if credentials.refresh_token:
             try:
@@ -69,7 +80,7 @@ def get_youtube_credentials():
     if credentials is None or not credentials.valid:
         flow = InstalledAppFlow.from_client_secrets_file(
             str(client_file),
-            scopes=[YOUTUBE_READONLY_SCOPE],
+            scopes=[YOUTUBE_MANAGE_SCOPE],
         )
         try:
             credentials = flow.run_local_server(
@@ -157,7 +168,7 @@ def find_active_youtube_broadcast(credentials=None):
         if item.get("status", {}).get("lifeCycleStatus") == "live"
     ]
     if not active_items:
-        raise RuntimeError(
+        raise NoActiveYouTubeBroadcastError(
             "認証したYouTubeアカウントに、現在ライブ中の配信がありません。"
             "YouTube Studioで配信が「ライブ」になっているか確認してください。"
         )
@@ -186,13 +197,129 @@ def find_active_youtube_broadcast(credentials=None):
     }
 
 
+def is_youtube_broadcast_live(video_id, credentials=None):
+    # 開始時に特定した配信だけを確認し、別の配信への切り替わりを誤認しません。
+    normalized_video_id = str(video_id).strip()
+    if not normalized_video_id:
+        raise ValueError("YouTube配信状態確認用の動画IDが空です。")
+    credentials = credentials or get_youtube_credentials()
+    headers = {"Authorization": f"Bearer {credentials.token}"}
+    params = {
+        "part": "id,status",
+        "id": normalized_video_id,
+        "maxResults": 1,
+    }
+    try:
+        response = requests.get(
+            YOUTUBE_LIVE_BROADCASTS_API_URL,
+            headers=headers,
+            params=params,
+            timeout=10,
+        )
+        response.raise_for_status()
+    except requests.exceptions.Timeout as exc:
+        raise RuntimeError(
+            "YouTubeライブ配信の状態確認がタイムアウトしました。"
+        ) from exc
+    except requests.exceptions.HTTPError as exc:
+        status_code = (
+            exc.response.status_code
+            if exc.response is not None
+            else "unknown"
+        )
+        raise RuntimeError(
+            "YouTubeライブ配信の状態確認でHTTPエラーが発生しました。"
+            f" status_code={status_code}"
+        ) from exc
+    except requests.exceptions.RequestException as exc:
+        raise RuntimeError(
+            "YouTubeライブ配信の状態確認に接続できませんでした。"
+        ) from exc
+
+    try:
+        data = response.json()
+    except requests.exceptions.JSONDecodeError as exc:
+        raise RuntimeError(
+            "YouTubeライブ配信の状態をJSONとして読み取れませんでした。"
+        ) from exc
+    items = data.get("items", [])
+    if not isinstance(items, list):
+        raise RuntimeError(
+            "YouTubeライブ配信の状態が期待する形式ではありません。"
+        )
+    if not items:
+        raise RuntimeError(
+            "状態確認対象のYouTubeライブ配信が見つかりませんでした。"
+            f" video_id={normalized_video_id}"
+        )
+    return items[0].get("status", {}).get("lifeCycleStatus") == "live"
+
+
+def complete_youtube_broadcast(video_id, credentials=None):
+    # 終了挨拶の再生後に、対象のライブ配信だけを終了状態へ遷移させます。
+    normalized_video_id = str(video_id).strip()
+    if not normalized_video_id:
+        raise ValueError("終了するYouTube配信の動画IDが空です。")
+    credentials = credentials or get_youtube_credentials()
+    headers = {"Authorization": f"Bearer {credentials.token}"}
+    params = {
+        "part": "id,status",
+        "id": normalized_video_id,
+        "broadcastStatus": "complete",
+    }
+    try:
+        response = requests.post(
+            f"{YOUTUBE_LIVE_BROADCASTS_API_URL}/transition",
+            headers=headers,
+            params=params,
+            timeout=10,
+        )
+        response.raise_for_status()
+    except requests.exceptions.Timeout as exc:
+        raise RuntimeError(
+            "YouTubeライブ配信の終了操作がタイムアウトしました。"
+        ) from exc
+    except requests.exceptions.HTTPError as exc:
+        status_code = (
+            exc.response.status_code
+            if exc.response is not None
+            else "unknown"
+        )
+        detail = (
+            exc.response.text[:300]
+            if exc.response is not None
+            else ""
+        )
+        raise RuntimeError(
+            "YouTubeライブ配信の終了操作でHTTPエラーが発生しました。"
+            f" status_code={status_code} detail={detail}"
+        ) from exc
+    except requests.exceptions.RequestException as exc:
+        raise RuntimeError(
+            "YouTubeライブ配信の終了操作に接続できませんでした。"
+        ) from exc
+
+    try:
+        data = response.json()
+    except requests.exceptions.JSONDecodeError as exc:
+        raise RuntimeError(
+            "YouTubeライブ配信の終了結果をJSONとして読み取れませんでした。"
+        ) from exc
+    status = data.get("status", {}).get("lifeCycleStatus")
+    if status not in {"complete", "liveStopping"}:
+        raise RuntimeError(
+            "YouTubeライブ配信の終了を確認できませんでした。"
+            f" lifeCycleStatus={status or '不明'}"
+        )
+    return status
+
+
 def _load_saved_credentials(token_file):
     if not token_file.is_file():
         return None
     try:
         return Credentials.from_authorized_user_file(
             str(token_file),
-            scopes=[YOUTUBE_READONLY_SCOPE],
         )
     except (OSError, ValueError) as exc:
         raise RuntimeError(

@@ -66,9 +66,11 @@ ALLOWED_ADMIN_ACTIONS = {
     "direct_speech",
     "ai_instruction",
     "closing_greeting",
+    "end_broadcast",
     "pause_autonomous",
     "resume_autonomous",
     "cancel_next",
+    "change_stream_plan",
 }
 
 
@@ -340,6 +342,9 @@ class ExternalControlRuntime:
             "phase": "starting",
             "message": "ライブ制御の開始を待っています。",
             "stream_theme": "",
+            "stream_segment": "",
+            "stream_segment_index": 0,
+            "stream_segment_count": 0,
             "discarded_prefetches": 0,
             "updated_at_ms": round(time.time() * 1000),
         }
@@ -351,9 +356,12 @@ class ExternalControlRuntime:
         if action not in ALLOWED_ADMIN_ACTIONS:
             raise ValueError(f"未対応の管理命令です。action={action}")
         normalized = {"action": action, "id": uuid.uuid4().hex}
-        if action in {"direct_speech", "ai_instruction"}:
+        if action in {"direct_speech", "ai_instruction", "change_stream_plan"}:
             text = str(command.get("text", "")).strip()
-            maximum_length = 500 if action == "ai_instruction" else 300
+            maximum_length = {
+                "ai_instruction": 500,
+                "change_stream_plan": 200,
+            }.get(action, 300)
             if not text:
                 raise ValueError("管理画面から送る文章が空です。")
             if len(text) > maximum_length:
@@ -423,6 +431,35 @@ class ExternalControlRuntime:
             status = dict(self._admin_status)
         status["queued_commands"] = self.admin_command_queue.qsize()
         return status
+
+    def get_obs_overlay_status(self):
+        subtitle_clients = self.subtitle_event_broker.subscriber_count()
+        chat_clients = self.chat_event_broker.subscriber_count()
+        return {
+            "subtitle_connected": subtitle_clients > 0,
+            "chat_connected": chat_clients > 0,
+            "subtitle_clients": subtitle_clients,
+            "chat_clients": chat_clients,
+            "ready": subtitle_clients > 0 and chat_clients > 0,
+        }
+
+    def wait_for_obs_overlays(self, timeout_seconds, poll_seconds=0.25):
+        # OBSの字幕・コメントが両方SSE接続するまで、開始挨拶を保留します。
+        timeout_seconds = float(timeout_seconds)
+        poll_seconds = float(poll_seconds)
+        if timeout_seconds < 0:
+            raise ValueError("OBS接続待機時間は0以上にしてください。")
+        if poll_seconds <= 0:
+            raise ValueError("OBS接続確認間隔は0より大きくしてください。")
+        if timeout_seconds == 0:
+            return True
+        deadline = time.monotonic() + timeout_seconds
+        while True:
+            if self.get_obs_overlay_status()["ready"]:
+                return True
+            if time.monotonic() >= deadline:
+                return False
+            time.sleep(min(poll_seconds, max(deadline - time.monotonic(), 0)))
 
     def list_character_memories(self, status):
         if self.character_memory_repository is None:
@@ -629,6 +666,7 @@ class ExternalControlRequestHandler(BaseHTTPRequestHandler):
             self._handle_character_memory_list(parsed_url.query)
             return
         if path == "/health":
+            overlay_status = self.runtime.get_obs_overlay_status()
             self._send_json(
                 200,
                 {
@@ -640,6 +678,7 @@ class ExternalControlRequestHandler(BaseHTTPRequestHandler):
                     "chat_sse_clients": (
                         self.runtime.chat_event_broker.subscriber_count()
                     ),
+                    "obs_overlays_ready": overlay_status["ready"],
                 },
             )
             return
@@ -684,7 +723,9 @@ class ExternalControlRequestHandler(BaseHTTPRequestHandler):
         self.send_header("Content-Type", "text/event-stream; charset=utf-8")
         self.send_header("Cache-Control", "no-cache")
         self.send_header("Connection", "keep-alive")
-        self._send_cors_headers()
+        # 字幕・コメントなどの読み取り専用SSEは、OBSのローカルHTMLからも許可します。
+        # OBSのChromiumはfile://のOrigin表現が環境により異なるため、ワイルドカードを使います。
+        self._send_cors_headers(allow_any_origin=True)
         self.end_headers()
 
         try:
@@ -950,7 +991,10 @@ class ExternalControlRequestHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(payload)
 
-    def _send_cors_headers(self):
+    def _send_cors_headers(self, allow_any_origin=False):
+        if allow_any_origin:
+            self.send_header("Access-Control-Allow-Origin", "*")
+            return
         origin = self.headers.get("Origin", "")
         if is_allowed_local_origin(origin):
             self.send_header("Access-Control-Allow-Origin", origin)

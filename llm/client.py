@@ -3,6 +3,7 @@ import logging
 import time
 from abc import ABC, abstractmethod
 
+from httpx import HTTPError
 from pydantic import ValidationError
 
 from openai import (
@@ -198,10 +199,136 @@ def _print_usage(response, request_label, attempt, elapsed_seconds):
     )
 
 
-def create_llm_client(config=None):
+class GeminiLlmClient(LlmClient):
+    def __init__(self, api_key, model):
+        if not api_key or "ここに" in api_key:
+            raise RuntimeError(
+                "GEMINI_API_KEYが未設定です。.envにGemini APIキーを設定してください。"
+            )
+        if not model:
+            raise RuntimeError(
+                "GEMINI_MODELが未設定です。.envに使用するモデル名を設定してください。"
+            )
+        try:
+            from google import genai
+            from google.genai import errors, types
+        except ImportError as exc:
+            raise RuntimeError(
+                "Gemini SDKがインストールされていません。"
+                "requirements.txtの依存関係をインストールしてください。"
+            ) from exc
+
+        self.client = genai.Client(api_key=api_key)
+        self.errors = errors
+        self.types = types
+        self.model = model
+
+    def generate_structured(
+        self,
+        instructions,
+        input_text,
+        response_model,
+        max_output_tokens,
+        request_label="llm",
+    ):
+        started_at = time.monotonic()
+        try:
+            response = self.client.models.generate_content(
+                model=self.model,
+                contents=input_text,
+                config=self.types.GenerateContentConfig(
+                    system_instruction=instructions,
+                    response_mime_type="application/json",
+                    response_json_schema=response_model.model_json_schema(),
+                    max_output_tokens=int(max_output_tokens),
+                    thinking_config=self.types.ThinkingConfig(
+                        thinking_budget=0,
+                    ),
+                ),
+            )
+        except self.errors.ClientError as exc:
+            status_code = getattr(exc, "code", None)
+            if status_code in {401, 403}:
+                raise RuntimeError(
+                    "Gemini APIの認証に失敗しました。"
+                    ".envのGEMINI_API_KEYを確認してください。"
+                ) from exc
+            if status_code == 429:
+                raise RuntimeError(
+                    "Gemini APIのレート制限または利用上限に達しました。"
+                    "Google AI Studioの利用状況を確認してください。"
+                ) from exc
+            raise RuntimeError(
+                "Gemini APIへのリクエストに失敗しました。"
+                f"status_code={status_code or 'unknown'}"
+            ) from exc
+        except self.errors.ServerError as exc:
+            raise RuntimeError(
+                "Gemini APIでサーバーエラーが発生しました。"
+                f"status_code={getattr(exc, 'code', None) or 'unknown'}"
+            ) from exc
+        except (HTTPError, OSError, TimeoutError) as exc:
+            raise RuntimeError(
+                "Gemini APIへの接続に失敗しました。ネットワーク接続を確認してください。"
+            ) from exc
+
+        _print_gemini_usage(
+            response,
+            request_label=request_label,
+            elapsed_seconds=time.monotonic() - started_at,
+        )
+        parsed = getattr(response, "parsed", None)
+        if parsed is None:
+            finish_reason = _gemini_finish_reason(response)
+            raise RuntimeError(
+                "Gemini APIから構造化された返答を取得できませんでした。"
+                f" finish_reason={finish_reason}"
+            )
+        try:
+            if isinstance(parsed, response_model):
+                return parsed
+            return response_model.model_validate(parsed)
+        except ValidationError as exc:
+            raise RuntimeError(
+                "Gemini APIの構造化出力を検証できませんでした。"
+                f" detail={_validation_error_summary(exc)}"
+            ) from exc
+
+
+def _gemini_finish_reason(response):
+    candidates = getattr(response, "candidates", None) or []
+    if not candidates:
+        return "unknown"
+    finish_reason = getattr(candidates[0], "finish_reason", None)
+    return getattr(finish_reason, "name", None) or str(finish_reason or "unknown")
+
+
+def _print_gemini_usage(response, request_label, elapsed_seconds):
+    # APIが返す実測値だけを表示し、プロンプト本文や認証情報はログへ出しません。
+    usage = getattr(response, "usage_metadata", None)
+    if usage is None:
+        print(
+            "LLM使用量："
+            f"処理={request_label} usage=取得不可 "
+            f"応答時間={elapsed_seconds:.2f}秒"
+        )
+        return
+    print(
+        "LLM使用量："
+        f"処理={request_label} "
+        f"入力={getattr(usage, 'prompt_token_count', 0) or 0} "
+        f"キャッシュ={getattr(usage, 'cached_content_token_count', 0) or 0} "
+        f"出力={getattr(usage, 'candidates_token_count', 0) or 0} "
+        f"推論={getattr(usage, 'thoughts_token_count', 0) or 0} "
+        f"合計={getattr(usage, 'total_token_count', 0) or 0} "
+        f"応答時間={elapsed_seconds:.2f}秒"
+    )
+
+
+def create_llm_client(config=None, provider_env_var="LLM_PROVIDER"):
     config = config or {}
     provider = os.getenv(
-        "LLM_PROVIDER",
+        provider_env_var,
         str(config.get("provider", "openai")),
     ).strip().lower()
     if provider == "openai":
@@ -209,7 +336,12 @@ def create_llm_client(config=None):
             api_key=os.getenv("OPENAI_API_KEY", "").strip(),
             model=os.getenv("OPENAI_MODEL", "gpt-5.6-luna").strip(),
         )
-    if provider in {"groq", "gemini"}:
+    if provider == "gemini":
+        return GeminiLlmClient(
+            api_key=os.getenv("GEMINI_API_KEY", "").strip(),
+            model=os.getenv("GEMINI_MODEL", "gemini-3.5-flash").strip(),
+        )
+    if provider == "groq":
         raise RuntimeError(
             f"LLM_PROVIDER={provider}はまだ設定されていません。"
             "プロバイダー決定後に対応クライアントを追加してください。"

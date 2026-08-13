@@ -68,6 +68,31 @@ class WavDurationTest(unittest.TestCase):
 
 
 class ExternalControlRuntimeTest(unittest.TestCase):
+    def test_obs_overlay_status_requires_subtitle_and_chat(self):
+        runtime = ExternalControlRuntime(
+            aivis_client=FakeAivisSpeechClient(),
+            speaker_id=101,
+            public_base_url="http://127.0.0.1:8765",
+        )
+
+        self.assertFalse(runtime.get_obs_overlay_status()["ready"])
+        runtime.subtitle_event_broker.subscribe()
+        self.assertFalse(runtime.get_obs_overlay_status()["ready"])
+        runtime.chat_event_broker.subscribe()
+
+        status = runtime.get_obs_overlay_status()
+        self.assertTrue(status["ready"])
+        self.assertTrue(runtime.wait_for_obs_overlays(0.1))
+
+    def test_obs_overlay_wait_can_be_disabled_for_non_obs_use(self):
+        runtime = ExternalControlRuntime(
+            aivis_client=FakeAivisSpeechClient(),
+            speaker_id=101,
+            public_base_url="http://127.0.0.1:8765",
+        )
+
+        self.assertTrue(runtime.wait_for_obs_overlays(0))
+
     def test_character_memory_can_be_listed_and_reviewed(self):
         repository = Mock()
         repository.list.return_value = [{"memory_id": "memory-1"}]
@@ -116,6 +141,36 @@ class ExternalControlRuntimeTest(unittest.TestCase):
 
         with self.assertRaisesRegex(ValueError, "未対応の管理命令"):
             runtime.enqueue_admin_command({"action": "stop_youtube"})
+
+    def test_end_broadcast_command_is_queued(self):
+        runtime = ExternalControlRuntime(
+            aivis_client=FakeAivisSpeechClient(),
+            speaker_id=101,
+            public_base_url="http://127.0.0.1:8765",
+        )
+
+        accepted = runtime.enqueue_admin_command(
+            {"action": "end_broadcast"}
+        )
+
+        self.assertEqual(accepted["action"], "end_broadcast")
+
+    def test_stream_plan_command_is_validated_and_queued(self):
+        runtime = ExternalControlRuntime(
+            aivis_client=FakeAivisSpeechClient(),
+            speaker_id=101,
+            public_base_url="http://127.0.0.1:8765",
+        )
+
+        accepted = runtime.enqueue_admin_command(
+            {
+                "action": "change_stream_plan",
+                "text": "初見向けの自己紹介配信",
+            }
+        )
+
+        self.assertEqual(accepted["action"], "change_stream_plan")
+        self.assertEqual(accepted["text"], "初見向けの自己紹介配信")
 
     def test_chat_messages_are_published_without_channel_id(self):
         runtime = ExternalControlRuntime(

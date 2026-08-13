@@ -166,14 +166,36 @@ class ParseAiResponseTest(unittest.TestCase):
         prompt = generate_mock.call_args.args[0]
         self.assertIn("配信元: テストニュース", prompt)
         self.assertIn("タイトル: 新しい技術が発表", prompt)
-        self.assertIn("つながらなければ記事を使わず", prompt)
+        self.assertIn("この記事自体を現在の中心話題", prompt)
         self.assertNotIn("[ガン奈の記録済みエピソード]", prompt)
         self.assertIn("確認できた情報源は一媒体です", prompt)
         self.assertIn("人物やファンを攻撃せず", prompt)
         self.assertIn("無関係な物やキャラクター設定を足さず", prompt)
         self.assertIn("文学的・無難な結論を避け", prompt)
         self.assertIn("事件、事故、災害ではブラックジョーク", prompt)
+        self.assertIn("誰または何がどうした記事なのか", prompt)
+        self.assertIn("前提を知らない途中参加者", prompt)
         self.assertEqual(response["emotion"], "surprised")
+
+    @patch("ai_response._generate_structured_response")
+    def test_news_followup_continues_without_repeating_summary(self, generate_mock):
+        generate_mock.return_value = {
+            "text": "その対応だけ、もう少し見たいね。",
+            "emotion": "relaxed",
+        }
+        article = {
+            "source_name": "テストニュース",
+            "published_at": "2026-08-12",
+            "title": "配信サービスが新機能を発表",
+            "summary": "コメント機能を更新しました。",
+        }
+
+        generate_news_commentary(article, story_turn=2, story_turn_count=3)
+
+        prompt = generate_mock.call_args.args[0]
+        self.assertIn("同じニュースについて2/3発話目", prompt)
+        self.assertIn("概要を最初から言い直さず", prompt)
+        self.assertIn("記事にない新事実や世間の反応を作らない", prompt)
 
     @patch("ai_response._generate_structured_response")
     def test_unverified_news_is_explicitly_labeled_in_prompt(self, generate_mock):
@@ -219,6 +241,8 @@ class ParseAiResponseTest(unittest.TestCase):
         self.assertIn("今回の話題方針: 役立つ雑学を一つ話す", prompt)
         self.assertIn("視聴者がいると決めつけず", prompt)
         self.assertIn("メインテーマを最優先にしてください", prompt)
+        self.assertIn("途中から聞いた人にも何について話しているか", prompt)
+        self.assertIn("冒頭に具体的な対象", prompt)
         self.assertIn("[ガン奈の記録済みエピソード]", prompt)
         self.assertEqual(response["emotion"], "happy")
 

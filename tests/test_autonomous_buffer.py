@@ -37,6 +37,55 @@ class AutonomousSpeechBufferTest(unittest.TestCase):
             {"duration_ms": 12000},
         )
 
+    def test_opening_announces_program_before_autonomous_speech(self):
+        self.publish_callback.side_effect = (
+            lambda runtime, response, prepared: (
+                response,
+                1,
+                {"duration_ms": 12000},
+            )
+        )
+        buffer = AutonomousSpeechBuffer(
+            runtime=self.runtime,
+            stream_context=self.stream_context,
+            config=create_config(),
+            publish_callback=self.publish_callback,
+            stream_topic="休日の過ごし方",
+            now=100,
+            prepare_in_background=False,
+        )
+
+        response, _, command = buffer.publish_opening(now=100)
+
+        self.assertIn("今日は『休日の過ごし方』", response["text"])
+        self.runtime.prepare_speech.assert_called_once_with(
+            response["text"],
+            "happy",
+            "normal",
+        )
+        self.assertEqual(command["duration_ms"], 12000)
+        self.assertEqual(buffer.next_speech_at, 115)
+
+    def test_admin_can_replace_program(self):
+        theme_manager = Mock()
+        theme_manager.replace_program.return_value = "新しい構成"
+        buffer = AutonomousSpeechBuffer(
+            runtime=self.runtime,
+            stream_context=self.stream_context,
+            config=create_config(),
+            publish_callback=self.publish_callback,
+            theme_manager=theme_manager,
+            now=100,
+            prepare_in_background=False,
+        )
+        buffer.paused = True
+
+        result = buffer.replace_program("自己紹介配信", now=100)
+
+        self.assertEqual(result, "新しい構成")
+        theme_manager.replace_program.assert_called_once_with("自己紹介配信")
+        self.assertEqual(buffer.next_speech_at, 103)
+
     @patch("autonomous_buffer.generate_autonomous_speech")
     def test_pause_stops_preparation_and_resume_restarts_timer(
         self,
@@ -193,7 +242,7 @@ class AutonomousSpeechBufferTest(unittest.TestCase):
         situation = generate_mock.call_args.args[0]
         self.assertIn("視聴者がいない前提", situation)
         self.assertIn(
-            "メインテーマ: インターネットと集中力",
+            "配信企画: インターネットと集中力",
             generate_mock.call_args.kwargs["theme_context"],
         )
 
@@ -226,6 +275,56 @@ class AutonomousSpeechBufferTest(unittest.TestCase):
         thread.join(timeout=1)
         self.assertFalse(buffer.tick(now=100))
         self.assertIsNotNone(buffer.prepared)
+
+    @patch("autonomous_buffer.fetch_news_articles")
+    @patch("autonomous_buffer.select_news_article")
+    @patch("autonomous_buffer.generate_news_commentary")
+    def test_automatic_program_starts_with_news_and_continues_same_article(
+        self,
+        generate_news_mock,
+        select_news_mock,
+        fetch_news_mock,
+    ):
+        article = {
+            "title": "VTuber事務所が新企画を発表",
+            "link": "https://example.com/news",
+            "source_name": "テストニュース",
+            "published_at": "2026-08-13",
+            "summary": "新企画の概要",
+        }
+        fetch_news_mock.return_value = [article]
+        select_news_mock.return_value = article
+        generate_news_mock.return_value = self.ai_response
+        config = create_config()
+        config["autonomous_speech"]["news_story_utterances"] = 3
+        theme_manager = Mock()
+        theme_manager.manual_theme = False
+        theme_manager.program_instruction = ""
+        theme_manager.build_context.return_value = "配信構成"
+        theme_manager.state.main_theme = "今週の界隈ニュース"
+        theme_manager.status.return_value = {}
+        buffer = AutonomousSpeechBuffer(
+            runtime=self.runtime,
+            stream_context=self.stream_context,
+            config=config,
+            publish_callback=self.publish_callback,
+            theme_manager=theme_manager,
+            now=100,
+            prepare_in_background=False,
+        )
+
+        buffer.tick(now=100)
+        self.assertEqual(buffer.prepared.article, article)
+        self.assertEqual(buffer.prepared.news_story_turn, 0)
+        buffer.tick(now=103)
+
+        self.assertEqual(buffer.prepared.article, article)
+        self.assertEqual(buffer.prepared.news_story_turn, 1)
+        self.assertEqual(fetch_news_mock.call_count, 1)
+        first_call, second_call = generate_news_mock.call_args_list[:2]
+        self.assertEqual(first_call.kwargs["story_turn"], 1)
+        self.assertEqual(second_call.kwargs["story_turn"], 2)
+        self.assertEqual(second_call.kwargs["story_turn_count"], 3)
 
     @patch("autonomous_buffer.generate_autonomous_speech")
     def test_comment_invalidates_in_flight_preparation(self, generate_mock):

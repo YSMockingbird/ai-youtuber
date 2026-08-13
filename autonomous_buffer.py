@@ -15,6 +15,7 @@ class BufferedAutonomousSpeech:
     prepared_speech: object
     topic: str
     article: object = None
+    news_story_turn: int = 0
 
 
 class AutonomousSpeechBuffer:
@@ -25,6 +26,7 @@ class AutonomousSpeechBuffer:
         config,
         publish_callback,
         stream_topic=None,
+        stream_instruction=None,
         theme_manager=None,
         now=None,
         prepare_in_background=True,
@@ -35,6 +37,14 @@ class AutonomousSpeechBuffer:
         )
         if not 1 <= self.silence_seconds <= 300:
             raise ValueError("silence_secondsは1〜300秒で設定してください。")
+        try:
+            self.news_story_utterances = int(
+                autonomous_config.get("news_story_utterances", 3)
+            )
+        except (TypeError, ValueError) as exc:
+            raise ValueError("news_story_utterancesは整数で設定してください。") from exc
+        if not 2 <= self.news_story_utterances <= 5:
+            raise ValueError("news_story_utterancesは2〜5で設定してください。")
 
         self.runtime = runtime
         self.stream_context = stream_context
@@ -42,9 +52,12 @@ class AutonomousSpeechBuffer:
         self.theme_manager = theme_manager or StreamThemeManager(
             config,
             manual_theme=stream_topic,
+            program_instruction=stream_instruction,
         )
         self.publish_callback = publish_callback
         self.used_news_links = set()
+        self.active_news_article = None
+        self.active_news_turn = 0
         self.recent_utterances = []
         self.previous_topic = None
         self.has_received_comment = False
@@ -60,6 +73,56 @@ class AutonomousSpeechBuffer:
         self.retry_at = 0.0
         current_time = time.monotonic() if now is None else float(now)
         self.next_speech_at = current_time + self.silence_seconds
+
+    def publish_opening(self, now=None):
+        # 構成表に含まれる挨拶を最初に一度だけ読み、今日の内容を案内します。
+        text = self.theme_manager.state.opening_greeting
+        ai_response = {
+            "text": text,
+            "emotion": "happy",
+            "speech_style": "normal",
+            "motion": {
+                "name": "greeting",
+                "speed": 1.0,
+                "intensity": 0.7,
+                "head": "nod",
+            },
+            "view_action": None,
+        }
+        prepared_speech = self.runtime.prepare_speech(text, "happy", "normal")
+        ai_response, delivered_count, command = self.publish_callback(
+            self.runtime,
+            ai_response,
+            prepared_speech,
+        )
+        self.stream_context.record_ai_speech(text)
+        self._remember_utterance(text)
+        self.theme_manager.record_opening(text)
+        self.schedule_after_external_speech(command["duration_ms"], now=now)
+        self.runtime.update_admin_status(
+            **self.theme_manager.status(),
+            phase="speaking",
+            message="配信開始の挨拶を再生しています。",
+            speaking_until_ms=round(
+                time.time() * 1000 + command["duration_ms"]
+            ),
+        )
+        print("--- 配信開始挨拶 ---")
+        print(f"AI：{text}")
+        print(f"接続中クライアント数：{delivered_count}")
+        return ai_response, delivered_count, command
+
+    def replace_program(self, instruction, now=None):
+        # 管理画面から配信企画を変更し、未再生の先読みを新構成で作り直します。
+        self._invalidate_preparation()
+        self.active_news_article = None
+        self.active_news_turn = 0
+        description = self.theme_manager.replace_program(instruction)
+        current_time = time.monotonic() if now is None else float(now)
+        self.retry_at = 0.0
+        self.next_speech_at = current_time + self.silence_seconds
+        self._ensure_prepared(current_time)
+        return description
 
     def tick(self, now=None):
         if self.paused:
@@ -97,9 +160,17 @@ class AutonomousSpeechBuffer:
             ai_response["text"],
             item.topic,
         )
+        self.runtime.update_admin_status(**self.theme_manager.status())
         self.previous_topic = item.topic
         if item.topic == "news":
             self.used_news_links.add(item.article["link"])
+            next_turn = item.news_story_turn + 1
+            if next_turn >= self.news_story_utterances:
+                self.active_news_article = None
+                self.active_news_turn = 0
+            else:
+                self.active_news_article = item.article
+                self.active_news_turn = next_turn
         playback_seconds = command["duration_ms"] / 1000
         published_at = (
             time.monotonic() if now is None else current_time
@@ -276,18 +347,30 @@ class AutonomousSpeechBuffer:
         return discarded
 
     def _prepare_next(self):
-        selected_topic = self.topic_selector.select(self.previous_topic)
+        continuing_news = self.active_news_article is not None
+        prefer_news_at_start = (
+            self.previous_topic is None
+            and not self.theme_manager.manual_theme
+            and self.theme_manager.program_instruction in {"", "AIにおまかせ"}
+        )
+        selected_topic = (
+            "news"
+            if continuing_news or prefer_news_at_start
+            else self.topic_selector.select(self.previous_topic)
+        )
         theme_context = self.theme_manager.build_context(selected_topic)
-        article = None
+        article = self.active_news_article if continuing_news else None
+        news_story_turn = self.active_news_turn if continuing_news else 0
         if selected_topic == "news":
-            try:
-                article = self._get_unused_news_article()
-            except RuntimeError as exc:
-                print(
-                    "ニュースを取得できないため雑学へ切り替えます: "
-                    f"{exc}"
-                )
-                selected_topic = "trivia"
+            if article is None:
+                try:
+                    article = self._get_unused_news_article()
+                except RuntimeError as exc:
+                    print(
+                        "ニュースを取得できないため雑学へ切り替えます: "
+                        f"{exc}"
+                    )
+                    selected_topic = "trivia"
 
         if selected_topic == "news":
             ai_response = generate_news_commentary(
@@ -297,6 +380,8 @@ class AutonomousSpeechBuffer:
                 character_memory_repository=(
                     self.stream_context.character_memory_repository
                 ),
+                story_turn=news_story_turn + 1,
+                story_turn_count=self.news_story_utterances,
             )
         else:
             audience_situation = (
@@ -334,6 +419,7 @@ class AutonomousSpeechBuffer:
             prepared_speech=prepared_speech,
             topic=selected_topic,
             article=article,
+            news_story_turn=news_story_turn,
         )
 
     def _get_unused_news_article(self):

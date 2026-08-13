@@ -28,7 +28,7 @@ YouTube Liveのコメントを取得し、設定されたLLMで返答を生成�
 1. Python仮想環境を作成する
 2. `requirements.txt` のライブラリをインストールする
 3. `.env.example` を参考に `.env` を作成する
-4. OpenAI API接続を確認する
+4. OpenAIまたはGemini API接続を確認する
 5. YouTube Liveコメント取得を確認する
 
 ## 環境変数
@@ -50,6 +50,73 @@ OpenAI API接続だけ確認します。
 ```bash
 .venv/bin/python main.py --mode openai-test
 ```
+
+### X投稿案をGeminiで作る
+
+Google AI StudioでGemini APIキーを発行し、`.env`へ次を設定します。
+
+```dotenv
+LLM_PROVIDER=openai
+X_LLM_PROVIDER=gemini
+GEMINI_API_KEY=取得したGemini APIキー
+GEMINI_MODEL=gemini-3.5-flash
+```
+
+`LLM_PROVIDER`はライブ処理用です。X投稿案の生成は`X_LLM_PROVIDER`だけを
+参照するため、ライブをOpenAIのまま運用できます。X投稿案の生成に失敗した場合も、
+エラーはX処理内で表示して終了し、ライブ処理へは伝播しません。
+
+話題を自動で選んで投稿案を1件表示します。このモードはXへ送信しません。
+
+```bash
+.venv/bin/python main.py --mode x-draft
+```
+
+話題を指定する場合は次のように実行します。
+
+```bash
+.venv/bin/python main.py --mode x-draft --x-topic "深夜のインターネット"
+```
+
+投稿案は130文字以内で、内容に合う場合は絵文字を1個まで使用します。
+Gemini APIの無料枠で利用できるモデルと上限は変更される可能性があるため、
+Google AI Studioに表示される現在の割り当てを確認してください。
+
+### 確認後にXへ投稿する
+
+X Developer ConsoleでOAuth 1.0の読み取り・書き込み権限を設定し、`.env`へ
+次の認証情報を保存します。
+
+```dotenv
+X_API_KEY=取得したコンシューマーキー
+X_API_KEY_SECRET=取得したコンシューマーキーシークレット
+X_ACCESS_TOKEN=取得したアクセストークン
+X_ACCESS_TOKEN_SECRET=取得したアクセストークンシークレット
+X_POST_HISTORY_DB_PATH=data/x_posts.db
+```
+
+次のコマンドは投稿候補を表示するだけで、Xへは送信しません。
+
+```bash
+.venv/bin/python main.py --mode x-post
+```
+
+投稿を許可する場合は`--confirm`を付けます。候補を確認した後、プロンプトへ
+大文字で`POST`と入力した場合だけ送信します。
+
+```bash
+.venv/bin/python main.py --mode x-post --confirm
+```
+
+話題も指定できます。
+
+```bash
+.venv/bin/python main.py --mode x-post --x-topic "深夜のインターネット" --confirm
+```
+
+投稿成功時は投稿ID、本文、日時を`data/x_posts.db`へ保存し、同じ本文の
+二重投稿を防止します。料金が高くなるURL付き投稿は現在禁止しています。
+X投稿処理のエラーはこのモード内で表示して終了し、ライブ処理へ伝播しません。
 
 ### YouTube配信IDの自動取得
 
@@ -139,11 +206,16 @@ http://127.0.0.1:8765/events
 
 サーバーを起動したターミナルへ文章を入力すると、AivisSpeechで音声を生成し、AITuber OnAirへ字幕・感情・音声を送信します。
 
-OBSで字幕を独立したブラウザソースとして表示する場合は、次のURLを追加します。
+OBSで字幕を独立したブラウザソースとして表示する場合は、ブラウザソースの
+「ローカルファイル」を有効にして、次のファイルを一度だけ設定します。
 
 ```text
-http://127.0.0.1:8765/overlay
+subtitle_overlay.html
 ```
+
+このファイルはPythonが停止している間もOBS上に残り、Pythonサーバーが起動すると
+3秒以内を目安に字幕へ自動接続します。通常の配信ごとの再読み込みは不要です。
+ブラウザで直接確認する場合は従来どおり`http://127.0.0.1:8765/overlay`を使えます。
 
 ブラウザソースの幅と高さは配信キャンバスと同じ値にします。AITuber OnAirの
 Visual設定では「ソロ配信で内蔵字幕を表示」をオフにしてください。
@@ -155,11 +227,15 @@ Visual設定では「ソロ配信で内蔵字幕を表示」をオフにして�
 ### OBSへ自作チャット欄を表示する
 
 YouTubeからPythonが取得したコメントを、OBS用のチャット欄にも表示できます。
-OBSの「ソース」から「ブラウザ」を追加し、URLへ次を指定します。
+OBSの「ソース」から「ブラウザ」を追加し、「ローカルファイル」を有効にして
+次のファイルを一度だけ設定します。
 
 ```text
-http://127.0.0.1:8765/chat-overlay
+chat_overlay.html
 ```
+
+Pythonサーバーの再起動後も3秒ごとに自動再接続します。ブラウザで直接確認する場合は
+`http://127.0.0.1:8765/chat-overlay`を使えます。
 
 最初は幅`520`、高さ`900`を目安にし、OBS上で配置と大きさを調整してください。
 背景は透明で、コメント部分だけ半透明の黒いカードとして表示されます。
@@ -182,6 +258,15 @@ AIが返答対象に選ばなかったコメントも含め、新規コメント
 チャット欄は`ai-youtuber-live`モードでコメントを取得している間に更新されます。
 OBSブラウザソースを再読み込みした場合も、同じPythonプロセスが動いていれば
 直近のコメントを復元します。表示デザインは`chat_overlay.html`で調整できます。
+
+`ai-youtuber-live`では字幕とコメントの接続を確認してから開始挨拶を流します。
+既定では最大120秒待機し、接続できなければどちらが未接続かを表示して安全に停止します。
+待機時間は`.env`の`OBS_OVERLAY_WAIT_SECONDS`で変更できます。
+
+OBS接続後、YouTubeがまだライブでなければ終了せず、既定で10秒ごとにライブを
+再検索します。YouTubeがライブになり、ライブチャットを取得できてから開始挨拶を
+流します。再検索間隔は`YOUTUBE_LIVE_WAIT_INTERVAL_SECONDS`、待機上限は
+`YOUTUBE_LIVE_WAIT_TIMEOUT_SECONDS`で変更できます。待機上限の`0`は無制限です。
 
 ### 配信管理画面
 

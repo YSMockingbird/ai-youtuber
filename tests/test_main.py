@@ -2,17 +2,289 @@ import unittest
 from unittest.mock import Mock, call, patch
 
 from main import (
+    AdminRequestedBroadcastEnd,
     generate_and_deliver_ai_response,
     generate_and_deliver_news_commentary,
     get_autonomous_speech_interval_seconds,
     get_mock_live_delay_seconds,
+    get_obs_overlay_wait_seconds,
+    get_youtube_live_wait_settings,
+    is_reply_candidate,
     process_next_admin_command,
     run_ai_youtuber_loop,
     run_mock_live,
+    run_obs_websocket_test,
+    run_x_post,
+    run_x_post_draft,
+    wait_for_youtube_live,
+    YouTubeBroadcastEndCoordinator,
 )
+from youtube_chat import YouTubeLiveEndedError, YouTubeLiveNotStartedError
+
+
+class ReplyCandidateTest(unittest.TestCase):
+    def test_low_information_reactions_are_skipped(self):
+        for comment in ("www", "ＷＷＷ", "草草草", "8888", "っっっっっf"):
+            with self.subTest(comment=comment):
+                self.assertFalse(is_reply_candidate({"comment": comment}))
+
+    def test_url_only_comment_is_skipped(self):
+        self.assertFalse(
+            is_reply_candidate({"comment": "https://example.com/test"})
+        )
+
+    def test_short_meaningful_comments_remain_candidates(self):
+        for comment in ("かわいい", "ええっ", "AIって何？", "hello"):
+            with self.subTest(comment=comment):
+                self.assertTrue(is_reply_candidate({"comment": comment}))
+
+
+class ObsOverlayWaitConfigTest(unittest.TestCase):
+    @patch("main.ObsWebSocketClient.from_env")
+    def test_obs_connection_test_reports_stream_status(self, from_env_mock):
+        client = from_env_mock.return_value
+        client.get_stream_status.return_value = False
+
+        run_obs_websocket_test()
+
+        client.get_stream_status.assert_called_once_with()
+
+    @patch.dict("os.environ", {"OBS_OVERLAY_WAIT_SECONDS": "90"})
+    def test_reads_overlay_wait_seconds(self):
+        self.assertEqual(get_obs_overlay_wait_seconds(), 90)
+
+    @patch.dict("os.environ", {"OBS_OVERLAY_WAIT_SECONDS": "invalid"})
+    def test_rejects_invalid_overlay_wait_seconds(self):
+        with self.assertRaisesRegex(RuntimeError, "数値"):
+            get_obs_overlay_wait_seconds()
+
+
+class YouTubeLiveWaitTest(unittest.TestCase):
+    @patch.dict(
+        "os.environ",
+        {
+            "YOUTUBE_LIVE_WAIT_INTERVAL_SECONDS": "10",
+            "YOUTUBE_LIVE_WAIT_TIMEOUT_SECONDS": "0",
+        },
+    )
+    def test_reads_live_wait_settings(self):
+        self.assertEqual(get_youtube_live_wait_settings(), (10, 0))
+
+    @patch("main.time.sleep")
+    @patch("main.get_live_chat_id")
+    def test_retries_only_until_live_starts(self, get_chat_id, sleep_mock):
+        get_chat_id.side_effect = [
+            YouTubeLiveNotStartedError("まだ開始前"),
+            YouTubeLiveNotStartedError("まだ開始前"),
+            ("live-chat-id", "video-id"),
+        ]
+        runtime = Mock()
+
+        result = wait_for_youtube_live(runtime)
+
+        self.assertEqual(result, ("live-chat-id", "video-id"))
+        self.assertEqual(sleep_mock.call_count, 2)
+        runtime.update_admin_status.assert_called_with(
+            phase="preparing",
+            message="YouTubeライブを確認しました。配信を準備しています。",
+            youtube_wait_attempts=3,
+        )
+
+    @patch("main.time.sleep")
+    @patch("main.get_live_chat_id")
+    def test_authentication_error_is_not_retried(self, get_chat_id, sleep_mock):
+        get_chat_id.side_effect = RuntimeError("認証失敗")
+
+        with self.assertRaisesRegex(RuntimeError, "認証失敗"):
+            wait_for_youtube_live(Mock())
+
+        sleep_mock.assert_not_called()
+
+
+class XPostDraftCommandTest(unittest.TestCase):
+    @patch("x_post.generate_x_post_draft")
+    def test_x_failure_does_not_propagate(self, generate_draft):
+        generate_draft.side_effect = RuntimeError("Gemini接続失敗")
+
+        result = run_x_post_draft()
+
+        self.assertFalse(result)
+
+    @patch("x_post.publish_x_post")
+    @patch("x_post.generate_x_post_draft")
+    def test_x_post_requires_confirm_flag(self, generate_draft, publish):
+        generate_draft.return_value = {"text": "確認する本文"}
+
+        result = run_x_post(confirm=False)
+
+        self.assertFalse(result)
+        publish.assert_not_called()
+
+    @patch("x_post.publish_x_post")
+    @patch("x_post.generate_x_post_draft")
+    def test_x_post_requires_exact_confirmation(self, generate_draft, publish):
+        generate_draft.return_value = {"text": "確認する本文"}
+
+        result = run_x_post(
+            confirm=True,
+            input_func=lambda _prompt: "no",
+        )
+
+        self.assertFalse(result)
+        publish.assert_not_called()
+
+    @patch("x_post.publish_x_post")
+    @patch("x_post.generate_x_post_draft")
+    def test_x_post_publishes_after_exact_confirmation(
+        self,
+        generate_draft,
+        publish,
+    ):
+        generate_draft.return_value = {"text": "確認する本文"}
+        publish.return_value = {"post_id": "12345", "text": "確認する本文"}
+
+        result = run_x_post(
+            confirm=True,
+            input_func=lambda _prompt: "POST",
+        )
+
+        self.assertTrue(result)
+        publish.assert_called_once_with("確認する本文")
 
 
 class GenerateAndDeliverAiResponseTest(unittest.TestCase):
+    def test_admin_broadcast_end_signal_is_a_distinct_normal_exit(self):
+        self.assertTrue(issubclass(AdminRequestedBroadcastEnd, RuntimeError))
+
+    def test_youtube_end_waits_for_closing_audio(self):
+        current_time = [100.0]
+        runtime = Mock()
+        complete_callback = Mock(return_value="complete")
+        stop_obs_callback = Mock(return_value=True)
+        coordinator = YouTubeBroadcastEndCoordinator(
+            "video-id",
+            runtime,
+            complete_callback=complete_callback,
+            stop_obs_callback=stop_obs_callback,
+            now=lambda: current_time[0],
+        )
+
+        coordinator.schedule(2000)
+        current_time[0] = 102.7
+        self.assertFalse(coordinator.tick())
+        complete_callback.assert_not_called()
+
+        current_time[0] = 102.75
+        self.assertTrue(coordinator.tick())
+        complete_callback.assert_called_once_with("video-id")
+        stop_obs_callback.assert_called_once_with()
+
+    @patch("main.deliver_generated_response_with_command")
+    @patch("main.generate_admin_directed_speech")
+    def test_end_broadcast_schedules_after_closing_greeting(
+        self,
+        generate_mock,
+        deliver_mock,
+    ):
+        runtime = Mock()
+        runtime.get_next_admin_command.return_value = {
+            "action": "end_broadcast",
+        }
+        generate_mock.return_value = {
+            "text": "今日はここまで。またね。",
+            "emotion": "relaxed",
+            "motion": None,
+        }
+        deliver_mock.return_value = (
+            generate_mock.return_value,
+            1,
+            {"duration_ms": 2400},
+        )
+        autonomous_buffer = Mock(paused=False)
+        schedule_end = Mock()
+
+        handled = process_next_admin_command(
+            runtime,
+            autonomous_buffer,
+            Mock(),
+            schedule_broadcast_end=schedule_end,
+        )
+
+        self.assertTrue(handled)
+        autonomous_buffer.pause.assert_called_once_with()
+        schedule_end.assert_called_once_with(2400)
+
+    @patch("main.AutonomousSpeechBuffer")
+    @patch("main.SpeechScheduler.from_config")
+    @patch("main.StreamContextManager")
+    @patch("main.load_llm_config")
+    @patch("main.YouTubeChatPoller")
+    @patch("main.get_live_chat_id")
+    def test_live_loop_stops_without_waiting_when_youtube_ends(
+        self,
+        live_chat_id_mock,
+        poller_class_mock,
+        load_config_mock,
+        context_manager_mock,
+        scheduler_factory_mock,
+        buffer_class_mock,
+    ):
+        live_chat_id_mock.return_value = ("live-chat-id", "video-id")
+        poller = poller_class_mock.return_value
+        poller.start.return_value = poller
+
+        def ended_results(*args, **kwargs):
+            raise YouTubeLiveEndedError("ライブチャット終了")
+            yield
+
+        poller.iter_results.side_effect = ended_results
+        load_config_mock.return_value = {
+            "autonomous_speech": {"silence_seconds": 3}
+        }
+        scheduler_factory_mock.return_value.silence_seconds = 3
+        autonomous_buffer = buffer_class_mock.return_value
+        autonomous_buffer.theme_manager.describe.return_value = "テーマ"
+        runtime = Mock()
+
+        run_ai_youtuber_loop(max_loops=1000, runtime=runtime)
+
+        autonomous_buffer.pause.assert_called_once_with()
+        runtime.update_admin_status.assert_called_with(
+            autonomous_paused=True,
+            phase="youtube_ended",
+            message="YouTubeライブ終了を検知しました。Pythonを停止します。",
+        )
+
+    def test_admin_can_change_stream_plan(self):
+        runtime = Mock()
+        runtime.get_next_admin_command.return_value = {
+            "action": "change_stream_plan",
+            "text": "初見向けの自己紹介配信",
+        }
+        autonomous_buffer = Mock()
+        autonomous_buffer.replace_program.return_value = "新しい構成"
+        autonomous_buffer.theme_manager.status.return_value = {
+            "stream_theme": "自己紹介配信",
+            "stream_segment": "どんなAIか",
+        }
+
+        handled = process_next_admin_command(
+            runtime,
+            autonomous_buffer,
+            Mock(),
+        )
+
+        self.assertTrue(handled)
+        autonomous_buffer.replace_program.assert_called_once_with(
+            "初見向けの自己紹介配信"
+        )
+        runtime.update_admin_status.assert_called_with(
+            stream_theme="自己紹介配信",
+            stream_segment="どんなAIか",
+            phase="waiting",
+            message="配信企画と話題構成を変更しました。",
+        )
+
     def test_admin_pause_command_pauses_only_autonomous_buffer(self):
         runtime = Mock()
         runtime.get_next_admin_command.return_value = {
@@ -155,7 +427,7 @@ class GenerateAndDeliverAiResponseTest(unittest.TestCase):
         generate_mock,
         deliver_mock,
     ):
-        live_chat_id_mock.return_value = "live-chat-id"
+        live_chat_id_mock.return_value = ("live-chat-id", "video-id")
         target_message = {
             "message_id": "message-1",
             "user_id": "channel-1",
