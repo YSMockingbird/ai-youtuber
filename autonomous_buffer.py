@@ -33,6 +33,7 @@ class AutonomousSpeechBuffer:
         stream_topic=None,
         stream_instruction=None,
         prepared_theme_plan=None,
+        news_history_repository=None,
         theme_manager=None,
         now=None,
         prepare_in_background=True,
@@ -62,6 +63,7 @@ class AutonomousSpeechBuffer:
             prepared_plan=prepared_theme_plan,
         )
         self.publish_callback = publish_callback
+        self.news_history_repository = news_history_repository
         self.used_news_links = set()
         self.active_news_article = None
         self.active_news_turn = 0
@@ -188,6 +190,8 @@ class AutonomousSpeechBuffer:
         self.previous_topic = item.topic
         if item.topic == "news":
             self.used_news_links.add(item.article["link"])
+            if item.news_story_turn == 0:
+                self._record_news_history(item.article)
             next_turn = item.news_story_turn + 1
             if next_turn >= self.news_story_utterances:
                 self.active_news_article = None
@@ -487,9 +491,15 @@ class AutonomousSpeechBuffer:
             if query
             else fetch_news_articles()
         )
+        persistent_exclusions = {"story_keys": set(), "links": set()}
+        if self.news_history_repository is not None:
+            persistent_exclusions = (
+                self.news_history_repository.recent_exclusions()
+            )
         article = select_news_article(
             articles,
-            self.used_news_links,
+            self.used_news_links | persistent_exclusions["links"],
+            excluded_story_keys=persistent_exclusions["story_keys"],
             theme_text=(
                 f"{self.theme_manager.state.main_theme} "
                 f"{self.theme_manager.state.current_focus}"
@@ -500,6 +510,15 @@ class AutonomousSpeechBuffer:
                 "未使用かつ雑談に適したニュース記事が見つかりませんでした。"
             )
         return article
+
+    def _record_news_history(self, article):
+        if self.news_history_repository is None:
+            return
+        try:
+            self.news_history_repository.record(article)
+        except (RuntimeError, ValueError) as exc:
+            # 既読履歴だけの不具合でライブを止めず、次回の重複リスクをログへ残します。
+            print(f"ニュース既読履歴の保存エラー: {exc}")
 
     def _remember_utterance(self, text):
         self.recent_utterances.append(text)

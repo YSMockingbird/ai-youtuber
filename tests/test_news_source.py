@@ -5,8 +5,10 @@ from unittest.mock import Mock, patch
 import requests
 
 from news_source import (
+    _has_matching_event_signature,
     _merge_duplicate_articles,
     clear_news_cache,
+    create_news_story_key,
     fetch_news_articles,
     fetch_news_articles_for_query,
     get_news_feed_specs,
@@ -121,6 +123,96 @@ class NewsSourceTest(unittest.TestCase):
         )
 
         self.assertEqual(selected["link"], "https://example.com/3")
+
+    def test_recent_story_is_skipped_even_when_url_is_different(self):
+        previous_title = (
+            "ホロライブ運営がネット上の噂に回答する新方針を検討 - インサイド"
+        )
+        articles = [
+            {
+                "title": (
+                    "ホロライブ運営がネット上の噂に回答する新方針を検討"
+                    "（インサイド） - Yahoo!ニュース"
+                ),
+                "summary": "同じ記事の転載です。",
+                "link": "https://yahoo.example/same-story",
+                "source_name": "Yahoo!ニュース",
+                "source_url": "https://news.google.com/rss",
+                "audience_category": "vtuber",
+            },
+            {
+                "title": "新作アニメの放送日が発表",
+                "summary": "別の話題です。",
+                "link": "https://animeanime.jp/article/new",
+                "source_name": "アニメ！アニメ！",
+                "audience_category": "anime",
+            },
+        ]
+
+        selected = select_news_article(
+            articles,
+            excluded_story_keys={create_news_story_key(previous_title)},
+        )
+
+        self.assertEqual(selected["link"], "https://animeanime.jp/article/new")
+
+    def test_same_event_with_substantially_different_headline_is_skipped(self):
+        previous_titles = [
+            (
+                "にじさんじ所属VTuber・夢月ロアに関する名誉毀損訴訟で和解成立 "
+                "「いじめの事実は存在しない」相手側が虚偽と認め謝罪 - Yahoo!ニュース"
+            ),
+            (
+                "にじさんじ「夢月ロア」の訴訟、ようやく和解"
+                "「いじめの事実は存在しない」デマ流した配信者が謝罪する内容 "
+                "- Yahoo!ニュース"
+            ),
+        ]
+        articles = [
+            {
+                "title": (
+                    "にじさんじ「夢月ロア」が起こした訴訟が和解 "
+                    "相手の物申す系VTuberは謝罪"
+                    "「虚偽の情報を伝えてしまった」 - Yahoo!ニュース"
+                ),
+                "summary": "同じ訴訟和解を別の表現で伝える記事です。",
+                "link": "https://news.google.com/rss/articles/another-url",
+                "source_name": "Yahoo!ニュース",
+                "source_url": "https://news.google.com/rss",
+                "audience_category": "gossip",
+            },
+            {
+                "title": "人気VTuberが大型音楽イベントへの出演を発表",
+                "summary": "別のニュースです。",
+                "link": "https://kai-you.example/music-event",
+                "source_name": "KAI-YOU",
+                "audience_category": "vtuber",
+            },
+        ]
+
+        selected = select_news_article(
+            articles,
+            excluded_story_keys={
+                create_news_story_key(title) for title in previous_titles
+            },
+        )
+
+        self.assertEqual(selected["link"], "https://kai-you.example/music-event")
+
+    def test_generic_agency_name_does_not_merge_different_events(self):
+        previous_title = (
+            "にじさんじ所属ライバーAが活動休止と大会延期を発表 - テスト媒体"
+        )
+        different_title = (
+            "にじさんじ所属ライバーBが活動休止と大会延期を発表"
+        )
+
+        self.assertFalse(
+            _has_matching_event_signature(
+                create_news_story_key(previous_title),
+                create_news_story_key(different_title),
+            )
+        )
 
     @patch.dict(
         "os.environ",

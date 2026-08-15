@@ -524,7 +524,12 @@
         const privacyStatus = elements.broadcastPrivacy.value;
         const streamPlan = elements.broadcastPlan.value.trim();
         if (!title) return showResult('配信タイトルを入力してください。', true);
-        if (!latestDraftId) return showResult('先に「AIで配信案を作成」を押してください。', true);
+        if (!latestDraftId && !streamPlan) {
+          return showResult(
+            '配信内容の希望を入力するか、「AIで配信案を作成」を押してください。',
+            true
+          );
+        }
         const privacyLabel = privacyStatus === 'public'
           ? '公開'
           : privacyStatus === 'private' ? '非公開' : '限定公開';

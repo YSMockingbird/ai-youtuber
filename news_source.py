@@ -97,6 +97,16 @@ LOW_VALUE_TITLE_PATTERNS = (
     r"プレスリリース",
     r"\d+枚目の写真",
 )
+STORY_EVENT_KEYWORDS = {
+    "訴訟", "提訴", "告訴", "和解", "判決", "起訴", "敗訴", "勝訴",
+    "虚偽", "謝罪", "契約解除", "活動休止", "卒業", "引退", "復帰",
+    "解散", "延期", "中止", "サービス終了", "配信停止", "受賞", "優勝",
+}
+GENERIC_STORY_ANCHOR_FRAGMENTS = {
+    "vtuber", "youtube", "にじさんじ", "ホロライブ", "ぶいすぽ",
+    "ニュース", "に関する", "について", "をめぐる", "所属", "ライバー",
+    "配信者", "事務所", "運営", "公式", "大会", "発表",
+}
 
 
 class _TextExtractor(HTMLParser):
@@ -301,13 +311,22 @@ def select_news_article(
     theme_text="",
     now=None,
     max_age_hours=None,
+    excluded_story_keys=None,
 ):
     used_links = used_links or set()
+    excluded_story_keys = set(excluded_story_keys or ())
+    excluded_story_map = {key: True for key in excluded_story_keys}
     current_time = _normalize_now(now)
     maximum_age = max_age_hours or get_news_max_age_hours()
     ranked = []
     for index, article in enumerate(articles):
         if article.get("link") in used_links:
+            continue
+        story_key = create_news_story_key(article.get("title", ""))
+        if story_key in excluded_story_keys or _find_similar_story_key(
+            story_key,
+            excluded_story_map,
+        ) is not None:
             continue
         combined_text = " ".join(
             (str(article.get("title", "")), str(article.get("summary", "")))
@@ -423,12 +442,69 @@ def _find_similar_story_key(candidate_key, existing):
         union = candidate_terms | existing_terms
         if union and len(candidate_terms & existing_terms) / len(union) >= 0.62:
             return existing_key
+        if _has_matching_event_signature(candidate_key, existing_key):
+            return existing_key
     return None
+
+
+def _has_matching_event_signature(left_key, right_key):
+    # 見出しの言い回しが違っても、同じ固有対象と複数の出来事語が一致すれば同一事件とみなします。
+    shared_events = {
+        keyword
+        for keyword in STORY_EVENT_KEYWORDS
+        if keyword in left_key and keyword in right_key
+    }
+    if len(shared_events) < 2:
+        return False
+
+    left_anchors = {
+        left_key[index : index + 4]
+        for index in range(len(left_key) - 3)
+    }
+    right_anchors = {
+        right_key[index : index + 4]
+        for index in range(len(right_key) - 3)
+    }
+    return any(
+        _is_informative_story_anchor(anchor)
+        for anchor in left_anchors & right_anchors
+    )
+
+
+def _is_informative_story_anchor(anchor):
+    if any(
+        fragment in anchor or anchor in fragment
+        or _shared_bigram_count(anchor, fragment) >= 2
+        for fragment in GENERIC_STORY_ANCHOR_FRAGMENTS
+    ):
+        return False
+    if any(
+        keyword[index : index + 2] in anchor
+        for keyword in STORY_EVENT_KEYWORDS
+        for index in range(len(keyword) - 1)
+    ):
+        return False
+    return True
+
+
+def _shared_bigram_count(left, right):
+    left_terms = {
+        left[index : index + 2] for index in range(len(left) - 1)
+    }
+    right_terms = {
+        right[index : index + 2] for index in range(len(right) - 1)
+    }
+    return len(left_terms & right_terms)
 
 
 def _normalized_story_key(title):
     value = re.sub(r"\s+-\s+[^-]+$", "", str(title or "")).lower()
     return re.sub(r"[^0-9a-zぁ-んァ-ヶ一-龠々ー]", "", value)[:100]
+
+
+def create_news_story_key(title):
+    # URLが変わっても同じ話題を判定できるよう、媒体名や記号を除いたキーを作ります。
+    return _normalized_story_key(title)
 
 
 def _parse_published_datetime(value):

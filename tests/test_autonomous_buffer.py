@@ -311,12 +311,18 @@ class AutonomousSpeechBufferTest(unittest.TestCase):
         theme_manager.build_context.return_value = "配信構成"
         theme_manager.state.main_theme = "今週の界隈ニュース"
         theme_manager.status.return_value = {}
+        news_history_repository = Mock()
+        news_history_repository.recent_exclusions.return_value = {
+            "story_keys": {"以前に使用した話題"},
+            "links": {"https://example.com/old-news"},
+        }
         buffer = AutonomousSpeechBuffer(
             runtime=self.runtime,
             stream_context=self.stream_context,
             config=config,
             publish_callback=self.publish_callback,
             theme_manager=theme_manager,
+            news_history_repository=news_history_repository,
             now=100,
             prepare_in_background=False,
         )
@@ -329,6 +335,16 @@ class AutonomousSpeechBufferTest(unittest.TestCase):
         self.assertEqual(buffer.prepared.article, article)
         self.assertEqual(buffer.prepared.news_story_turn, 1)
         self.assertEqual(fetch_news_mock.call_count, 1)
+        select_news_mock.assert_called_once()
+        self.assertEqual(
+            select_news_mock.call_args.args[1],
+            {"https://example.com/old-news"},
+        )
+        self.assertEqual(
+            select_news_mock.call_args.kwargs["excluded_story_keys"],
+            {"以前に使用した話題"},
+        )
+        news_history_repository.record.assert_called_once_with(article)
         first_call, second_call = generate_news_mock.call_args_list[:2]
         self.assertEqual(first_call.kwargs["story_turn"], 1)
         self.assertEqual(second_call.kwargs["story_turn"], 2)

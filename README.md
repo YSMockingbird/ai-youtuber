@@ -413,11 +413,20 @@ NEWS_RSS_URLS=https://example.com/vtuber.xml,https://example.com/anime.xml
 NEWS_TIMEOUT_SECONDS=10
 NEWS_MAX_AGE_HOURS=168
 NEWS_CACHE_SECONDS=600
+NEWS_HISTORY_DB_PATH=data/news_history.db
+NEWS_HISTORY_DAYS=14
 ```
 
 `NEWS_CACHE_SECONDS`は取得済みニュースを再利用する秒数です。既定の`600`では、
 同じ配信中にRSSへアクセスする回数を10分に1回までに抑えます。更新に失敗した場合は、
 取得済みの古いキャッシュがあれば配信を止めずに利用します。
+
+ライブで実際に読み上げを開始したニュースは、`data/news_history.db`へ保存します。
+既定では14日間、同じURLに加えて、配信元や表記が少し違う類似見出しも候補から
+除外します。保存対象は実際に使った記事だけなので、コメント到着で破棄した先読みは
+既読になりません。候補を使い切った場合は、同じニュースを繰り返さず雑学などの
+通常雑談へ切り替えます。期間は`NEWS_HISTORY_DAYS`で1〜90日の範囲から変更できます。
+この判定はPythonとSQLiteだけで行うため、LLMの呼び出し回数やトークン消費は増えません。
 
 以前の`NEWS_RSS_URL`も独自URLの場合は互換用として利用できます。ただし、旧既定値の
 デジタル庁RSSが残っている場合は無視し、オタク層向けの既定フィードへ移行します。

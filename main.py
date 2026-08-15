@@ -1331,6 +1331,7 @@ def run_ai_youtuber_loop(
     stream_topic=None,
     stream_plan=None,
     obs_websocket_client=None,
+    news_history_repository=None,
 ):
     # コメントを優先し、音声終了後の無言時間が続いたら自発発話します。
     prepared_theme_plan = None
@@ -1387,6 +1388,7 @@ def run_ai_youtuber_loop(
             stream_topic=stream_topic,
             stream_instruction=stream_plan,
             prepared_theme_plan=prepared_theme_plan,
+            news_history_repository=news_history_repository,
         )
     recent_utterances = []
     previous_autonomous_topic = None
@@ -1677,6 +1679,9 @@ def run_ai_youtuber_live(max_loops, stream_topic=None, stream_plan=None):
     print_external_control_server_info(version, speaker_id, port)
 
     try:
+        from news_history import get_news_history_repository
+
+        news_history_repository = get_news_history_repository()
         obs_websocket_client = ObsWebSocketClient.from_env()
         if obs_websocket_client is not None:
             output_active = obs_websocket_client.get_stream_status()
@@ -1690,6 +1695,7 @@ def run_ai_youtuber_live(max_loops, stream_topic=None, stream_plan=None):
             stream_topic=stream_topic,
             stream_plan=stream_plan,
             obs_websocket_client=obs_websocket_client,
+            news_history_repository=news_history_repository,
         )
     finally:
         server.runtime.update_admin_status(
