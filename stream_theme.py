@@ -1,9 +1,11 @@
 from dataclasses import dataclass, field
+from typing import Literal, Optional
 
 from pydantic import BaseModel, ConfigDict, Field
 
 from llm.client import create_llm_client
 from llm.config import load_llm_config
+from time_context import get_current_datetime_context
 
 
 class StreamSegmentPlan(BaseModel):
@@ -25,6 +27,10 @@ class StreamThemePlan(BaseModel):
     opening_greeting: str = Field(min_length=10, max_length=180)
     segments: list[StreamSegmentPlan] = Field(min_length=3, max_length=5)
     closing_direction: str = Field(min_length=5, max_length=100)
+    youtube_title: str = Field(min_length=10, max_length=70)
+    youtube_description: str = Field(min_length=30, max_length=300)
+    news_policy: Literal["off", "related", "general"]
+    news_query: Optional[str] = Field(min_length=2, max_length=50)
 
 
 def generate_stream_theme_plan(previous_state=None, instruction=None):
@@ -61,8 +67,16 @@ def generate_stream_theme_plan(previous_state=None, instruction=None):
         "関連作品、過去の類似例、視聴者層の反応などを入れてください。\n"
         "opening_greetingは実際に読み上げる2〜3文です。短い挨拶と、今日何を話すかを"
         "初見にも分かる言葉で含め、視聴者がいると断定しないでください。\n"
+        "youtube_titleは配信内容が一目で分かる自然な日本語にし、誇張、煽り、長い副題を"
+        "避けてください。youtube_descriptionは2〜4文で内容とAI配信であることを説明し、"
+        "未確定の日時、URL、ハッシュタグ、事実を作らないでください。\n"
         "世界平和、デスメタル、麻雀、ギャンブルなどの設定は、指定や話の流れに"
-        "関係する時だけ使い、毎回の企画へ無理に入れないでください。\n\n"
+        "関係する時だけ使い、毎回の企画へ無理に入れないでください。\n"
+        "news_policyは、指定内容にニュースが不要ならoff、直接関係するニュースだけを"
+        "使えるならrelated、AIにおまかせで幅広い時事を扱う場合だけgeneralにしてください。"
+        "relatedの場合だけ、Google News検索用の短いnews_queryを設定してください。"
+        "自己紹介、趣味、特定テーマの雑談へ無関係なニュースを混ぜないでください。\n"
+        f"{get_current_datetime_context()}\n\n"
         f"前回までの状態:\n{previous_context}"
     )
     client = create_llm_client(load_llm_config())
@@ -74,7 +88,8 @@ def generate_stream_theme_plan(previous_state=None, instruction=None):
         ),
         input_text=input_text,
         response_model=StreamThemePlan,
-        max_output_tokens=1200,
+        # 構成に加えてタイトルと説明文も返すため、途中切れによる再試行を避けます。
+        max_output_tokens=1500,
         request_label="stream_plan",
     )
 
@@ -95,6 +110,8 @@ class StreamThemeState:
     tangent_topic: str = ""
     utterance_count: int = 0
     needs_new_plan: bool = False
+    news_policy: str = "general"
+    news_query: str = ""
 
 
 class StreamThemeManager:
@@ -103,6 +120,7 @@ class StreamThemeManager:
         config,
         manual_theme=None,
         program_instruction=None,
+        prepared_plan=None,
         plan_generator=generate_stream_theme_plan,
     ):
         self.plan_generator = plan_generator
@@ -115,14 +133,37 @@ class StreamThemeManager:
         if normalized_manual_theme and normalized_instruction:
             raise ValueError("stream_topicとstream_planは同時に指定できません。")
 
-        if normalized_manual_theme:
+        if prepared_plan is not None:
+            if normalized_manual_theme:
+                raise ValueError("生成済み配信構成とstream_topicは同時に指定できません。")
+            plan = prepared_plan
+            self.manual_theme = False
+        elif normalized_manual_theme:
             plan = self._create_manual_plan(normalized_manual_theme)
             self.manual_theme = True
         else:
             plan = self.plan_generator(None, normalized_instruction or None)
             self.manual_theme = False
+        if (
+            normalized_instruction
+            and normalized_instruction != "AIにおまかせ"
+            and plan.news_policy == "general"
+        ):
+            # 指定配信で一般ニュースへ逸れる判断は採用しません。
+            plan.news_policy = "off"
+            plan.news_query = None
+        if plan.news_policy == "related" and not plan.news_query:
+            plan.news_policy = "off"
         self.program_instruction = normalized_instruction
         self.state = self._state_from_plan(plan)
+
+    @property
+    def news_policy(self):
+        return self.state.news_policy
+
+    @property
+    def news_query(self):
+        return self.state.news_query
 
     @property
     def current_segment(self):
@@ -211,6 +252,14 @@ class StreamThemeManager:
         if len(normalized_instruction) > 200:
             raise ValueError("配信企画の指示は200文字以内にしてください。")
         plan = self.plan_generator(self.state, normalized_instruction)
+        if (
+            normalized_instruction != "AIにおまかせ"
+            and plan.news_policy == "general"
+        ):
+            plan.news_policy = "off"
+            plan.news_query = None
+        if plan.news_policy == "related" and not plan.news_query:
+            plan.news_policy = "off"
         self.program_instruction = normalized_instruction
         self.manual_theme = False
         self.state = self._state_from_plan(plan)
@@ -218,11 +267,17 @@ class StreamThemeManager:
 
     def describe(self):
         segment_titles = " → ".join(segment.title for segment in self.state.segments)
+        news_description = {
+            "off": "使用しない",
+            "related": f"関連ニュースのみ（検索: {self.state.news_query}）",
+            "general": "幅広いニュースを使用",
+        }[self.state.news_policy]
         return (
             f"配信企画：{self.state.main_theme}\n"
             f"開始挨拶：{self.state.opening_greeting}\n"
             f"話題構成：{segment_titles}\n"
-            f"現在の話題：{self.current_segment.title}"
+            f"現在の話題：{self.current_segment.title}\n"
+            f"ニュース方針：{news_description}"
         )
 
     def status(self):
@@ -231,6 +286,8 @@ class StreamThemeManager:
             "stream_segment": self.current_segment.title,
             "stream_segment_index": self.state.segment_index + 1,
             "stream_segment_count": len(self.state.segments),
+            "news_policy": self.state.news_policy,
+            "news_query": self.state.news_query,
         }
 
     def _advance_segment(self):
@@ -256,6 +313,15 @@ class StreamThemeManager:
         previous_theme = self.state.main_theme
         total_utterances = self.state.utterance_count
         plan = self.plan_generator(self.state, self.program_instruction or None)
+        if (
+            self.program_instruction
+            and self.program_instruction != "AIにおまかせ"
+            and plan.news_policy == "general"
+        ):
+            plan.news_policy = "off"
+            plan.news_query = None
+        if plan.news_policy == "related" and not plan.news_query:
+            plan.news_policy = "off"
         self.state = self._state_from_plan(plan)
         self.state.utterance_count = total_utterances
         print(f"配信構成を更新します：{previous_theme} → {self.state.main_theme}")
@@ -269,6 +335,8 @@ class StreamThemeManager:
             opening_greeting=plan.opening_greeting.strip(),
             segments=list(plan.segments),
             closing_direction=plan.closing_direction.strip(),
+            news_policy=plan.news_policy,
+            news_query=str(plan.news_query or "").strip(),
         )
 
     @staticmethod
@@ -301,4 +369,11 @@ class StreamThemeManager:
                 ),
             ],
             closing_direction="話した内容を一つだけ振り返って軽く締める",
+            youtube_title=f"{theme}について話すAI VTuber雑談",
+            youtube_description=(
+                f"AI VTuberの才羽ガン奈が、{theme}について雑談します。"
+                "コメントがあれば会話しながら進める配信です。"
+            ),
+            news_policy="off",
+            news_query=None,
         )

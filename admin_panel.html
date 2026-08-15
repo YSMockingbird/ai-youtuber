@@ -95,7 +95,7 @@
       h2 { margin: 0 0 7px; font-size: 18px; }
       .description { margin: 0 0 16px; color: #9299aa; font-size: 13px; line-height: 1.6; }
       label { display: block; margin: 13px 0 7px; color: #cbd0dc; font-size: 13px; font-weight: 700; }
-      textarea, select {
+      textarea, select, input {
         width: 100%;
         border: 1px solid #333947;
         border-radius: 11px;
@@ -105,7 +105,8 @@
         font: inherit;
       }
       textarea { min-height: 112px; padding: 12px 13px; line-height: 1.55; resize: vertical; }
-      textarea:focus, select:focus { border-color: #6687ea; box-shadow: 0 0 0 3px rgba(102, 135, 234, 0.14); }
+      input { height: 42px; padding: 0 12px; }
+      textarea:focus, select:focus, input:focus { border-color: #6687ea; box-shadow: 0 0 0 3px rgba(102, 135, 234, 0.14); }
       select { height: 42px; padding: 0 10px; }
       .selects { display: grid; grid-template-columns: repeat(3, 1fr); gap: 10px; }
       button {
@@ -128,7 +129,9 @@
       button.danger { border-color: #8d3c43; background: #662a30; }
       .action-row { display: flex; flex-wrap: wrap; gap: 9px; margin-top: 14px; }
       .action-row button { flex: 1; }
-      .quick-actions { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+      .broadcast-grid { display: grid; grid-template-columns: 0.9fr 1.1fr; gap: 20px; }
+      .broadcast-column { min-width: 0; }
+      .quick-actions { display: grid; grid-template-columns: repeat(5, 1fr); gap: 10px; }
       .quick-actions button { min-height: 58px; }
       .notice {
         margin-top: 14px;
@@ -147,10 +150,25 @@
         font-size: 13px;
       }
       .result.error { color: #ff8d91; }
+      .draft-preview {
+        display: none;
+        margin-top: 14px;
+        padding: 12px 13px;
+        border: 1px solid #344a67;
+        border-radius: 11px;
+        background: rgba(28, 48, 72, 0.35);
+        color: #c8daf0;
+        font-size: 12px;
+        line-height: 1.65;
+        white-space: pre-wrap;
+      }
+      .draft-preview.visible { display: block; }
       @media (max-width: 760px) {
         .grid { grid-template-columns: 1fr; }
         .card.full { grid-column: auto; }
+        .broadcast-grid { grid-template-columns: 1fr; }
         .selects { grid-template-columns: 1fr; }
+        .quick-actions { grid-template-columns: 1fr 1fr; }
         header { flex-direction: column; }
       }
     </style>
@@ -181,6 +199,50 @@
 
       <div class="grid">
         <section class="card full">
+          <h2>配信開始</h2>
+          <p class="description">AIが配信企画・タイトル・説明文をまとめて作成し、確認後にYouTube配信枠とOBSを開始します。</p>
+          <div class="broadcast-grid">
+            <div class="broadcast-column">
+              <label for="broadcastPlan">配信内容の希望</label>
+              <textarea id="broadcastPlan" maxlength="200" placeholder="空欄ならAIにおまかせ。例：初見向けの自己紹介配信"></textarea>
+              <div class="action-row">
+                <button id="prepareBroadcast">AIで配信案を作成</button>
+              </div>
+              <div class="notice">PythonがYouTube開始待機中のときだけ利用できます。配信枠は必要に応じて自動作成されます。</div>
+            </div>
+            <div class="broadcast-column">
+              <label for="broadcastTitle">配信タイトル</label>
+              <input id="broadcastTitle" maxlength="100" placeholder="AIが生成した後、必要なら編集できます" />
+              <label for="broadcastDescription">配信説明</label>
+              <textarea id="broadcastDescription" maxlength="5000" placeholder="AIが生成した後、必要なら編集できます"></textarea>
+              <label for="broadcastPrivacy">公開設定</label>
+              <select id="broadcastPrivacy">
+                <option value="unlisted" selected>限定公開（テスト推奨）</option>
+                <option value="private">非公開</option>
+                <option value="public">公開</option>
+              </select>
+              <div id="broadcastDraftPreview" class="draft-preview"></div>
+              <div class="action-row">
+                <button id="configureBroadcast">内容を設定して開始</button>
+              </div>
+            </div>
+          </div>
+        </section>
+
+        <section class="card full">
+          <h2>進行操作</h2>
+          <p class="description">配信中の自発発話と終了を操作します。コメント返信は自発発話を止めても継続します。</p>
+          <div class="quick-actions">
+            <button id="pause" class="secondary">自発発話を停止</button>
+            <button id="resume" class="secondary">自発発話を再開</button>
+            <button id="cancel" class="secondary">次の発言を取消</button>
+            <button id="closing" class="warning">終了挨拶を生成</button>
+            <button id="endBroadcast" class="danger">終了挨拶して配信終了</button>
+          </div>
+          <div class="notice">「終了挨拶を生成」は挨拶のみです。「終了挨拶して配信終了」は音声再生後にYouTube・OBS・Pythonを停止します。</div>
+        </section>
+
+        <section class="card full">
           <h2>配信企画・話題構成</h2>
           <p class="description">以後の自発雑談を、指定した企画に沿う3〜5個の話題へ組み直します。コメント返信はそのまま継続します。</p>
           <label for="planPreset">企画プリセット</label>
@@ -197,7 +259,7 @@
           <div class="notice">配信開始時から指定する場合は、起動時に --stream-plan を使ってください。この操作では開始挨拶を繰り返しません。</div>
         </section>
 
-        <section class="card">
+        <section class="card full">
           <h2>AIへの指示</h2>
           <p class="description">指示文をそのまま読まず、ガン奈自身の自然な発言に変換します。</p>
           <label for="instruction">非公開の指示</label>
@@ -205,19 +267,6 @@
           <div class="action-row">
             <button id="sendInstruction">AIへ指示を送る</button>
           </div>
-        </section>
-
-        <section class="card">
-          <h2>進行操作</h2>
-          <p class="description">コメント返信は止めず、自発的な独り言だけを制御します。</p>
-          <div class="quick-actions">
-            <button id="pause" class="secondary">自発発話を停止</button>
-            <button id="resume" class="secondary">自発発話を再開</button>
-            <button id="cancel" class="secondary">次の発言を取消</button>
-            <button id="closing" class="warning">終了挨拶を生成</button>
-            <button id="endBroadcast" class="danger">終了挨拶して配信終了</button>
-          </div>
-          <div class="notice">「終了挨拶を生成」は挨拶のみです。「終了挨拶して配信終了」は音声再生後にYouTubeとPythonを停止します。OBSの停止は現在手動です。</div>
         </section>
 
         <section class="card full">
@@ -290,15 +339,26 @@
         cancel: document.getElementById('cancel'),
         closing: document.getElementById('closing'),
         endBroadcast: document.getElementById('endBroadcast'),
+        configureBroadcast: document.getElementById('configureBroadcast'),
+        prepareBroadcast: document.getElementById('prepareBroadcast'),
+        broadcastTitle: document.getElementById('broadcastTitle'),
+        broadcastDescription: document.getElementById('broadcastDescription'),
+        broadcastPrivacy: document.getElementById('broadcastPrivacy'),
+        broadcastPlan: document.getElementById('broadcastPlan'),
+        broadcastDraftPreview: document.getElementById('broadcastDraftPreview'),
         speakDirectly: document.getElementById('speakDirectly'),
       };
       const commandButtons = [
         elements.sendInstruction, elements.pause, elements.resume,
         elements.cancel, elements.closing, elements.endBroadcast,
+        elements.configureBroadcast,
+        elements.prepareBroadcast,
         elements.speakDirectly,
         elements.changePlan,
       ];
       let latestStatus = null;
+      let latestDraftId = '';
+      let ignoredDraftId = '';
 
       function showResult(message, isError = false) {
         elements.result.textContent = message;
@@ -313,6 +373,9 @@
           starting: '起動中', waiting: '待機中', paused: '自発発話停止中',
           waiting_for_obs: 'OBS接続待機中',
           waiting_for_youtube: 'YouTubeライブ待機中', preparing: '配信準備中',
+          starting_broadcast: 'OBS・YouTube配信開始中',
+          configuring_broadcast: 'YouTube配信設定中',
+          preparing_broadcast_draft: 'AI配信案作成中',
           processing: '指示を処理中', speaking: '発話中', error: 'エラー',
           ending_youtube: 'YouTube配信終了中', youtube_ended: 'YouTube配信終了',
           stopped: 'ライブ制御停止中',
@@ -339,8 +402,27 @@
 
         const available = Boolean(status.available);
         for (const button of commandButtons) button.disabled = !available;
+        elements.configureBroadcast.disabled = !available || status.phase !== 'waiting_for_youtube';
+        elements.prepareBroadcast.disabled = !available || status.phase !== 'waiting_for_youtube';
         elements.pause.disabled = !available || Boolean(status.autonomous_paused);
         elements.resume.disabled = !available || !status.autonomous_paused;
+        const draft = status.broadcast_draft;
+        if (
+          draft && draft.id
+          && draft.id !== latestDraftId
+          && draft.id !== ignoredDraftId
+        ) {
+          latestDraftId = draft.id;
+          ignoredDraftId = '';
+          elements.broadcastTitle.value = draft.title || '';
+          elements.broadcastDescription.value = draft.description || '';
+          elements.broadcastDraftPreview.textContent = [
+            `配信企画：${draft.theme || ''}`,
+            `話題構成：${(draft.segments || []).join(' → ')}`,
+            `ニュース方針：${draft.news_description || ''}`,
+          ].join('\n');
+          elements.broadcastDraftPreview.classList.add('visible');
+        }
       }
 
       async function refreshStatus() {
@@ -424,6 +506,48 @@
           {action: 'end_broadcast'},
           '終了挨拶後のYouTube配信終了命令を受け付けました。'
         );
+      });
+      elements.prepareBroadcast.addEventListener('click', () => {
+        ignoredDraftId = latestDraftId;
+        latestDraftId = '';
+        elements.configureBroadcast.disabled = true;
+        elements.broadcastDraftPreview.textContent = 'AIが配信案を作成しています...';
+        elements.broadcastDraftPreview.classList.add('visible');
+        sendCommand({
+          action: 'prepare_broadcast',
+          stream_plan: elements.broadcastPlan.value.trim(),
+        }, 'AI配信案の作成を受け付けました。');
+      });
+      elements.configureBroadcast.addEventListener('click', () => {
+        const title = elements.broadcastTitle.value.trim();
+        const description = elements.broadcastDescription.value.trim();
+        const privacyStatus = elements.broadcastPrivacy.value;
+        const streamPlan = elements.broadcastPlan.value.trim();
+        if (!title) return showResult('配信タイトルを入力してください。', true);
+        if (!latestDraftId) return showResult('先に「AIで配信案を作成」を押してください。', true);
+        const privacyLabel = privacyStatus === 'public'
+          ? '公開'
+          : privacyStatus === 'private' ? '非公開' : '限定公開';
+        const confirmed = window.confirm(
+          `「${title}」・${privacyLabel}でYouTube配信枠とOBSを開始します。よろしいですか？`
+        );
+        if (!confirmed) return;
+        sendCommand({
+          action: 'configure_broadcast',
+          title,
+          description,
+          privacy_status: privacyStatus,
+          stream_plan: streamPlan,
+          draft_id: latestDraftId,
+        }, 'YouTube配信の開始命令を受け付けました。');
+      });
+
+      elements.broadcastPlan.addEventListener('input', () => {
+        if (!latestDraftId) return;
+        ignoredDraftId = latestDraftId;
+        latestDraftId = '';
+        elements.broadcastDraftPreview.textContent = '配信内容の希望を変更しました。AI配信案を再作成してください。';
+        elements.broadcastDraftPreview.classList.add('visible');
       });
 
       refreshStatus();

@@ -1,6 +1,8 @@
 import math
 import re
 
+from time_context import get_current_datetime_context
+
 
 def estimate_tokens(text):
     # プロバイダー未確定のため、日本語を多めに見積もる保守的な近似値を使います。
@@ -35,6 +37,11 @@ class ContextBuilder:
         self.memory_repository = memory_repository
 
     def build(self, current_input, user_id="", include_memories=True):
+        original_current_input = str(current_input or "").strip()
+        current_input = (
+            f"{original_current_input}\n"
+            f"{get_current_datetime_context()}"
+        ).strip()
         context_config = self.config.get("context", {})
         total_budget = int(context_config.get("total_token_budget", 2400))
         section_overhead_tokens = estimate_tokens(
@@ -74,7 +81,7 @@ class ContextBuilder:
             memory_limit = int(context_config.get("relevant_memory_count", 5))
             memories = self.memory_repository.find_relevant(
                 user_id,
-                current_input,
+                original_current_input,
                 memory_limit,
             )
             raw_memory_lines = [f"- {memory['content']}" for memory in memories]

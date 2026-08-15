@@ -57,6 +57,7 @@ ALLOWED_VIEW_ACTIONS = {
 ALLOWED_SPEECH_STYLES = {"slow", "normal", "fast"}
 
 SUBTITLE_OVERLAY_PATH = Path(__file__).with_name("subtitle_overlay.html")
+TOPIC_OVERLAY_PATH = Path(__file__).with_name("topic_overlay.html")
 CHAT_OVERLAY_PATH = Path(__file__).with_name("chat_overlay.html")
 ADMIN_PANEL_PATH = Path(__file__).with_name("admin_panel.html")
 CHARACTER_MEMORY_PANEL_PATH = Path(__file__).with_name(
@@ -67,11 +68,27 @@ ALLOWED_ADMIN_ACTIONS = {
     "ai_instruction",
     "closing_greeting",
     "end_broadcast",
+    "start_broadcast",
+    "prepare_broadcast",
+    "configure_broadcast",
     "pause_autonomous",
     "resume_autonomous",
     "cancel_next",
     "change_stream_plan",
 }
+
+
+def _remove_news_source_suffix(title, source_name):
+    # Google News由来の「見出し - Yahoo!ニュース」のような媒体名重複を除きます。
+    normalized_title = str(title or "").strip()
+    normalized_source = str(source_name or "").strip()
+    if not normalized_title or not normalized_source:
+        return normalized_title
+    for separator in (" - ", " – ", " — ", "｜", " | "):
+        suffix = f"{separator}{normalized_source}"
+        if normalized_title.endswith(suffix):
+            return normalized_title[: -len(suffix)].rstrip()
+    return normalized_title
 
 
 @dataclass(frozen=True)
@@ -332,10 +349,13 @@ class ExternalControlRuntime:
         self.audio_store = AudioStore()
         self.event_broker = EventBroker()
         self.subtitle_event_broker = EventBroker(retain_latest=True)
+        self.topic_event_broker = EventBroker(retain_latest=True)
         self.chat_event_broker = ChatEventBroker(history_size=20)
         self.admin_command_queue = queue.Queue(maxsize=32)
         self.character_memory_repository = character_memory_repository
         self._admin_status_lock = threading.Lock()
+        self._prepared_broadcast_draft = None
+        self._selected_broadcast_plan = None
         self._admin_status = {
             "available": False,
             "autonomous_paused": False,
@@ -356,6 +376,41 @@ class ExternalControlRuntime:
         if action not in ALLOWED_ADMIN_ACTIONS:
             raise ValueError(f"未対応の管理命令です。action={action}")
         normalized = {"action": action, "id": uuid.uuid4().hex}
+        if action in {"prepare_broadcast", "configure_broadcast"}:
+            stream_plan = str(command.get("stream_plan", "")).strip()
+            if len(stream_plan) > 200:
+                raise ValueError("配信企画は200文字以内にしてください。")
+            normalized["stream_plan"] = stream_plan
+        if action == "configure_broadcast":
+            title = str(command.get("title", "")).strip()
+            description = str(command.get("description", "")).strip()
+            privacy_status = str(
+                command.get("privacy_status", "unlisted")
+            ).strip()
+            draft_id = str(command.get("draft_id", "")).strip()
+            if not 1 <= len(title) <= 100:
+                raise ValueError("配信タイトルは1〜100文字にしてください。")
+            if len(description) > 5000:
+                raise ValueError("配信説明は5000文字以内にしてください。")
+            if privacy_status not in {"private", "unlisted", "public"}:
+                raise ValueError(
+                    "公開設定はprivate、unlisted、publicのいずれかです。"
+                )
+            if not stream_plan and not draft_id:
+                raise ValueError(
+                    "配信企画を入力するか、AIで配信案を作成してください。"
+                )
+            if len(draft_id) > 64:
+                raise ValueError("配信案IDが長すぎます。")
+            normalized.update(
+                {
+                    "title": title,
+                    "description": description,
+                    "privacy_status": privacy_status,
+                    "stream_plan": stream_plan,
+                    "draft_id": draft_id,
+                }
+            )
         if action in {"direct_speech", "ai_instruction", "change_stream_plan"}:
             text = str(command.get("text", "")).strip()
             maximum_length = {
@@ -395,8 +450,13 @@ class ExternalControlRuntime:
             ) from exc
         return normalized
 
-    def get_next_admin_command(self):
+    def get_next_admin_command(self, timeout_seconds=0):
+        timeout_seconds = float(timeout_seconds)
+        if timeout_seconds < 0:
+            raise ValueError("管理命令の待機時間は0以上にしてください。")
         try:
+            if timeout_seconds > 0:
+                return self.admin_command_queue.get(timeout=timeout_seconds)
             return self.admin_command_queue.get_nowait()
         except queue.Empty:
             return None
@@ -405,6 +465,57 @@ class ExternalControlRuntime:
         with self._admin_status_lock:
             self._admin_status.update(changes)
             self._admin_status["updated_at_ms"] = round(time.time() * 1000)
+
+    def store_prepared_broadcast_draft(self, plan, instruction, draft_id):
+        normalized_draft_id = str(draft_id).strip()
+        if not normalized_draft_id:
+            raise ValueError("生成した配信案のIDが空です。")
+        segment_titles = [segment.title for segment in plan.segments]
+        news_description = {
+            "off": "使用しない",
+            "related": f"関連ニュースのみ（検索: {plan.news_query}）",
+            "general": "幅広いニュースを使用",
+        }[plan.news_policy]
+        public_draft = {
+            "id": normalized_draft_id,
+            "title": plan.youtube_title,
+            "description": plan.youtube_description,
+            "theme": plan.theme,
+            "segments": segment_titles,
+            "news_policy": plan.news_policy,
+            "news_description": news_description,
+        }
+        with self._admin_status_lock:
+            self._prepared_broadcast_draft = {
+                "id": normalized_draft_id,
+                "instruction": str(instruction or "").strip(),
+                "plan": plan,
+            }
+            self._admin_status["broadcast_draft"] = public_draft
+            self._admin_status["updated_at_ms"] = round(time.time() * 1000)
+        return public_draft
+
+    def select_prepared_broadcast_plan(self, draft_id):
+        normalized_draft_id = str(draft_id or "").strip()
+        with self._admin_status_lock:
+            draft = self._prepared_broadcast_draft
+            if draft is None or draft["id"] != normalized_draft_id:
+                raise RuntimeError(
+                    "AI配信案が見つからないか更新されています。"
+                    "「AIで配信案を作成」をもう一度押してください。"
+                )
+            self._selected_broadcast_plan = draft
+            return draft["instruction"]
+
+    def clear_selected_broadcast_plan(self):
+        with self._admin_status_lock:
+            self._selected_broadcast_plan = None
+
+    def consume_selected_broadcast_plan(self):
+        with self._admin_status_lock:
+            selected = self._selected_broadcast_plan
+            self._selected_broadcast_plan = None
+        return selected
 
     def get_admin_status(self):
         with self._admin_status_lock:
@@ -434,13 +545,20 @@ class ExternalControlRuntime:
 
     def get_obs_overlay_status(self):
         subtitle_clients = self.subtitle_event_broker.subscriber_count()
+        topic_clients = self.topic_event_broker.subscriber_count()
         chat_clients = self.chat_event_broker.subscriber_count()
         return {
             "subtitle_connected": subtitle_clients > 0,
+            "topic_connected": topic_clients > 0,
             "chat_connected": chat_clients > 0,
             "subtitle_clients": subtitle_clients,
+            "topic_clients": topic_clients,
             "chat_clients": chat_clients,
-            "ready": subtitle_clients > 0 and chat_clients > 0,
+            "ready": (
+                subtitle_clients > 0
+                and topic_clients > 0
+                and chat_clients > 0
+            ),
         }
 
     def wait_for_obs_overlays(self, timeout_seconds, poll_seconds=0.25):
@@ -503,6 +621,45 @@ class ExternalControlRuntime:
             message_id,
             state,
             duration_ms,
+        )
+
+    def publish_topic_card(self, card):
+        # 記事由来のHTMLは渡さず、OBS側でtextContentとして表示する公開情報だけに絞ります。
+        if not isinstance(card, dict):
+            raise ValueError("話題カードはJSONオブジェクトで指定してください。")
+        kind = str(card.get("kind", "")).strip()
+        if kind not in {"news", "talk"}:
+            raise ValueError(f"未対応の話題カード種別です。kind={kind}")
+        source_name = " ".join(
+            str(card.get("source_name", "")).split()
+        )[:100]
+        title = _remove_news_source_suffix(
+            " ".join(str(card.get("title", "")).split()),
+            source_name,
+        )[:120]
+        summary = " ".join(str(card.get("summary", "")).split())[:180]
+        if not title:
+            raise ValueError("話題カードのタイトルが空です。")
+        command = {
+            "type": "topic_card",
+            "id": uuid.uuid4().hex,
+            "kind": kind,
+            "title": title,
+            "summary": summary,
+        }
+        if kind == "news":
+            command["source_name"] = source_name
+            command["published_at"] = " ".join(
+                str(card.get("published_at", "")).split()
+            )[:100]
+            command["information_status"] = str(
+                card.get("information_status", "single_report")
+            ).strip()
+        return self.topic_event_broker.publish(command)
+
+    def clear_topic_card(self):
+        return self.topic_event_broker.publish(
+            {"type": "clear_topic_card", "id": uuid.uuid4().hex}
         )
 
     def prepare_speech(self, text, emotion="neutral", speech_style="normal"):
@@ -606,6 +763,7 @@ class ExternalControlRuntime:
         self.subtitle_event_broker.publish(
             {"type": "clear", "id": command["id"]}
         )
+        self.clear_topic_card()
         return command, delivered_count
 
 
@@ -644,11 +802,17 @@ class ExternalControlRequestHandler(BaseHTTPRequestHandler):
         if path == "/subtitle-events":
             self._serve_events(self.runtime.subtitle_event_broker)
             return
+        if path == "/topic-events":
+            self._serve_events(self.runtime.topic_event_broker)
+            return
         if path == "/chat-events":
             self._serve_events(self.runtime.chat_event_broker)
             return
         if path in {"/overlay", "/overlay/"}:
             self._serve_subtitle_overlay()
+            return
+        if path in {"/topic-overlay", "/topic-overlay/"}:
+            self._serve_topic_overlay()
             return
         if path in {"/chat-overlay", "/chat-overlay/"}:
             self._serve_chat_overlay()
@@ -674,6 +838,9 @@ class ExternalControlRequestHandler(BaseHTTPRequestHandler):
                     "sse_clients": self.runtime.event_broker.subscriber_count(),
                     "subtitle_sse_clients": (
                         self.runtime.subtitle_event_broker.subscriber_count()
+                    ),
+                    "topic_sse_clients": (
+                        self.runtime.topic_event_broker.subscriber_count()
                     ),
                     "chat_sse_clients": (
                         self.runtime.chat_event_broker.subscriber_count()
@@ -751,6 +918,24 @@ class ExternalControlRequestHandler(BaseHTTPRequestHandler):
             self._send_json(
                 500,
                 {"error": "字幕オーバーレイのHTMLを読み込めませんでした。"},
+            )
+            return
+
+        self.send_response(200)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(payload)))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        self.wfile.write(payload)
+
+    def _serve_topic_overlay(self):
+        try:
+            payload = TOPIC_OVERLAY_PATH.read_bytes()
+        except OSError as exc:
+            print(f"話題カードオーバーレイを読み込めませんでした: {exc}")
+            self._send_json(
+                500,
+                {"error": "話題カードオーバーレイのHTMLを読み込めませんでした。"},
             )
             return
 

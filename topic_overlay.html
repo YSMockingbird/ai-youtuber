@@ -1,0 +1,228 @@
+<!doctype html>
+<html lang="ja">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>AI YouTuber Topic Overlay</title>
+    <style>
+      :root {
+        color-scheme: dark;
+        font-family:
+          "Hiragino Sans", "Yu Gothic", "Meiryo", system-ui, sans-serif;
+      }
+
+      * {
+        box-sizing: border-box;
+      }
+
+      html,
+      body {
+        width: 100%;
+        height: 100%;
+        margin: 0;
+        overflow: hidden;
+        background: transparent;
+      }
+
+      body {
+        display: flex;
+        align-items: flex-start;
+        justify-content: flex-end;
+        padding: 8px;
+      }
+
+      .topic-card {
+        /* OBSソースが横長でも、カード本文まで横へ引き伸ばさないようにします。 */
+        width: min(100%, 520px);
+        padding: 14px 18px 16px;
+        border: 1px solid rgba(255, 255, 255, 0.72);
+        border-left: 6px solid #88e0d0;
+        border-radius: 8px;
+        background: rgba(8, 12, 20, 0.82);
+        color: #ffffff;
+        text-align: left;
+        text-shadow: 0 2px 3px rgba(0, 0, 0, 0.95);
+      }
+
+      .topic-card[data-kind="talk"] {
+        border-left-color: #ffd166;
+      }
+
+      .topic-label {
+        color: #88e0d0;
+        font-size: clamp(14px, 5vh, 22px);
+        font-weight: 800;
+        letter-spacing: 0.12em;
+      }
+
+      .topic-card[data-kind="talk"] .topic-label {
+        color: #ffd166;
+      }
+
+      .topic-title,
+      .topic-summary {
+        display: -webkit-box;
+        overflow: hidden;
+        overflow-wrap: anywhere;
+        -webkit-box-orient: vertical;
+      }
+
+      .topic-title {
+        margin-top: 5px;
+        font-size: clamp(20px, 7.2vh, 34px);
+        font-weight: 800;
+        line-height: 1.35;
+        -webkit-line-clamp: 3;
+      }
+
+      .topic-summary {
+        margin-top: 8px;
+        color: rgba(255, 255, 255, 0.92);
+        font-size: clamp(16px, 5.5vh, 26px);
+        font-weight: 600;
+        line-height: 1.45;
+        -webkit-line-clamp: 3;
+      }
+
+      .topic-meta {
+        margin-top: 8px;
+        color: rgba(255, 255, 255, 0.72);
+        font-size: clamp(12px, 4.2vh, 19px);
+        line-height: 1.4;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+      }
+
+      /* 2倍解像度の縦長ソースでは、縮小後も同じ見た目になるよう全寸法を2倍にします。 */
+      @media (min-width: 1000px) and (max-aspect-ratio: 4 / 3) {
+        body {
+          padding: 16px;
+        }
+
+        .topic-card {
+          width: min(100%, 1040px);
+          padding: 28px 36px 32px;
+          border-width: 2px;
+          border-left-width: 12px;
+          border-radius: 16px;
+        }
+
+        .topic-label {
+          font-size: 44px;
+        }
+
+        .topic-title {
+          margin-top: 10px;
+          font-size: 68px;
+        }
+
+        .topic-summary {
+          margin-top: 16px;
+          font-size: 52px;
+        }
+
+        .topic-meta {
+          margin-top: 16px;
+          font-size: 38px;
+        }
+      }
+    </style>
+  </head>
+  <body>
+    <section id="topicCard" class="topic-card" aria-live="polite" hidden>
+      <div id="topicLabel" class="topic-label"></div>
+      <div id="topicTitle" class="topic-title"></div>
+      <div id="topicSummary" class="topic-summary"></div>
+      <div id="topicMeta" class="topic-meta"></div>
+    </section>
+    <script>
+      const topicCard = document.getElementById('topicCard');
+      const topicLabel = document.getElementById('topicLabel');
+      const topicTitle = document.getElementById('topicTitle');
+      const topicSummary = document.getElementById('topicSummary');
+      const topicMeta = document.getElementById('topicMeta');
+      // ローカルファイルとしてOBSへ読み込んでも、Python起動後に自動接続します。
+      const topicEvents = new EventSource('http://127.0.0.1:8765/topic-events');
+
+      function hideTopicCard() {
+        topicCard.hidden = true;
+        topicLabel.textContent = '';
+        topicTitle.textContent = '';
+        topicSummary.textContent = '';
+        topicMeta.textContent = '';
+        delete topicCard.dataset.kind;
+      }
+
+      function formatPublishedAt(value) {
+        if (!value) return '';
+        const parsed = new Date(value);
+        if (Number.isNaN(parsed.getTime())) return value;
+        return new Intl.DateTimeFormat('ja-JP', {
+          timeZone: 'Asia/Tokyo',
+          month: 'numeric',
+          day: 'numeric',
+          hour: '2-digit',
+          minute: '2-digit',
+        }).format(parsed);
+      }
+
+      function showTopicCard(command) {
+        const kind = command.kind === 'news' ? 'news' : 'talk';
+        const statusLabels = {
+          official_basis: '公式情報ベース',
+          multiple_reports: '複数媒体で報道',
+          unverified: '未確認情報',
+          single_report: '記事情報',
+        };
+        topicCard.dataset.kind = kind;
+        topicLabel.textContent = kind === 'news' ? 'NEWS' : 'TALK';
+        topicTitle.textContent = command.title || '';
+        topicSummary.textContent = command.summary || '';
+        topicSummary.hidden = !command.summary;
+        if (kind === 'news') {
+          const source = command.source_name ? `出典：${command.source_name}` : '';
+          const status = statusLabels[command.information_status] || '記事情報';
+          const publishedAt = formatPublishedAt(command.published_at);
+          topicMeta.textContent = [source, status, publishedAt].filter(Boolean).join(' ／ ');
+          topicMeta.hidden = false;
+        } else {
+          topicMeta.textContent = '';
+          topicMeta.hidden = true;
+        }
+        topicCard.hidden = false;
+      }
+
+      topicEvents.onopen = () => {
+        window.parent.postMessage(
+          {type: 'ai-youtuber-overlay-status', overlay: 'topic', connected: true},
+          '*',
+        );
+      };
+
+      topicEvents.onmessage = (event) => {
+        try {
+          const command = JSON.parse(event.data);
+          if (command.type === 'clear_topic_card') {
+            hideTopicCard();
+            return;
+          }
+          if (command.type !== 'topic_card' || typeof command.title !== 'string') {
+            throw new Error('未対応の話題カードコマンドです。');
+          }
+          showTopicCard(command);
+        } catch (error) {
+          console.error('話題カードを処理できませんでした:', error);
+        }
+      };
+
+      topicEvents.onerror = () => {
+        console.error('話題カードサーバーとの接続が切れました。再接続を待機します。');
+        window.parent.postMessage(
+          {type: 'ai-youtuber-overlay-status', overlay: 'topic', connected: false},
+          '*',
+        );
+      };
+    </script>
+  </body>
+</html>

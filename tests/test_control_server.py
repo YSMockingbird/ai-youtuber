@@ -6,6 +6,7 @@ import unittest
 import urllib.request
 import wave
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import Mock
 
 from character_memory import CharacterMemoryRepository
@@ -13,6 +14,8 @@ from control_server import (
     AudioStore,
     ExternalControlHttpServer,
     ExternalControlRuntime,
+    SUBTITLE_OVERLAY_PATH,
+    TOPIC_OVERLAY_PATH,
     get_wav_duration_ms,
     normalize_motion_command,
 )
@@ -68,7 +71,7 @@ class WavDurationTest(unittest.TestCase):
 
 
 class ExternalControlRuntimeTest(unittest.TestCase):
-    def test_obs_overlay_status_requires_subtitle_and_chat(self):
+    def test_obs_overlay_status_requires_subtitle_topic_and_chat(self):
         runtime = ExternalControlRuntime(
             aivis_client=FakeAivisSpeechClient(),
             speaker_id=101,
@@ -78,11 +81,51 @@ class ExternalControlRuntimeTest(unittest.TestCase):
         self.assertFalse(runtime.get_obs_overlay_status()["ready"])
         runtime.subtitle_event_broker.subscribe()
         self.assertFalse(runtime.get_obs_overlay_status()["ready"])
+        runtime.topic_event_broker.subscribe()
+        self.assertFalse(runtime.get_obs_overlay_status()["ready"])
         runtime.chat_event_broker.subscribe()
 
         status = runtime.get_obs_overlay_status()
         self.assertTrue(status["ready"])
+        self.assertTrue(status["topic_connected"])
         self.assertTrue(runtime.wait_for_obs_overlays(0.1))
+
+    def test_topic_card_is_sanitized_and_replayed_after_reconnect(self):
+        runtime = ExternalControlRuntime(
+            aivis_client=FakeAivisSpeechClient(),
+            speaker_id=101,
+            public_base_url="http://127.0.0.1:8765",
+        )
+
+        runtime.publish_topic_card(
+            {
+                "kind": "news",
+                "title": "  VTuber事務所が   新企画を発表 - テストニュース  ",
+                "summary": "新企画の内容と開始時期が公開された。",
+                "source_name": "テストニュース",
+                "published_at": "2026-08-13",
+                "information_status": "official_basis",
+            }
+        )
+        subscriber = runtime.topic_event_broker.subscribe()
+        command = subscriber.get_nowait()
+
+        self.assertEqual(command["type"], "topic_card")
+        self.assertEqual(command["title"], "VTuber事務所が 新企画を発表")
+        self.assertEqual(command["summary"], "新企画の内容と開始時期が公開された。")
+        self.assertEqual(command["source_name"], "テストニュース")
+
+    def test_subtitle_and_topic_overlays_are_separate_files(self):
+        subtitle_html = SUBTITLE_OVERLAY_PATH.read_text(encoding="utf-8")
+        topic_html = TOPIC_OVERLAY_PATH.read_text(encoding="utf-8")
+
+        self.assertNotIn("topic-events", subtitle_html)
+        self.assertNotIn("topicCard", subtitle_html)
+        self.assertIn("topic-events", topic_html)
+        self.assertIn("topicCard", topic_html)
+        self.assertNotIn("現在のトークテーマ", topic_html)
+        self.assertIn("width: min(100%, 520px)", topic_html)
+        self.assertIn("max-aspect-ratio: 4 / 3", topic_html)
 
     def test_obs_overlay_wait_can_be_disabled_for_non_obs_use(self):
         runtime = ExternalControlRuntime(
@@ -154,6 +197,95 @@ class ExternalControlRuntimeTest(unittest.TestCase):
         )
 
         self.assertEqual(accepted["action"], "end_broadcast")
+
+    def test_start_broadcast_command_is_queued(self):
+        runtime = ExternalControlRuntime(
+            aivis_client=FakeAivisSpeechClient(),
+            speaker_id=101,
+            public_base_url="http://127.0.0.1:8765",
+        )
+
+        accepted = runtime.enqueue_admin_command(
+            {"action": "start_broadcast"}
+        )
+
+        self.assertEqual(accepted["action"], "start_broadcast")
+
+    def test_configure_broadcast_command_is_validated_and_queued(self):
+        runtime = ExternalControlRuntime(
+            aivis_client=FakeAivisSpeechClient(),
+            speaker_id=101,
+            public_base_url="http://127.0.0.1:8765",
+        )
+
+        accepted = runtime.enqueue_admin_command(
+            {
+                "action": "configure_broadcast",
+                "title": "自己紹介ライブ",
+                "description": "AI VTuberのテスト配信です。",
+                "privacy_status": "unlisted",
+                "stream_plan": "初見向けの自己紹介配信",
+            }
+        )
+
+        self.assertEqual(accepted["title"], "自己紹介ライブ")
+        self.assertEqual(accepted["privacy_status"], "unlisted")
+
+    def test_prepare_broadcast_allows_empty_instruction(self):
+        runtime = ExternalControlRuntime(
+            aivis_client=FakeAivisSpeechClient(),
+            speaker_id=101,
+            public_base_url="http://127.0.0.1:8765",
+        )
+
+        accepted = runtime.enqueue_admin_command(
+            {"action": "prepare_broadcast", "stream_plan": ""}
+        )
+
+        self.assertEqual(accepted["action"], "prepare_broadcast")
+        self.assertEqual(accepted["stream_plan"], "")
+
+    def test_prepared_broadcast_plan_is_selected_by_draft_id(self):
+        runtime = ExternalControlRuntime(
+            aivis_client=FakeAivisSpeechClient(),
+            speaker_id=101,
+            public_base_url="http://127.0.0.1:8765",
+        )
+        plan = SimpleNamespace(
+            youtube_title="自己紹介をするAI VTuber雑談配信",
+            youtube_description="AI VTuberの才羽ガン奈が、仕組みや趣味を自己紹介します。",
+            theme="自己紹介配信",
+            segments=[SimpleNamespace(title="どんなAIか")],
+            news_policy="off",
+            news_query=None,
+        )
+
+        public_draft = runtime.store_prepared_broadcast_draft(
+            plan,
+            "初見向けの自己紹介配信",
+            "draft-1",
+        )
+        instruction = runtime.select_prepared_broadcast_plan("draft-1")
+        selected = runtime.consume_selected_broadcast_plan()
+
+        self.assertEqual(public_draft["title"], plan.youtube_title)
+        self.assertEqual(
+            runtime.get_admin_status()["broadcast_draft"],
+            public_draft,
+        )
+        self.assertEqual(instruction, "初見向けの自己紹介配信")
+        self.assertIs(selected["plan"], plan)
+        self.assertIsNone(runtime.consume_selected_broadcast_plan())
+
+    def test_outdated_broadcast_draft_is_rejected(self):
+        runtime = ExternalControlRuntime(
+            aivis_client=FakeAivisSpeechClient(),
+            speaker_id=101,
+            public_base_url="http://127.0.0.1:8765",
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "AI配信案が見つからない"):
+            runtime.select_prepared_broadcast_plan("outdated-draft")
 
     def test_stream_plan_command_is_validated_and_queued(self):
         runtime = ExternalControlRuntime(
@@ -580,6 +712,17 @@ class CharacterMemoryHttpTest(unittest.TestCase):
         self.assertIn("ガン奈の記憶", html)
         self.assertEqual(len(body["memories"]), 1)
         self.assertEqual(body["memories"][0]["status"], "draft")
+
+    def test_topic_overlay_is_available_separately(self):
+        with urllib.request.urlopen(
+            f"{self.base_url}/topic-overlay",
+            timeout=3,
+        ) as response:
+            html = response.read().decode("utf-8")
+
+        self.assertIn("AI YouTuber Topic Overlay", html)
+        self.assertIn("topic-events", html)
+        self.assertNotIn("subtitle-events", html)
 
     def test_draft_can_be_approved_via_api(self):
         memory_id = self.repository.list("draft")[0]["memory_id"]

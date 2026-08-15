@@ -175,6 +175,11 @@ class ParseAiResponseTest(unittest.TestCase):
         self.assertIn("事件、事故、災害ではブラックジョーク", prompt)
         self.assertIn("誰または何がどうした記事なのか", prompt)
         self.assertIn("前提を知らない途中参加者", prompt)
+        self.assertIn("topic_summaryには", prompt)
+        self.assertEqual(
+            generate_mock.call_args.kwargs["response_model"].__name__,
+            "NewsAiResponseSchema",
+        )
         self.assertEqual(response["emotion"], "surprised")
 
     @patch("ai_response._generate_structured_response")

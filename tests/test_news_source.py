@@ -8,6 +8,7 @@ from news_source import (
     _merge_duplicate_articles,
     clear_news_cache,
     fetch_news_articles,
+    fetch_news_articles_for_query,
     get_news_feed_specs,
     parse_news_feed,
     select_news_article,
@@ -20,6 +21,17 @@ class NewsSourceTest(unittest.TestCase):
 
     def tearDown(self):
         clear_news_cache()
+
+    @patch("news_source.fetch_news_articles")
+    def test_related_news_uses_google_news_search_query(self, fetch_mock):
+        fetch_mock.return_value = []
+
+        fetch_news_articles_for_query("生成AI 最新発表", now=100)
+
+        rss_url = fetch_mock.call_args.kwargs["rss_url"]
+        self.assertIn("news.google.com/rss/search", rss_url)
+        self.assertIn("%E7%94%9F%E6%88%90AI", rss_url)
+        self.assertEqual(fetch_mock.call_args.kwargs["now"], 100)
 
     @staticmethod
     def rss_response(title="キャッシュ対象ニュース"):

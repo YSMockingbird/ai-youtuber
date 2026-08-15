@@ -235,6 +235,17 @@ def fetch_news_articles(rss_url=None, now=None):
     return _copy_articles(merged)
 
 
+def fetch_news_articles_for_query(query, now=None):
+    # 指定配信ではGoogle News検索を絞り、無関係な一般ニュースを混ぜません。
+    normalized_query = " ".join(str(query or "").split())
+    if not 2 <= len(normalized_query) <= 50:
+        raise ValueError("ニュース検索テーマは2〜50文字にしてください。")
+    return fetch_news_articles(
+        rss_url=_google_news_search_url(normalized_query),
+        now=now,
+    )
+
+
 def _copy_articles(articles):
     return [dict(article) for article in articles]
 

@@ -1,5 +1,6 @@
 import tempfile
 import unittest
+from unittest.mock import patch
 from pathlib import Path
 
 from character import CHARACTER_PROMPT
@@ -10,6 +11,23 @@ from llm.memory import SQLiteMemoryRepository
 
 
 class ContextManagementTest(unittest.TestCase):
+    @patch(
+        "llm.context_builder.get_current_datetime_context",
+        return_value="現在: 2026-08-15(土) 22:30 Asia/Tokyo。日時は関連する場合だけ言及する。",
+    )
+    def test_current_datetime_is_added_to_current_input(self, _datetime_mock):
+        builder = ContextBuilder(
+            "短い人格設定",
+            {"context": {"total_token_budget": 500}},
+            ConversationState(4, 100),
+            memory_repository=None,
+        )
+
+        prompt = builder.build("こんばんは")
+
+        self.assertIn("2026-08-15(土) 22:30", prompt)
+        self.assertIn("日時は関連する場合だけ言及する", prompt)
+
     def test_actual_autonomous_input_fits_configured_budget(self):
         conversation = ConversationState(8, 700)
         builder = ContextBuilder(

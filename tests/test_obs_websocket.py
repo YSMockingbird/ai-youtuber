@@ -79,6 +79,38 @@ class ObsWebSocketClientTest(unittest.TestCase):
             ["GetStreamStatus", "StopStream"],
         )
 
+    @patch("obs_websocket.uuid.uuid4")
+    def test_inactive_stream_is_started(self, uuid_mock):
+        uuid_mock.return_value.hex = "request-id"
+        websocket = FakeWebSocket(
+            [
+                {
+                    "op": 7,
+                    "d": {
+                        "requestId": "request-id",
+                        "requestStatus": {"result": True, "code": 100},
+                        "responseData": {"outputActive": False},
+                    },
+                },
+                {
+                    "op": 7,
+                    "d": {
+                        "requestId": "request-id",
+                        "requestStatus": {"result": True, "code": 100},
+                        "responseData": {},
+                    },
+                },
+            ]
+        )
+        client = ObsWebSocketClient("127.0.0.1", 4455, "secret")
+        client._connect = lambda: websocket
+
+        self.assertTrue(client.start_stream())
+        self.assertEqual(
+            [message["d"]["requestType"] for message in websocket.sent],
+            ["GetStreamStatus", "StartStream"],
+        )
+
     def test_remote_host_is_rejected(self):
         with self.assertRaisesRegex(ValueError, "ローカルMac"):
             ObsWebSocketClient("192.0.2.1", 4455, "secret")

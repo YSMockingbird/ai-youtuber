@@ -70,16 +70,24 @@ class AutonomousTopicSelector:
 
         self.rng = rng or random.Random()
 
-    def select(self, previous_topic=None):
+    def select(self, previous_topic=None, allow_news=True):
         # 直前と同じ種類を除外し、規則的すぎない重み付き抽選にします。
         candidates = [
             topic
             for topic, weight in self.weights.items()
-            if weight > 0 and topic != previous_topic
+            if weight > 0
+            and topic != previous_topic
+            and (allow_news or topic != "news")
         ]
         if not candidates:
             candidates = [
-                topic for topic, weight in self.weights.items() if weight > 0
+                topic
+                for topic, weight in self.weights.items()
+                if weight > 0 and (allow_news or topic != "news")
             ]
+        if not candidates:
+            raise RuntimeError(
+                "ニュースを除外すると選択可能な自発発話の種類がありません。"
+            )
         weights = [self.weights[topic] for topic in candidates]
         return self.rng.choices(candidates, weights=weights, k=1)[0]

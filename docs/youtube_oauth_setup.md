@@ -1,6 +1,6 @@
 # YouTube OAuth設定メモ
 
-最終確認日: 2026-08-12
+最終確認日: 2026-08-13
 
 この文書は、YouTube Liveの配信IDを自動取得するために行った設定と、
 再設定が必要になった場合の手順を記録するものです。
@@ -16,14 +16,14 @@ Python
 YouTubeコメント監視
 ```
 
-現在のOAuthは「配信を操作する権限」ではなく、配信情報を読み取るために使っています。
+現在のOAuthは、配信情報の読み取りに加えて配信枠の作成・開始・終了にも使います。
 
 | 項目 | 現在の設定 |
 |---|---|
 | Google CloudプロジェクトID | `ai-youtube-505107` |
 | 有効化したAPI | YouTube Data API v3 |
 | OAuthクライアント種類 | デスクトップアプリ（installed application） |
-| OAuthスコープ | `https://www.googleapis.com/auth/youtube.readonly` |
+| OAuthスコープ | `https://www.googleapis.com/auth/youtube` |
 | リダイレクト先 | `http://localhost`（実行時に空きポートを自動使用） |
 | OAuthクライアントJSON | `.secrets/youtube_oauth_client.json` |
 | 保存済みOAuthトークン | `.secrets/youtube_oauth_token.json` |
@@ -39,7 +39,7 @@ Google Cloud Consoleの「Google Auth Platform」で確認してください。
 1. Google Cloudプロジェクト`ai-youtube-505107`を作成した。
 2. YouTube Data API v3を有効にした。
 3. Google Auth Platformのブランディング、対象、データアクセスを設定した。
-4. データアクセスへYouTube Data API v3の`youtube.readonly`を追加した。
+4. データアクセスへYouTube Data API v3の`youtube`を追加した。
 5. OAuthクライアントを「デスクトップアプリ」として作成した。
 6. ダウンロードしたJSONを次の名前で配置した。
 
@@ -66,12 +66,16 @@ YOUTUBE_API_KEY=Google Cloudで発行したAPIキー
 YOUTUBE_VIDEO_ID=
 YOUTUBE_OAUTH_CLIENT_FILE=.secrets/youtube_oauth_client.json
 YOUTUBE_OAUTH_TOKEN_FILE=.secrets/youtube_oauth_token.json
+YOUTUBE_STREAM_ID=
 ```
 
 `YOUTUBE_VIDEO_ID`が空欄の場合、認証したチャンネルが所有する配信を取得し、
 Python側で`status.lifeCycleStatus == "live"`の配信だけを選びます。
 
 `YOUTUBE_VIDEO_ID`へ値を設定した場合は、OAuthによる自動取得より手動IDを優先します。
+
+再利用可能な配信ストリームが複数ある場合だけ、`YOUTUBE_STREAM_ID`へ使用する
+ストリームIDを指定します。一件だけの場合は空欄のままで自動選択できます。
 
 ## 通常の起動
 
@@ -118,25 +122,16 @@ OAuthクライアントJSONとYouTube APIキーは、通常はそのまま利用
 ブラウザで再認証します。長期無人運転へ進む前に、公開ステータスとGoogleの要件を
 改めて確認します。
 
-## 将来、配信開始・終了も自動化する場合
+## 現在の配信開始・終了方式
 
-現在の`youtube.readonly`では、YouTube配信の開始・終了や配信枠の作成はできません。
-実装時には次のどちらかを選びます。
+- PythonからOBS WebSocketで映像送信を開始・停止する
+- 管理画面から常設配信のタイトル・説明・公開設定を更新する
+- OBS映像の送信開始により、常設配信の自動スタートでライブを開始する
+- 配信終了時は動画IDをAPIで`complete`へ移行してからOBSとPythonを停止する
 
-### OBS開始・停止とYouTube自動スタート／ストップを使う
-
-- PythonからOBS WebSocketで配信を開始・停止する
-- YouTube Studioの自動スタート／自動ストップを利用する
-- OBS WebSocketの認証設定を最初に一度行う
-
-### YouTube APIから配信状態も操作する
-
-- OAuthスコープを`youtube`または`youtube.force-ssl`へ変更する
-- 既存トークンには追加権限がないため、一度だけ再認証する
-- 配信枠の作成、ストリームとの関連付け、`live`への遷移、`complete`への遷移を実装する
-
-どちらの場合も、LLMから直接終了APIを呼ばず、Python側で最低配信時間、未処理コメント、
-終了挨拶と音声再生完了を確認してから停止します。
+現在の「S のライブ配信」は常設配信です。常設配信の自動スタート設定は変更できず、
+YouTube Studioにも切り替え項目は表示されません。新しい配信枠は別途作成せず、
+この常設配信を更新して再利用します。
 
 ## セキュリティ
 

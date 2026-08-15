@@ -14,12 +14,15 @@ from main import (
     run_ai_youtuber_loop,
     run_mock_live,
     run_obs_websocket_test,
+    start_obs_for_upcoming_youtube_broadcast,
     run_x_post,
     run_x_post_draft,
     wait_for_youtube_live,
+    wait_for_youtube_stream_active,
     YouTubeBroadcastEndCoordinator,
 )
 from youtube_chat import YouTubeLiveEndedError, YouTubeLiveNotStartedError
+from youtube_oauth import NoUpcomingYouTubeBroadcastError
 
 
 class ReplyCandidateTest(unittest.TestCase):
@@ -60,6 +63,143 @@ class ObsOverlayWaitConfigTest(unittest.TestCase):
 
 
 class YouTubeLiveWaitTest(unittest.TestCase):
+    def test_waits_until_youtube_receives_obs_stream(self):
+        status_checker = Mock(side_effect=[False, False, True])
+        sleep_callback = Mock()
+        times = iter([0, 0, 2, 4])
+
+        wait_for_youtube_stream_active(
+            "stream-id",
+            timeout_seconds=10,
+            interval_seconds=2,
+            status_checker=status_checker,
+            sleep_callback=sleep_callback,
+            now=lambda: next(times),
+        )
+
+        self.assertEqual(status_checker.call_count, 3)
+        self.assertEqual(sleep_callback.call_count, 2)
+
+    @patch("youtube_oauth.transition_youtube_broadcast_to_live")
+    @patch("main.wait_for_youtube_stream_active")
+    @patch("youtube_oauth.find_upcoming_youtube_broadcast")
+    def test_obs_start_transitions_broadcast_when_auto_start_is_off(
+        self,
+        find_upcoming_mock,
+        wait_stream_mock,
+        transition_mock,
+    ):
+        find_upcoming_mock.return_value = {
+            "video_id": "video-id",
+            "title": "限定公開テスト",
+            "privacy_status": "unlisted",
+            "enable_auto_start": False,
+            "bound_stream_id": "stream-id",
+        }
+        obs_client = Mock()
+        obs_client.start_stream.return_value = True
+
+        result = start_obs_for_upcoming_youtube_broadcast(
+            Mock(),
+            obs_client,
+        )
+
+        self.assertEqual(result, ("video-id", None))
+        obs_client.start_stream.assert_called_once_with()
+        wait_stream_mock.assert_called_once_with("stream-id")
+        transition_mock.assert_called_once_with("video-id")
+
+    @patch("youtube_oauth.transition_youtube_broadcast_to_live")
+    @patch("main.wait_for_youtube_stream_active")
+    @patch("youtube_oauth.create_youtube_broadcast")
+    @patch("youtube_oauth.find_upcoming_youtube_broadcast")
+    def test_configure_creates_broadcast_when_no_ready_slot_exists(
+        self,
+        find_upcoming_mock,
+        create_broadcast_mock,
+        wait_stream_mock,
+        transition_mock,
+    ):
+        find_upcoming_mock.side_effect = NoUpcomingYouTubeBroadcastError(
+            "配信枠なし"
+        )
+        create_broadcast_mock.return_value = {
+            "video_id": "created-video",
+            "title": "AIの自己紹介配信",
+            "description": "AI VTuberが自己紹介します。",
+            "privacy_status": "unlisted",
+            "bound_stream_id": "stream-id",
+            "enable_auto_start": False,
+            "enable_auto_stop": True,
+        }
+        runtime = Mock()
+        runtime.select_prepared_broadcast_plan.return_value = (
+            "初見向けの自己紹介配信"
+        )
+        obs_client = Mock()
+        obs_client.start_stream.return_value = True
+        command = {
+            "action": "configure_broadcast",
+            "title": "AIの自己紹介配信",
+            "description": "AI VTuberが自己紹介します。",
+            "privacy_status": "unlisted",
+            "stream_plan": "初見向けの自己紹介配信",
+            "draft_id": "draft-1",
+        }
+
+        result = start_obs_for_upcoming_youtube_broadcast(
+            runtime,
+            obs_client,
+            command=command,
+        )
+
+        self.assertEqual(
+            result,
+            ("created-video", "初見向けの自己紹介配信"),
+        )
+        create_broadcast_mock.assert_called_once_with(
+            title="AIの自己紹介配信",
+            description="AI VTuberが自己紹介します。",
+            privacy_status="unlisted",
+        )
+        wait_stream_mock.assert_called_once_with("stream-id")
+        transition_mock.assert_called_once_with("created-video")
+
+    @patch("youtube_oauth.find_upcoming_youtube_broadcast")
+    @patch("main.get_live_chat_id")
+    def test_admin_command_starts_obs_and_waits_for_expected_youtube_live(
+        self,
+        get_chat_id,
+        find_upcoming_mock,
+    ):
+        get_chat_id.side_effect = [
+            YouTubeLiveNotStartedError("まだ開始前"),
+            ("live-chat-id", "video-id"),
+        ]
+        find_upcoming_mock.return_value = {
+            "video_id": "video-id",
+            "title": "限定公開テスト",
+            "privacy_status": "unlisted",
+            "enable_auto_start": True,
+        }
+        runtime = Mock()
+        runtime.get_next_admin_command.return_value = {
+            "action": "start_broadcast"
+        }
+        obs_client = Mock()
+        obs_client.start_stream.return_value = True
+
+        result = wait_for_youtube_live(
+            runtime,
+            obs_websocket_client=obs_client,
+        )
+
+        self.assertEqual(result, ("live-chat-id", "video-id", None))
+        obs_client.start_stream.assert_called_once_with()
+        runtime.get_next_admin_command.assert_called_once_with(
+            timeout_seconds=10
+        )
+
     @patch.dict(
         "os.environ",
         {
@@ -82,7 +222,7 @@ class YouTubeLiveWaitTest(unittest.TestCase):
 
         result = wait_for_youtube_live(runtime)
 
-        self.assertEqual(result, ("live-chat-id", "video-id"))
+        self.assertEqual(result, ("live-chat-id", "video-id", None))
         self.assertEqual(sleep_mock.call_count, 2)
         runtime.update_admin_status.assert_called_with(
             phase="preparing",
@@ -99,6 +239,146 @@ class YouTubeLiveWaitTest(unittest.TestCase):
             wait_for_youtube_live(Mock())
 
         sleep_mock.assert_not_called()
+
+    @patch("youtube_oauth.update_youtube_broadcast_metadata")
+    @patch("youtube_oauth.find_upcoming_youtube_broadcast")
+    @patch("main.get_live_chat_id")
+    def test_admin_can_configure_persistent_broadcast_and_apply_stream_plan(
+        self,
+        get_chat_id,
+        find_upcoming_mock,
+        update_metadata_mock,
+    ):
+        get_chat_id.side_effect = [
+            YouTubeLiveNotStartedError("まだ開始前"),
+            ("live-chat-id", "persistent-video"),
+        ]
+        find_upcoming_mock.return_value = {
+            "video_id": "persistent-video",
+            "title": "S のライブ配信",
+            "privacy_status": "unlisted",
+            "enable_auto_start": True,
+        }
+        update_metadata_mock.return_value = {
+            "video_id": "persistent-video",
+            "title": "自己紹介ライブ",
+            "description": "テスト説明",
+            "privacy_status": "unlisted",
+        }
+        runtime = Mock()
+        runtime.get_next_admin_command.return_value = {
+            "action": "configure_broadcast",
+            "title": "自己紹介ライブ",
+            "description": "テスト説明",
+            "privacy_status": "unlisted",
+            "stream_plan": "初見向けの自己紹介配信",
+        }
+        obs_client = Mock()
+        obs_client.start_stream.return_value = True
+
+        result = wait_for_youtube_live(
+            runtime,
+            obs_websocket_client=obs_client,
+        )
+
+        self.assertEqual(
+            result,
+            (
+                "live-chat-id",
+                "persistent-video",
+                "初見向けの自己紹介配信",
+            ),
+        )
+        update_metadata_mock.assert_called_once_with(
+            video_id="persistent-video",
+            title="自己紹介ライブ",
+            description="テスト説明",
+            privacy_status="unlisted",
+        )
+        obs_client.start_stream.assert_called_once_with()
+
+    @patch("stream_theme.generate_stream_theme_plan")
+    @patch("youtube_oauth.update_youtube_broadcast_metadata")
+    @patch("youtube_oauth.find_upcoming_youtube_broadcast")
+    @patch("main.get_live_chat_id")
+    def test_admin_prepares_then_starts_with_same_broadcast_plan(
+        self,
+        get_chat_id,
+        find_upcoming_mock,
+        update_metadata_mock,
+        generate_plan_mock,
+    ):
+        get_chat_id.side_effect = [
+            YouTubeLiveNotStartedError("まだ開始前"),
+            YouTubeLiveNotStartedError("まだ開始前"),
+            ("live-chat-id", "persistent-video"),
+        ]
+        find_upcoming_mock.return_value = {
+            "video_id": "persistent-video",
+            "title": "S のライブ配信",
+            "privacy_status": "unlisted",
+            "enable_auto_start": True,
+        }
+        update_metadata_mock.return_value = {
+            "video_id": "persistent-video",
+            "title": "AIの自己紹介配信",
+            "description": "AI VTuberが自己紹介します。",
+            "privacy_status": "unlisted",
+        }
+        plan = Mock()
+        generate_plan_mock.return_value = plan
+        runtime = Mock()
+        runtime.get_next_admin_command.side_effect = [
+            {
+                "action": "prepare_broadcast",
+                "id": "draft-1",
+                "stream_plan": "初見向けの自己紹介配信",
+            },
+            {
+                "action": "configure_broadcast",
+                "title": "AIの自己紹介配信",
+                "description": "AI VTuberが自己紹介します。",
+                "privacy_status": "unlisted",
+                "stream_plan": "初見向けの自己紹介配信",
+                "draft_id": "draft-1",
+            },
+        ]
+        runtime.store_prepared_broadcast_draft.return_value = {
+            "title": "AIの自己紹介配信",
+            "theme": "自己紹介配信",
+            "news_description": "使用しない",
+        }
+        runtime.select_prepared_broadcast_plan.return_value = (
+            "初見向けの自己紹介配信"
+        )
+        obs_client = Mock()
+        obs_client.start_stream.return_value = True
+
+        result = wait_for_youtube_live(
+            runtime,
+            obs_websocket_client=obs_client,
+        )
+
+        self.assertEqual(
+            result,
+            (
+                "live-chat-id",
+                "persistent-video",
+                "初見向けの自己紹介配信",
+            ),
+        )
+        generate_plan_mock.assert_called_once_with(
+            instruction="初見向けの自己紹介配信"
+        )
+        runtime.store_prepared_broadcast_draft.assert_called_once_with(
+            plan,
+            "初見向けの自己紹介配信",
+            "draft-1",
+        )
+        runtime.select_prepared_broadcast_plan.assert_called_once_with(
+            "draft-1"
+        )
+        obs_client.start_stream.assert_called_once_with()
 
 
 class XPostDraftCommandTest(unittest.TestCase):

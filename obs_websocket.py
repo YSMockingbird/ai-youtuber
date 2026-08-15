@@ -68,6 +68,14 @@ class ObsWebSocketClient:
             self._request(websocket, "StopStream")
         return True
 
+    def start_stream(self):
+        with self._connect() as websocket:
+            status = self._request(websocket, "GetStreamStatus")
+            if status.get("outputActive", False):
+                return False
+            self._request(websocket, "StartStream")
+        return True
+
     def _connect(self):
         try:
             websocket = connect(

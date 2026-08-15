@@ -163,6 +163,9 @@ class AutonomousSpeechBufferTest(unittest.TestCase):
         )
         self.assertEqual(buffer.next_speech_at, 118)
         self.assertEqual(self.runtime.prepare_speech.call_count, 2)
+        topic_card = self.runtime.publish_topic_card.call_args.args[0]
+        self.assertEqual(topic_card["kind"], "talk")
+        self.assertEqual(topic_card["title"], "インターネットと集中力")
 
     @patch("autonomous_buffer.generate_autonomous_speech")
     def test_comment_discards_buffer_and_restarts_from_exact_audio_duration(
@@ -294,12 +297,17 @@ class AutonomousSpeechBufferTest(unittest.TestCase):
         }
         fetch_news_mock.return_value = [article]
         select_news_mock.return_value = article
-        generate_news_mock.return_value = self.ai_response
+        generate_news_mock.return_value = {
+            **self.ai_response,
+            "topic_summary": "新企画の内容と開始時期が公開された。",
+        }
         config = create_config()
         config["autonomous_speech"]["news_story_utterances"] = 3
         theme_manager = Mock()
         theme_manager.manual_theme = False
         theme_manager.program_instruction = ""
+        theme_manager.news_policy = "general"
+        theme_manager.news_query = ""
         theme_manager.build_context.return_value = "配信構成"
         theme_manager.state.main_theme = "今週の界隈ニュース"
         theme_manager.status.return_value = {}
@@ -325,6 +333,12 @@ class AutonomousSpeechBufferTest(unittest.TestCase):
         self.assertEqual(first_call.kwargs["story_turn"], 1)
         self.assertEqual(second_call.kwargs["story_turn"], 2)
         self.assertEqual(second_call.kwargs["story_turn_count"], 3)
+        topic_card = self.runtime.publish_topic_card.call_args.args[0]
+        self.assertEqual(topic_card["kind"], "news")
+        self.assertEqual(
+            topic_card["summary"],
+            "新企画の内容と開始時期が公開された。",
+        )
 
     @patch("autonomous_buffer.generate_autonomous_speech")
     def test_comment_invalidates_in_flight_preparation(self, generate_mock):

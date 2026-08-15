@@ -48,6 +48,22 @@ class AutonomousTopicSelectorTest(unittest.TestCase):
             selector.weights["observation"],
         )
 
+    def test_news_can_be_excluded_without_another_llm_decision(self):
+        selector = AutonomousTopicSelector(
+            {
+                "autonomous_speech": {
+                    "topic_weights": {
+                        "news": 10,
+                        "trivia": 1,
+                        "observation": 0,
+                        "character_thought": 0,
+                    }
+                }
+            }
+        )
+
+        self.assertEqual(selector.select(allow_news=False), "trivia")
+
     def test_unknown_topic_is_rejected_with_meaningful_error(self):
         with self.assertRaisesRegex(ValueError, "未対応の種類"):
             AutonomousTopicSelector(

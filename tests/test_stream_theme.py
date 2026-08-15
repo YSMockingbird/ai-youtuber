@@ -10,7 +10,12 @@ from stream_theme import (
 )
 
 
-def create_plan(theme="休日の過ごし方", prefix="休日"):
+def create_plan(
+    theme="休日の過ごし方",
+    prefix="休日",
+    news_policy="general",
+    news_query=None,
+):
     return StreamThemePlan(
         theme=theme,
         core_question=f"{theme}を身近な体験からどう話すか",
@@ -37,6 +42,13 @@ def create_plan(theme="休日の過ごし方", prefix="休日"):
             ),
         ],
         closing_direction="印象に残った話を一つ振り返って終える",
+        youtube_title=f"{theme}を話すAI VTuber雑談配信",
+        youtube_description=(
+            f"AI VTuberの才羽ガン奈が、{theme}について雑談します。"
+            "コメントにも反応しながら進めます。"
+        ),
+        news_policy=news_policy,
+        news_query=news_query,
     )
 
 
@@ -51,7 +63,12 @@ class StreamThemeManagerTest(unittest.TestCase):
         self.assertIn("配信企画と最初の話題が分かる", context)
 
     def test_program_instruction_is_passed_to_generator(self):
-        generator = Mock(return_value=create_plan(theme="自己紹介配信"))
+        generator = Mock(
+            return_value=create_plan(
+                theme="自己紹介配信",
+                news_policy="off",
+            )
+        )
 
         manager = StreamThemeManager(
             {},
@@ -61,6 +78,62 @@ class StreamThemeManagerTest(unittest.TestCase):
 
         generator.assert_called_once_with(None, "初見向けの自己紹介配信")
         self.assertEqual(manager.state.main_theme, "自己紹介配信")
+        self.assertEqual(manager.news_policy, "off")
+
+    def test_prepared_plan_is_reused_without_second_llm_call(self):
+        generator = Mock()
+        prepared_plan = create_plan(
+            theme="自己紹介配信",
+            news_policy="off",
+        )
+
+        manager = StreamThemeManager(
+            {},
+            program_instruction="初見向けの自己紹介配信",
+            prepared_plan=prepared_plan,
+            plan_generator=generator,
+        )
+
+        generator.assert_not_called()
+        self.assertEqual(manager.state.main_theme, "自己紹介配信")
+        self.assertEqual(manager.news_policy, "off")
+
+    def test_specific_program_rejects_general_news(self):
+        generator = Mock(
+            return_value=create_plan(
+                theme="自己紹介配信",
+                news_policy="general",
+            )
+        )
+
+        manager = StreamThemeManager(
+            {},
+            program_instruction="初見向けの自己紹介配信",
+            plan_generator=generator,
+        )
+
+        self.assertEqual(manager.news_policy, "off")
+        self.assertEqual(manager.news_query, "")
+        self.assertIn("ニュース方針：使用しない", manager.describe())
+
+    def test_related_news_keeps_search_query(self):
+        generator = Mock(
+            return_value=create_plan(
+                theme="AI業界の話",
+                news_policy="related",
+                news_query="生成AI 最新発表",
+            )
+        )
+
+        manager = StreamThemeManager(
+            {},
+            program_instruction="最近のAI業界について話す",
+            plan_generator=generator,
+        )
+
+        self.assertEqual(manager.news_policy, "related")
+        self.assertEqual(manager.news_query, "生成AI 最新発表")
+        self.assertIn("関連ニュースのみ", manager.describe())
 
     def test_comment_becomes_temporary_tangent_without_advancing_segment(self):
         manager = StreamThemeManager({}, manual_theme="仕事の話")
@@ -160,6 +233,14 @@ class StreamThemeManagerTest(unittest.TestCase):
         self.assertIn("一つの実在する話題を3〜5発話", prompt)
         self.assertIn("『人はなぜ』で始まる学術的な題名を避け", prompt)
         self.assertIn("開始挨拶と3〜5個の話題区間", prompt)
+        self.assertIn("news_policy", prompt)
+        self.assertIn("youtube_title", prompt)
+        self.assertIn("youtube_description", prompt)
+        self.assertIn("日時は関連する場合だけ言及する", prompt)
+        self.assertEqual(
+            client.generate_structured.call_args.kwargs["max_output_tokens"],
+            1500,
+        )
 
 
 if __name__ == "__main__":

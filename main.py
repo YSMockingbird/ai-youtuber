@@ -140,6 +140,27 @@ def run_obs_websocket_test():
     print(f"OBS配信出力：{'稼働中' if output_active else '停止中'}")
 
 
+def run_youtube_upcoming_test():
+    # 公開開始は行わず、自動開始の対象候補と安全設定だけを表示します。
+    from youtube_oauth import find_upcoming_youtube_broadcast
+
+    broadcast = find_upcoming_youtube_broadcast()
+    print("開始可能なYouTube予約配信を確認しました。")
+    print(f"タイトル：{broadcast['title']}")
+    print(f"video_id：{broadcast['video_id']}")
+    print(f"公開設定：{broadcast['privacy_status']}")
+    print(f"開始予定：{broadcast['scheduled_start_time'] or '未設定'}")
+    print(f"ストリーム接続：{broadcast['bound_stream_id']}")
+    print(
+        "YouTube自動スタート："
+        f"{'ON' if broadcast['enable_auto_start'] else 'OFF'}"
+    )
+    print(
+        "YouTube自動ストップ："
+        f"{'ON' if broadcast['enable_auto_stop'] else 'OFF'}"
+    )
+
+
 def run_x_post_draft(topic=None):
     # Xへは送信せず、確認用の投稿候補だけを表示します。
     try:
@@ -337,11 +358,171 @@ def get_youtube_live_wait_settings():
     return interval_seconds, timeout_seconds
 
 
-def wait_for_youtube_live(runtime=None):
+def wait_for_youtube_stream_active(
+    stream_id,
+    timeout_seconds=60,
+    interval_seconds=2,
+    status_checker=None,
+    sleep_callback=None,
+    now=None,
+):
+    # OBS開始後、YouTubeが映像を受信してからライブ状態へ移行します。
+    normalized_stream_id = str(stream_id or "").strip()
+    if not normalized_stream_id:
+        raise ValueError("映像到着を確認するYouTubeストリームIDが空です。")
+    if timeout_seconds <= 0:
+        raise ValueError("YouTube映像到着の待機時間は0より大きくしてください。")
+    if interval_seconds <= 0:
+        raise ValueError("YouTube映像到着の確認間隔は0より大きくしてください。")
+    if status_checker is None:
+        from youtube_oauth import is_youtube_stream_active
+
+        status_checker = is_youtube_stream_active
+    sleep_callback = sleep_callback or time.sleep
+    now = now or time.monotonic
+    deadline = now() + timeout_seconds
+    while True:
+        if status_checker(normalized_stream_id):
+            return
+        remaining = deadline - now()
+        if remaining <= 0:
+            raise RuntimeError(
+                "OBSを開始しましたが、YouTubeへの映像到着を確認できませんでした。"
+                f" stream_id={normalized_stream_id}"
+            )
+        sleep_callback(min(interval_seconds, remaining))
+
+
+def start_obs_for_upcoming_youtube_broadcast(
+    runtime,
+    obs_websocket_client,
+    command=None,
+):
+    # 配信枠を必要に応じて作成または更新し、OBSから映像送信を開始します。
+    from youtube_oauth import (
+        create_youtube_broadcast,
+        find_upcoming_youtube_broadcast,
+        NoUpcomingYouTubeBroadcastError,
+        transition_youtube_broadcast_to_live,
+        update_youtube_broadcast_metadata,
+    )
+
+    if obs_websocket_client is None:
+        raise RuntimeError(
+            "OBS WebSocketが無効なため配信を自動開始できません。"
+        )
+    requested_stream_plan = None
+    if command is not None and command.get("action") == "configure_broadcast":
+        draft_id = command.get("draft_id")
+        if draft_id:
+            requested_stream_plan = runtime.select_prepared_broadcast_plan(
+                draft_id
+            )
+        else:
+            runtime.clear_selected_broadcast_plan()
+            requested_stream_plan = command.get("stream_plan")
+    elif command is not None and command.get("action") == "start_broadcast":
+        runtime.clear_selected_broadcast_plan()
+
+    created_broadcast = False
+    try:
+        broadcast = find_upcoming_youtube_broadcast()
+    except NoUpcomingYouTubeBroadcastError as exc:
+        if command is None or command.get("action") != "configure_broadcast":
+            raise RuntimeError(
+                "開始可能なYouTube配信枠がありません。"
+                "先に管理画面でAI配信案を作成し、"
+                "「内容を設定して開始」を押してください。"
+            ) from exc
+        runtime.update_admin_status(
+            phase="configuring_broadcast",
+            message="YouTubeに新しい配信枠を作成しています。",
+        )
+        broadcast = create_youtube_broadcast(
+            title=command["title"],
+            description=command["description"],
+            privacy_status=command["privacy_status"],
+        )
+        created_broadcast = True
+        print(
+            "YouTube配信枠を自動作成しました："
+            f"{broadcast['title']} / video_id={broadcast['video_id']} "
+            f"privacy={broadcast['privacy_status']}"
+        )
+
+    if command is not None and command.get("action") == "configure_broadcast":
+        runtime.update_admin_status(
+            phase="configuring_broadcast",
+            message=(
+                "YouTube配信枠を作成しました。"
+                if created_broadcast
+                else "YouTube配信の内容を更新しています。"
+            ),
+        )
+        if not created_broadcast:
+            updated = update_youtube_broadcast_metadata(
+                video_id=broadcast["video_id"],
+                title=command["title"],
+                description=command["description"],
+                privacy_status=command["privacy_status"],
+            )
+            broadcast.update(updated)
+            print(
+                "YouTube配信の内容を更新しました："
+                f"{broadcast['title']} / video_id={broadcast['video_id']} "
+                f"privacy={broadcast['privacy_status']}"
+            )
+    runtime.update_admin_status(
+        phase="starting_broadcast",
+        message=(
+            "OBSから映像送信を開始しています。"
+            f"対象={broadcast['title']} 公開設定={broadcast['privacy_status']}"
+        ),
+        starting_video_id=broadcast["video_id"],
+        starting_broadcast_title=broadcast["title"],
+    )
+    started = obs_websocket_client.start_stream()
+    print(
+        "管理画面：OBS配信出力を開始しました。"
+        if started
+        else "管理画面：OBS配信出力はすでに稼働中です。"
+    )
+    print(
+        f"YouTube自動開始待機：{broadcast['title']} / "
+        f"video_id={broadcast['video_id']} "
+        f"privacy={broadcast['privacy_status']}"
+    )
+    if not broadcast["enable_auto_start"]:
+        runtime.update_admin_status(
+            phase="starting_broadcast",
+            message="YouTubeへの映像到着を確認しています。",
+        )
+        wait_for_youtube_stream_active(broadcast["bound_stream_id"])
+        transition_youtube_broadcast_to_live(broadcast["video_id"])
+        print(
+            "YouTubeライブの開始を指示しました："
+            f"video_id={broadcast['video_id']}"
+        )
+    runtime.update_admin_status(
+        phase="starting_broadcast",
+        message="OBSから映像を送信しました。YouTubeのライブ開始を待っています。",
+        starting_video_id=broadcast["video_id"],
+        starting_broadcast_title=broadcast["title"],
+    )
+    return broadcast["video_id"], (
+        requested_stream_plan
+        if command is not None and command.get("action") == "configure_broadcast"
+        else None
+    )
+
+
+def wait_for_youtube_live(runtime=None, obs_websocket_client=None):
     # ライブ未開始だけを待機し、認証・通信・APIエラーはそのまま通知します。
     interval_seconds, timeout_seconds = get_youtube_live_wait_settings()
     started_at = time.monotonic()
     attempt = 0
+    expected_video_id = None
+    requested_stream_plan = None
     while True:
         attempt += 1
         try:
@@ -360,19 +541,99 @@ def wait_for_youtube_live(runtime=None):
             if runtime is not None:
                 runtime.update_admin_status(
                     phase="waiting_for_youtube",
-                    message=message,
+                    message=(
+                        message
+                        if obs_websocket_client is None
+                        else "管理画面でAI配信案を作成し、内容を設定して開始してください。"
+                    ),
                     youtube_wait_attempts=attempt,
                 )
             print(f"{message} 確認回数={attempt}")
+            if runtime is not None and obs_websocket_client is not None:
+                command = runtime.get_next_admin_command(
+                    timeout_seconds=interval_seconds
+                )
+                if command is None:
+                    continue
+                if command.get("action") not in {
+                    "start_broadcast",
+                    "prepare_broadcast",
+                    "configure_broadcast",
+                }:
+                    runtime.update_admin_status(
+                        phase="waiting_for_youtube",
+                        message=(
+                            "配信開始前に利用できるのは、AI配信案の作成と"
+                            "OBS・YouTube配信開始だけです。"
+                        ),
+                    )
+                    continue
+                if command.get("action") == "prepare_broadcast":
+                    try:
+                        from stream_theme import generate_stream_theme_plan
+
+                        runtime.update_admin_status(
+                            phase="preparing_broadcast_draft",
+                            message="AIがタイトル・説明文・配信構成を作成しています。",
+                        )
+                        instruction = command.get("stream_plan") or None
+                        plan = generate_stream_theme_plan(
+                            instruction=instruction
+                        )
+                        draft = runtime.store_prepared_broadcast_draft(
+                            plan,
+                            instruction,
+                            command["id"],
+                        )
+                        runtime.update_admin_status(
+                            phase="waiting_for_youtube",
+                            message=(
+                                "AI配信案を作成しました。内容を確認して開始してください。"
+                                f" 企画={draft['theme']}"
+                            ),
+                        )
+                        print(
+                            "AI配信案を作成しました："
+                            f"title={draft['title']} theme={draft['theme']} "
+                            f"news={draft['news_description']}"
+                        )
+                    except (RuntimeError, ValueError) as prepare_exc:
+                        runtime.update_admin_status(
+                            phase="waiting_for_youtube",
+                            message=f"AI配信案を作成できませんでした: {prepare_exc}",
+                        )
+                        print(f"AI配信案作成エラー: {prepare_exc}")
+                    continue
+                try:
+                    (
+                        expected_video_id,
+                        requested_stream_plan,
+                    ) = start_obs_for_upcoming_youtube_broadcast(
+                        runtime,
+                        obs_websocket_client,
+                        command=command,
+                    )
+                except (RuntimeError, ValueError) as start_exc:
+                    runtime.update_admin_status(
+                        phase="waiting_for_youtube",
+                        message=f"配信を開始できませんでした: {start_exc}",
+                    )
+                    print(f"配信自動開始エラー: {start_exc}")
+                continue
             time.sleep(interval_seconds)
             continue
+        if expected_video_id is not None and video_id != expected_video_id:
+            raise RuntimeError(
+                "開始を指示した配信とは別のYouTubeライブを検出しました。"
+                f" expected={expected_video_id} actual={video_id}"
+            )
         if runtime is not None:
             runtime.update_admin_status(
                 phase="preparing",
                 message="YouTubeライブを確認しました。配信を準備しています。",
                 youtube_wait_attempts=attempt,
             )
-        return live_chat_id, video_id
+        return live_chat_id, video_id, requested_stream_plan
 
 
 def _create_youtube_live_status_callback(video_id):
@@ -429,9 +690,11 @@ def print_external_control_server_info(version, speaker_id, port):
     )
     print(f"SSE URL: http://127.0.0.1:{port}/events")
     print(f"OBS字幕URL: http://127.0.0.1:{port}/overlay")
+    print(f"OBS話題カードURL: http://127.0.0.1:{port}/topic-overlay")
     print(f"OBSチャットURL: http://127.0.0.1:{port}/chat-overlay")
     project_root = Path(__file__).resolve().parent
     print(f"OBS固定字幕ファイル: {project_root / 'subtitle_overlay.html'}")
+    print(f"OBS固定話題カードファイル: {project_root / 'topic_overlay.html'}")
     print(f"OBS固定チャットファイル: {project_root / 'chat_overlay.html'}")
     print(f"配信管理画面: http://127.0.0.1:{port}/admin")
     print(f"記憶管理画面: http://127.0.0.1:{port}/character-memories")
@@ -899,6 +1162,8 @@ def process_next_admin_command(
 
     action = command["action"]
     try:
+        if action == "start_broadcast":
+            raise RuntimeError("YouTubeライブはすでに開始しています。")
         if action == "end_broadcast" and schedule_broadcast_end is None:
             raise RuntimeError(
                 "YouTube自動終了はai-youtuber-liveモードでのみ利用できます。"
@@ -1068,27 +1333,41 @@ def run_ai_youtuber_loop(
     obs_websocket_client=None,
 ):
     # コメントを優先し、音声終了後の無言時間が続いたら自発発話します。
+    prepared_theme_plan = None
     if runtime is not None:
         overlay_wait_seconds = get_obs_overlay_wait_seconds()
         runtime.update_admin_status(
             available=True,
             phase="waiting_for_obs",
-            message="OBSの字幕・コメント接続を待っています。",
+            message="OBSの字幕・話題カード・コメント接続を待っています。",
         )
         print(
-            "OBS接続待機：字幕とコメントの接続を待っています。"
+            "OBS接続待機：字幕・話題カード・コメントの接続を待っています。"
             f"最大={overlay_wait_seconds:g}秒"
         )
         if not runtime.wait_for_obs_overlays(overlay_wait_seconds):
             overlay_status = runtime.get_obs_overlay_status()
             raise RuntimeError(
-                "OBSの字幕・コメント接続を確認できませんでした。"
+                "OBSの字幕・話題カード・コメント接続を確認できませんでした。"
                 f" subtitle_connected={overlay_status['subtitle_connected']}"
+                f" topic_connected={overlay_status['topic_connected']}"
                 f" chat_connected={overlay_status['chat_connected']} "
                 "OBSのローカルHTML設定を確認してください。"
             )
-        print("OBS接続確認：字幕・コメントともに接続済みです。")
-        live_chat_id, video_id = wait_for_youtube_live(runtime)
+        print("OBS接続確認：字幕・話題カード・コメントすべて接続済みです。")
+        live_chat_id, video_id, requested_stream_plan = wait_for_youtube_live(
+            runtime,
+            obs_websocket_client=obs_websocket_client,
+        )
+        if requested_stream_plan:
+            stream_plan = requested_stream_plan
+        selected_broadcast_plan = runtime.consume_selected_broadcast_plan()
+        if (
+            isinstance(selected_broadcast_plan, dict)
+            and "plan" in selected_broadcast_plan
+        ):
+            prepared_theme_plan = selected_broadcast_plan["plan"]
+            stream_plan = selected_broadcast_plan["instruction"] or None
     else:
         live_chat_id = get_live_chat_id()
         video_id = None
@@ -1107,6 +1386,7 @@ def run_ai_youtuber_loop(
             publish_callback=deliver_prepared_response,
             stream_topic=stream_topic,
             stream_instruction=stream_plan,
+            prepared_theme_plan=prepared_theme_plan,
         )
     recent_utterances = []
     previous_autonomous_topic = None
@@ -1428,6 +1708,7 @@ def parse_args():
         choices=[
             "openai-test",
             "obs-test",
+            "youtube-upcoming",
             "youtube-chat-id",
             "youtube-messages",
             "youtube-loop",
@@ -1506,6 +1787,8 @@ def main():
             run_openai_test()
         elif args.mode == "obs-test":
             run_obs_websocket_test()
+        elif args.mode == "youtube-upcoming":
+            run_youtube_upcoming_test()
         elif args.mode == "x-draft":
             run_x_post_draft(args.x_topic)
         elif args.mode == "x-post":

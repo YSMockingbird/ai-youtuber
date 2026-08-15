@@ -73,6 +73,11 @@ class AiResponseSchema(BaseModel):
     character_event_candidate: Optional["CharacterEventCandidate"] = None
 
 
+class NewsAiResponseSchema(AiResponseSchema):
+    # ニュース発話と同じ応答内で作り、画面表示のためだけの追加API呼び出しを避けます。
+    topic_summary: Optional[str] = Field(default=None, min_length=10, max_length=90)
+
+
 class MemoryCandidate(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -160,6 +165,8 @@ def generate_news_commentary(
             "このニュースについて最初の発話です。1文目で誰または何がどうした記事なのかを"
             "短い口語で説明してください。タイトルをそのまま読み上げず、前提を知らない"
             "途中参加者にも話題が分かる文にしてください。記事の具体的な一点へ反応してください。"
+            "topic_summaryには、画面表示用として記事の事実だけを40〜70文字の一文で"
+            "必ず入れてください。感想、ツッコミ、記事にない背景は入れないでください。"
         )
     else:
         story_instruction = (
@@ -197,7 +204,11 @@ def generate_news_commentary(
         if context_builder is not None
         else current_input
     )
-    return _generate_structured_response(prompt, request_label="news_commentary")
+    return _generate_structured_response(
+        prompt,
+        request_label="news_commentary",
+        response_model=NewsAiResponseSchema,
+    )
 
 
 def generate_autonomous_speech(
@@ -293,13 +304,17 @@ def generate_admin_directed_speech(
     return _generate_structured_response(prompt, request_label="admin_instruction")
 
 
-def _generate_structured_response(prompt, request_label="ai_response"):
+def _generate_structured_response(
+    prompt,
+    request_label="ai_response",
+    response_model=AiResponseSchema,
+):
     # プロバイダー依存処理は共通クライアントの内側へ閉じ込めます。
     client = create_llm_client(load_llm_config())
     parsed = client.generate_structured(
         instructions=CHARACTER_PROMPT,
         input_text=prompt,
-        response_model=AiResponseSchema,
+        response_model=response_model,
         max_output_tokens=800,
         request_label=request_label,
     )

@@ -5,7 +5,11 @@ from dataclasses import dataclass
 
 from ai_response import generate_autonomous_speech, generate_news_commentary
 from autonomous_topics import AutonomousTopicSelector, TOPIC_INSTRUCTIONS
-from news_source import fetch_news_articles, select_news_article
+from news_source import (
+    fetch_news_articles,
+    fetch_news_articles_for_query,
+    select_news_article,
+)
 from stream_theme import StreamThemeManager
 
 
@@ -16,6 +20,7 @@ class BufferedAutonomousSpeech:
     topic: str
     article: object = None
     news_story_turn: int = 0
+    topic_card: object = None
 
 
 class AutonomousSpeechBuffer:
@@ -27,6 +32,7 @@ class AutonomousSpeechBuffer:
         publish_callback,
         stream_topic=None,
         stream_instruction=None,
+        prepared_theme_plan=None,
         theme_manager=None,
         now=None,
         prepare_in_background=True,
@@ -53,11 +59,13 @@ class AutonomousSpeechBuffer:
             config,
             manual_theme=stream_topic,
             program_instruction=stream_instruction,
+            prepared_plan=prepared_theme_plan,
         )
         self.publish_callback = publish_callback
         self.used_news_links = set()
         self.active_news_article = None
         self.active_news_turn = 0
+        self.active_news_topic_summary = ""
         self.recent_utterances = []
         self.previous_topic = None
         self.has_received_comment = False
@@ -95,6 +103,13 @@ class AutonomousSpeechBuffer:
             ai_response,
             prepared_speech,
         )
+        self._publish_topic_card(
+            {
+                "kind": "talk",
+                "title": self.theme_manager.state.main_theme,
+                "summary": self.theme_manager.current_segment.title,
+            }
+        )
         self.stream_context.record_ai_speech(text)
         self._remember_utterance(text)
         self.theme_manager.record_opening(text)
@@ -117,7 +132,15 @@ class AutonomousSpeechBuffer:
         self._invalidate_preparation()
         self.active_news_article = None
         self.active_news_turn = 0
+        self.active_news_topic_summary = ""
         description = self.theme_manager.replace_program(instruction)
+        self._publish_topic_card(
+            {
+                "kind": "talk",
+                "title": self.theme_manager.state.main_theme,
+                "summary": self.theme_manager.current_segment.title,
+            }
+        )
         current_time = time.monotonic() if now is None else float(now)
         self.retry_at = 0.0
         self.next_speech_at = current_time + self.silence_seconds
@@ -144,6 +167,7 @@ class AutonomousSpeechBuffer:
         except (RuntimeError, ValueError) as exc:
             self._record_error("準備済み音声の配信", exc, current_time)
             return False
+        self._publish_topic_card(item.topic_card)
 
         character_event_candidate = ai_response.get(
             "character_event_candidate"
@@ -168,9 +192,11 @@ class AutonomousSpeechBuffer:
             if next_turn >= self.news_story_utterances:
                 self.active_news_article = None
                 self.active_news_turn = 0
+                self.active_news_topic_summary = ""
             else:
                 self.active_news_article = item.article
                 self.active_news_turn = next_turn
+                self.active_news_topic_summary = item.topic_card["summary"]
         playback_seconds = command["duration_ms"] / 1000
         published_at = (
             time.monotonic() if now is None else current_time
@@ -347,16 +373,21 @@ class AutonomousSpeechBuffer:
         return discarded
 
     def _prepare_next(self):
-        continuing_news = self.active_news_article is not None
+        news_allowed = self.theme_manager.news_policy != "off"
+        continuing_news = self.active_news_article is not None and news_allowed
         prefer_news_at_start = (
             self.previous_topic is None
             and not self.theme_manager.manual_theme
             and self.theme_manager.program_instruction in {"", "AIにおまかせ"}
+            and self.theme_manager.news_policy == "general"
         )
         selected_topic = (
             "news"
             if continuing_news or prefer_news_at_start
-            else self.topic_selector.select(self.previous_topic)
+            else self.topic_selector.select(
+                self.previous_topic,
+                allow_news=news_allowed,
+            )
         )
         theme_context = self.theme_manager.build_context(selected_topic)
         article = self.active_news_article if continuing_news else None
@@ -364,7 +395,11 @@ class AutonomousSpeechBuffer:
         if selected_topic == "news":
             if article is None:
                 try:
-                    article = self._get_unused_news_article()
+                    article = self._get_unused_news_article(
+                        self.theme_manager.news_query
+                        if self.theme_manager.news_policy == "related"
+                        else None
+                    )
                 except RuntimeError as exc:
                     print(
                         "ニュースを取得できないため雑学へ切り替えます: "
@@ -383,6 +418,24 @@ class AutonomousSpeechBuffer:
                 story_turn=news_story_turn + 1,
                 story_turn_count=self.news_story_utterances,
             )
+            topic_summary = self.active_news_topic_summary
+            if not topic_summary:
+                topic_summary = str(
+                    ai_response.get("topic_summary")
+                    or article.get("summary")
+                    or article["title"]
+                ).strip()
+            topic_card = {
+                "kind": "news",
+                "title": article["title"],
+                "summary": topic_summary,
+                "source_name": article["source_name"],
+                "published_at": article["published_at"] or "",
+                "information_status": article.get(
+                    "information_status",
+                    "single_report",
+                ),
+            }
         else:
             audience_situation = (
                 "配信開始後、まだコメントは一件もない。"
@@ -402,6 +455,11 @@ class AutonomousSpeechBuffer:
                     self.stream_context.character_memory_repository
                 ),
             )
+            topic_card = {
+                "kind": "talk",
+                "title": self.theme_manager.state.main_theme,
+                "summary": self.theme_manager.current_segment.title,
+            }
 
         prepared_speech = self.runtime.prepare_speech(
             ai_response["text"],
@@ -420,10 +478,15 @@ class AutonomousSpeechBuffer:
             topic=selected_topic,
             article=article,
             news_story_turn=news_story_turn,
+            topic_card=topic_card,
         )
 
-    def _get_unused_news_article(self):
-        articles = fetch_news_articles()
+    def _get_unused_news_article(self, query=None):
+        articles = (
+            fetch_news_articles_for_query(query)
+            if query
+            else fetch_news_articles()
+        )
         article = select_news_article(
             articles,
             self.used_news_links,
@@ -441,6 +504,15 @@ class AutonomousSpeechBuffer:
     def _remember_utterance(self, text):
         self.recent_utterances.append(text)
         self.recent_utterances = self.recent_utterances[-8:]
+
+    def _publish_topic_card(self, card):
+        if not card:
+            return
+        try:
+            self.runtime.publish_topic_card(card)
+        except (RuntimeError, ValueError) as exc:
+            # 話題カードだけの不具合で音声配信を止めず、原因はログへ残します。
+            print(f"話題カード表示エラー: {exc}")
 
     def _record_error(self, phase, error, current_time):
         print(f"{phase}エラー: {error}")
