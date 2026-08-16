@@ -42,11 +42,6 @@ def create_plan(
             ),
         ],
         closing_direction="印象に残った話を一つ振り返って終える",
-        youtube_title=f"{theme}を話すAI VTuber雑談配信",
-        youtube_description=(
-            f"AI VTuberの才羽ガン奈が、{theme}について雑談します。"
-            "コメントにも反応しながら進めます。"
-        ),
         news_policy=news_policy,
         news_query=news_query,
     )
@@ -309,8 +304,8 @@ class StreamThemeManagerTest(unittest.TestCase):
         self.assertIn("『人はなぜ』で始まる学術的な題名を避け", prompt)
         self.assertIn("開始挨拶と3〜5個の話題区間", prompt)
         self.assertIn("news_policy", prompt)
-        self.assertIn("youtube_title", prompt)
-        self.assertIn("youtube_description", prompt)
+        self.assertNotIn("youtube_title", prompt)
+        self.assertNotIn("youtube_description", prompt)
         self.assertIn("自己紹介の場合、talking_points", prompt)
         self.assertIn("現時点では固定の好きなものがなく", prompt)
         self.assertIn("登録者とオリジナルモデルの目標", prompt)

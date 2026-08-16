@@ -13,6 +13,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
+from broadcast_schedule import get_broadcast_schedule_repository
 from character_memory import get_character_memory_repository
 
 
@@ -75,6 +76,7 @@ ALLOWED_ADMIN_ACTIONS = {
     "resume_autonomous",
     "cancel_next",
     "change_stream_plan",
+    "stop_live_control",
 }
 
 
@@ -356,6 +358,7 @@ class ExternalControlRuntime:
         speaker_id,
         public_base_url,
         character_memory_repository=None,
+        broadcast_schedule_repository=None,
     ):
         self.aivis_client = aivis_client
         self.speaker_id = speaker_id
@@ -367,9 +370,12 @@ class ExternalControlRuntime:
         self.chat_event_broker = ChatEventBroker(history_size=20)
         self.admin_command_queue = queue.Queue(maxsize=32)
         self.character_memory_repository = character_memory_repository
+        self.broadcast_schedule_repository = broadcast_schedule_repository
         self._admin_status_lock = threading.Lock()
         self._prepared_broadcast_draft = None
         self._selected_broadcast_plan = None
+        self._active_broadcast_schedule_id = None
+        self._live_service_controller = None
         self._admin_status = {
             "available": False,
             "autonomous_paused": False,
@@ -391,15 +397,41 @@ class ExternalControlRuntime:
             raise ValueError(f"未対応の管理命令です。action={action}")
         normalized = {"action": action, "id": uuid.uuid4().hex}
         if action in {"prepare_broadcast", "configure_broadcast"}:
-            stream_plan = str(command.get("stream_plan", "")).strip()
+            schedule_id = str(command.get("schedule_id", "")).strip()
+            if len(schedule_id) > 64:
+                raise ValueError("配信予定IDが長すぎます。")
+            schedule = None
+            if schedule_id:
+                schedule = self.get_broadcast_schedule(schedule_id)
+                if schedule["status"] in {"live", "completed", "cancelled"}:
+                    raise ValueError(
+                        "この配信予定は現在の状態では準備・開始できません。"
+                        f" status={schedule['status']}"
+                    )
+            stream_plan = str(
+                schedule["content_request"]
+                if schedule is not None
+                else command.get("stream_plan", "")
+            ).strip()
             if len(stream_plan) > 200:
                 raise ValueError("配信企画は200文字以内にしてください。")
             normalized["stream_plan"] = stream_plan
+            normalized["schedule_id"] = schedule_id
         if action == "configure_broadcast":
-            title = str(command.get("title", "")).strip()
-            description = str(command.get("description", "")).strip()
+            title = str(
+                schedule["title"]
+                if schedule is not None
+                else command.get("title", "")
+            ).strip()
+            description = str(
+                schedule["description"]
+                if schedule is not None
+                else command.get("description", "")
+            ).strip()
             privacy_status = str(
-                command.get("privacy_status", "unlisted")
+                schedule["privacy_status"]
+                if schedule is not None
+                else command.get("privacy_status", "unlisted")
             ).strip()
             draft_id = str(command.get("draft_id", "")).strip()
             if not 1 <= len(title) <= 100:
@@ -410,12 +442,17 @@ class ExternalControlRuntime:
                 raise ValueError(
                     "公開設定はprivate、unlisted、publicのいずれかです。"
                 )
-            if not stream_plan and not draft_id:
+            if schedule is not None and not schedule["prepared_stream_plan"]:
                 raise ValueError(
-                    "配信企画を入力するか、AIで配信案を作成してください。"
+                    "この配信予定はまだ準備されていません。"
+                    "先に「この予定を準備」を押してください。"
+                )
+            if schedule is None and not stream_plan and not draft_id:
+                raise ValueError(
+                    "配信企画を入力するか、AIで配信構成を作成してください。"
                 )
             if len(draft_id) > 64:
-                raise ValueError("配信案IDが長すぎます。")
+                raise ValueError("配信構成IDが長すぎます。")
             normalized.update(
                 {
                     "title": title,
@@ -480,10 +517,16 @@ class ExternalControlRuntime:
             self._admin_status.update(changes)
             self._admin_status["updated_at_ms"] = round(time.time() * 1000)
 
-    def store_prepared_broadcast_draft(self, plan, instruction, draft_id):
+    def store_prepared_broadcast_draft(
+        self,
+        plan,
+        instruction,
+        draft_id,
+        schedule_id=None,
+    ):
         normalized_draft_id = str(draft_id).strip()
         if not normalized_draft_id:
-            raise ValueError("生成した配信案のIDが空です。")
+            raise ValueError("生成した配信構成のIDが空です。")
         segment_titles = [segment.title for segment in plan.segments]
         news_description = {
             "off": "使用しない",
@@ -492,8 +535,7 @@ class ExternalControlRuntime:
         }[plan.news_policy]
         public_draft = {
             "id": normalized_draft_id,
-            "title": plan.youtube_title,
-            "description": plan.youtube_description,
+            "schedule_id": str(schedule_id or "").strip(),
             "theme": plan.theme,
             "segments": segment_titles,
             "news_policy": plan.news_policy,
@@ -504,9 +546,25 @@ class ExternalControlRuntime:
                 "id": normalized_draft_id,
                 "instruction": str(instruction or "").strip(),
                 "plan": plan,
+                "schedule_id": str(schedule_id or "").strip(),
             }
             self._admin_status["broadcast_draft"] = public_draft
             self._admin_status["updated_at_ms"] = round(time.time() * 1000)
+        if schedule_id:
+            repository = self._get_broadcast_schedule_repository()
+            try:
+                serialized_plan = plan.model_dump_json()
+            except AttributeError as exc:
+                raise ValueError(
+                    "生成した配信構成を保存可能なJSONへ変換できませんでした。"
+                ) from exc
+            repository.update_schedule(
+                schedule_id,
+                prepared_stream_plan=serialized_plan,
+                status="prepared",
+                youtube_video_id=None,
+                last_error=None,
+            )
         return public_draft
 
     def select_prepared_broadcast_plan(self, draft_id):
@@ -515,8 +573,8 @@ class ExternalControlRuntime:
             draft = self._prepared_broadcast_draft
             if draft is None or draft["id"] != normalized_draft_id:
                 raise RuntimeError(
-                    "AI配信案が見つからないか更新されています。"
-                    "「AIで配信案を作成」をもう一度押してください。"
+                    "AI配信構成が見つからないか更新されています。"
+                    "「AIで配信構成を作成」をもう一度押してください。"
                 )
             self._selected_broadcast_plan = draft
             return draft["instruction"]
@@ -530,6 +588,61 @@ class ExternalControlRuntime:
             selected = self._selected_broadcast_plan
             self._selected_broadcast_plan = None
         return selected
+
+    def select_prepared_broadcast_schedule(self, schedule_id):
+        from stream_theme import StreamThemePlan
+
+        schedule = self.get_broadcast_schedule(schedule_id)
+        serialized_plan = schedule.get("prepared_stream_plan")
+        if not serialized_plan:
+            raise RuntimeError(
+                "配信予定に準備済みの配信構成がありません。"
+                "先に「この予定を準備」を押してください。"
+            )
+        try:
+            plan = StreamThemePlan.model_validate_json(serialized_plan)
+        except (TypeError, ValueError) as exc:
+            raise RuntimeError(
+                "保存済みの配信構成を読み込めませんでした。"
+                "この予定をもう一度準備してください。"
+            ) from exc
+        with self._admin_status_lock:
+            self._selected_broadcast_plan = {
+                "id": schedule["schedule_id"],
+                "instruction": schedule["content_request"],
+                "plan": plan,
+                "schedule_id": schedule["schedule_id"],
+            }
+            self._active_broadcast_schedule_id = schedule["schedule_id"]
+        return schedule["content_request"] or None
+
+    def update_active_broadcast_schedule(self, status, video_id=None, error=None):
+        with self._admin_status_lock:
+            schedule_id = self._active_broadcast_schedule_id
+        if not schedule_id:
+            return None
+        changes = {"status": status, "last_error": error}
+        if video_id is not None:
+            changes["youtube_video_id"] = video_id
+        return self._get_broadcast_schedule_repository().update_schedule(
+            schedule_id,
+            **changes,
+        )
+
+    def update_broadcast_schedule_status(
+        self,
+        schedule_id,
+        status,
+        video_id=None,
+        error=None,
+    ):
+        changes = {"status": status, "last_error": error}
+        if video_id is not None:
+            changes["youtube_video_id"] = video_id
+        return self._get_broadcast_schedule_repository().update_schedule(
+            schedule_id,
+            **changes,
+        )
 
     def get_admin_status(self):
         with self._admin_status_lock:
@@ -555,7 +668,27 @@ class ExternalControlRuntime:
                 )
             status = dict(self._admin_status)
         status["queued_commands"] = self.admin_command_queue.qsize()
+        controller = self._live_service_controller
+        status["managed_live_service"] = controller is not None
+        status["live_control_running"] = (
+            controller.is_running() if controller is not None else True
+        )
         return status
+
+    def attach_live_service_controller(self, controller):
+        if controller is None:
+            raise ValueError("ライブ制御コントローラーが設定されていません。")
+        self._live_service_controller = controller
+
+    def start_live_service(self):
+        if self._live_service_controller is None:
+            raise RuntimeError("この起動モードでは常駐ライブ制御を利用できません。")
+        return self._live_service_controller.start()
+
+    def stop_live_service(self):
+        if self._live_service_controller is None:
+            raise RuntimeError("この起動モードでは常駐ライブ制御を利用できません。")
+        return self._live_service_controller.request_stop()
 
     def get_obs_overlay_status(self):
         subtitle_clients = self.subtitle_event_broker.subscriber_count()
@@ -602,6 +735,60 @@ class ExternalControlRuntime:
         if self.character_memory_repository is None:
             raise RuntimeError("キャラクター記憶の保存先が設定されていません。")
         self.character_memory_repository.review(memory_id, status)
+
+    def list_broadcast_templates(self):
+        repository = self._get_broadcast_schedule_repository()
+        return repository.list_templates()
+
+    def save_broadcast_template(self, values):
+        repository = self._get_broadcast_schedule_repository()
+        template_id = str(values.get("template_id", "")).strip()
+        arguments = {
+            "name": values.get("name"),
+            "title": values.get("title"),
+            "description": values.get("description"),
+            "privacy_status": values.get("privacy_status", "unlisted"),
+        }
+        if template_id:
+            return repository.update_template(template_id, **arguments)
+        return repository.create_template(**arguments)
+
+    def delete_broadcast_template(self, template_id):
+        repository = self._get_broadcast_schedule_repository()
+        repository.delete_template(template_id)
+
+    def list_broadcast_schedules(self, start_at=None, end_at=None):
+        repository = self._get_broadcast_schedule_repository()
+        return repository.list_schedules(start_at=start_at, end_at=end_at)
+
+    def get_broadcast_schedule(self, schedule_id):
+        repository = self._get_broadcast_schedule_repository()
+        return repository.get_schedule(schedule_id)
+
+    def save_broadcast_schedule(self, values):
+        repository = self._get_broadcast_schedule_repository()
+        schedule_id = str(values.get("schedule_id", "")).strip()
+        arguments = {
+            "scheduled_start_at": values.get("scheduled_start_at"),
+            "planning_mode": values.get("planning_mode"),
+            "content_request": values.get("content_request"),
+            "title": values.get("title"),
+            "description": values.get("description"),
+            "privacy_status": values.get("privacy_status", "unlisted"),
+            "template_id": values.get("template_id"),
+        }
+        if schedule_id:
+            return repository.update_schedule(schedule_id, **arguments)
+        return repository.create_schedule(**arguments)
+
+    def delete_broadcast_schedule(self, schedule_id):
+        repository = self._get_broadcast_schedule_repository()
+        repository.delete_schedule(schedule_id)
+
+    def _get_broadcast_schedule_repository(self):
+        if self.broadcast_schedule_repository is None:
+            raise RuntimeError("配信予定の保存先が設定されていません。")
+        return self.broadcast_schedule_repository
 
     def publish_chat_messages(self, messages):
         # 表示に必要な公開情報だけをチャット画面へ送り、Channel IDは渡しません。
@@ -857,6 +1044,12 @@ class ExternalControlRequestHandler(BaseHTTPRequestHandler):
         if path == "/api/character-memories":
             self._handle_character_memory_list(parsed_url.query)
             return
+        if path == "/api/broadcast/templates":
+            self._handle_broadcast_template_list()
+            return
+        if path == "/api/broadcast/schedules":
+            self._handle_broadcast_schedule_list(parsed_url.query)
+            return
         if path == "/health":
             overlay_status = self.runtime.get_obs_overlay_status()
             self._send_json(
@@ -900,8 +1093,26 @@ class ExternalControlRequestHandler(BaseHTTPRequestHandler):
         if path == "/api/admin/command":
             self._handle_admin_command()
             return
+        if path == "/api/live-service/start":
+            self._handle_live_service_start()
+            return
+        if path == "/api/live-service/stop":
+            self._handle_live_service_stop()
+            return
         if path == "/api/character-memories/review":
             self._handle_character_memory_review()
+            return
+        if path == "/api/broadcast/templates/save":
+            self._handle_broadcast_template_save()
+            return
+        if path == "/api/broadcast/templates/delete":
+            self._handle_broadcast_template_delete()
+            return
+        if path == "/api/broadcast/schedules/save":
+            self._handle_broadcast_schedule_save()
+            return
+        if path == "/api/broadcast/schedules/delete":
+            self._handle_broadcast_schedule_delete()
             return
         self._send_json(404, {"error": "指定されたエンドポイントはありません。"})
 
@@ -1112,6 +1323,9 @@ class ExternalControlRequestHandler(BaseHTTPRequestHandler):
         except ValueError as exc:
             self._send_json(400, {"error": str(exc)})
             return
+        except KeyError as exc:
+            self._send_json(404, {"error": str(exc)})
+            return
         except RuntimeError as exc:
             self._send_json(503, {"error": str(exc)})
             return
@@ -1123,6 +1337,22 @@ class ExternalControlRequestHandler(BaseHTTPRequestHandler):
                 "action": command["action"],
             },
         )
+
+    def _handle_live_service_start(self):
+        try:
+            self.runtime.start_live_service()
+        except RuntimeError as exc:
+            self._send_json(409, {"error": str(exc)})
+            return
+        self._send_json(202, {"status": "starting"})
+
+    def _handle_live_service_stop(self):
+        try:
+            self.runtime.stop_live_service()
+        except RuntimeError as exc:
+            self._send_json(409, {"error": str(exc)})
+            return
+        self._send_json(202, {"status": "stopping"})
 
     def _handle_character_memory_list(self, query):
         status = parse_qs(query).get("status", ["draft"])[0]
@@ -1166,6 +1396,96 @@ class ExternalControlRequestHandler(BaseHTTPRequestHandler):
             200,
             {"memory_id": memory_id, "status": status},
         )
+
+    def _handle_broadcast_template_list(self):
+        try:
+            templates = self.runtime.list_broadcast_templates()
+        except RuntimeError as exc:
+            self._send_json(500, {"error": str(exc)})
+            return
+        self._send_json(200, {"templates": templates})
+
+    def _handle_broadcast_template_save(self):
+        body = self._read_json_object()
+        if body is None:
+            return
+        try:
+            template = self.runtime.save_broadcast_template(body)
+        except ValueError as exc:
+            self._send_json(400, {"error": str(exc)})
+            return
+        except KeyError as exc:
+            self._send_json(404, {"error": str(exc)})
+            return
+        except RuntimeError as exc:
+            self._send_json(500, {"error": str(exc)})
+            return
+        self._send_json(200, {"template": template})
+
+    def _handle_broadcast_template_delete(self):
+        body = self._read_json_object()
+        if body is None:
+            return
+        try:
+            self.runtime.delete_broadcast_template(body.get("template_id"))
+        except ValueError as exc:
+            self._send_json(400, {"error": str(exc)})
+            return
+        except KeyError as exc:
+            self._send_json(404, {"error": str(exc)})
+            return
+        except RuntimeError as exc:
+            self._send_json(500, {"error": str(exc)})
+            return
+        self._send_json(200, {"status": "deleted"})
+
+    def _handle_broadcast_schedule_list(self, query):
+        parameters = parse_qs(query)
+        start_at = parameters.get("start_at", [None])[0]
+        end_at = parameters.get("end_at", [None])[0]
+        try:
+            schedules = self.runtime.list_broadcast_schedules(start_at, end_at)
+        except ValueError as exc:
+            self._send_json(400, {"error": str(exc)})
+            return
+        except RuntimeError as exc:
+            self._send_json(500, {"error": str(exc)})
+            return
+        self._send_json(200, {"schedules": schedules})
+
+    def _handle_broadcast_schedule_save(self):
+        body = self._read_json_object()
+        if body is None:
+            return
+        try:
+            schedule = self.runtime.save_broadcast_schedule(body)
+        except ValueError as exc:
+            self._send_json(400, {"error": str(exc)})
+            return
+        except KeyError as exc:
+            self._send_json(404, {"error": str(exc)})
+            return
+        except RuntimeError as exc:
+            self._send_json(500, {"error": str(exc)})
+            return
+        self._send_json(200, {"schedule": schedule})
+
+    def _handle_broadcast_schedule_delete(self):
+        body = self._read_json_object()
+        if body is None:
+            return
+        try:
+            self.runtime.delete_broadcast_schedule(body.get("schedule_id"))
+        except ValueError as exc:
+            self._send_json(400, {"error": str(exc)})
+            return
+        except KeyError as exc:
+            self._send_json(404, {"error": str(exc)})
+            return
+        except RuntimeError as exc:
+            self._send_json(500, {"error": str(exc)})
+            return
+        self._send_json(200, {"status": "deleted"})
 
     def _read_json_object(self):
         try:
@@ -1238,6 +1558,7 @@ class ExternalControlServer:
         host="127.0.0.1",
         port=8765,
         character_memory_repository=None,
+        broadcast_schedule_repository=None,
     ):
         public_base_url = f"http://127.0.0.1:{port}"
         self.runtime = ExternalControlRuntime(
@@ -1247,6 +1568,10 @@ class ExternalControlServer:
             character_memory_repository=(
                 character_memory_repository
                 or get_character_memory_repository()
+            ),
+            broadcast_schedule_repository=(
+                broadcast_schedule_repository
+                or get_broadcast_schedule_repository()
             ),
         )
         self.http_server = ExternalControlHttpServer((host, port), self.runtime)

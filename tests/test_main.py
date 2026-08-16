@@ -183,6 +183,57 @@ class YouTubeLiveWaitTest(unittest.TestCase):
         wait_stream_mock.assert_called_once_with("stream-id")
         transition_mock.assert_called_once_with("created-video")
 
+    @patch("youtube_oauth.update_youtube_broadcast_metadata")
+    @patch("youtube_oauth.find_upcoming_youtube_broadcast")
+    def test_scheduled_broadcast_uses_persisted_plan_and_updates_status(
+        self,
+        find_upcoming_mock,
+        update_metadata_mock,
+    ):
+        find_upcoming_mock.return_value = {
+            "video_id": "scheduled-video",
+            "title": "カレンダー配信",
+            "privacy_status": "unlisted",
+            "enable_auto_start": True,
+            "bound_stream_id": "stream-id",
+        }
+        update_metadata_mock.return_value = {
+            "video_id": "scheduled-video",
+            "title": "カレンダー配信",
+            "description": "予定に保存した説明",
+            "privacy_status": "unlisted",
+        }
+        runtime = Mock()
+        runtime.select_prepared_broadcast_schedule.return_value = (
+            "自己紹介配信"
+        )
+        obs_client = Mock()
+        obs_client.start_stream.return_value = True
+        command = {
+            "action": "configure_broadcast",
+            "schedule_id": "schedule-1",
+            "title": "カレンダー配信",
+            "description": "予定に保存した説明",
+            "privacy_status": "unlisted",
+            "stream_plan": "自己紹介配信",
+            "draft_id": "",
+        }
+
+        result = start_obs_for_upcoming_youtube_broadcast(
+            runtime,
+            obs_client,
+            command=command,
+        )
+
+        self.assertEqual(result, ("scheduled-video", "自己紹介配信"))
+        runtime.select_prepared_broadcast_schedule.assert_called_once_with(
+            "schedule-1"
+        )
+        runtime.update_active_broadcast_schedule.assert_called_once_with(
+            "youtube_scheduled",
+            video_id="scheduled-video",
+        )
+
     @patch("youtube_oauth.find_upcoming_youtube_broadcast")
     @patch("main.get_live_chat_id")
     def test_admin_command_starts_obs_and_waits_for_expected_youtube_live(
@@ -362,7 +413,6 @@ class YouTubeLiveWaitTest(unittest.TestCase):
             },
         ]
         runtime.store_prepared_broadcast_draft.return_value = {
-            "title": "AIの自己紹介配信",
             "theme": "自己紹介配信",
             "news_description": "使用しない",
         }

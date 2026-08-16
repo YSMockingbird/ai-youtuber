@@ -1,6 +1,7 @@
 import argparse
 import os
 import re
+import threading
 import time
 import unicodedata
 from pathlib import Path
@@ -21,6 +22,7 @@ from control_server import ALLOWED_EMOTIONS, ExternalControlServer
 from llm.config import load_llm_config
 from llm.session import StreamContextManager
 from local_services import ensure_live_local_services, wait_for_obs_ready
+from live_service import LiveServiceController
 from motion_control import MotionRateLimiter
 from news_source import fetch_news_articles, select_news_article
 from obs_websocket import ObsWebSocketClient
@@ -107,6 +109,7 @@ class YouTubeBroadcastEndCoordinator:
             phase="youtube_ended",
             message=f"YouTubeライブを終了しました。{obs_message} Pythonを停止します。",
         )
+        self.runtime.update_active_broadcast_schedule("completed")
         print(f"YouTubeライブを自動終了しました：status={status}")
         print(obs_message)
         return True
@@ -283,24 +286,7 @@ def run_aivis_info():
 
 
 def get_aivis_speaker_id(client):
-    raw_speaker_id = os.getenv("AIVIS_SPEAKER_ID", "").strip()
-    if not raw_speaker_id:
-        styles = client.get_styles()
-        available = ", ".join(
-            f"{style['style_id']}:{style['speaker_name']}/{style['style_name']}"
-            for style in styles
-        )
-        raise RuntimeError(
-            "AIVIS_SPEAKER_IDが未設定です。"
-            ".envへ使用するスタイルIDを設定してください。"
-            f"利用可能={available or 'なし'}"
-        )
-
-    try:
-        speaker_id = int(raw_speaker_id)
-    except ValueError as exc:
-        raise RuntimeError("AIVIS_SPEAKER_IDは整数で設定してください。") from exc
-
+    speaker_id = get_configured_aivis_speaker_id()
     available_style_ids = {
         style["style_id"] for style in client.get_styles()
     }
@@ -309,6 +295,23 @@ def get_aivis_speaker_id(client):
             "AIVIS_SPEAKER_IDに対応するスタイルが見つかりません。"
             f"speaker_id={speaker_id}"
         )
+    return speaker_id
+
+
+def get_configured_aivis_speaker_id():
+    # 常駐管理画面の起動時はAivisSpeechへ接続せず、設定値だけを検証します。
+    raw_speaker_id = os.getenv("AIVIS_SPEAKER_ID", "").strip()
+    if not raw_speaker_id:
+        raise RuntimeError(
+            "AIVIS_SPEAKER_IDが未設定です。"
+            ".envへ使用するスタイルIDを設定してください。"
+        )
+
+    try:
+        speaker_id = int(raw_speaker_id)
+    except ValueError as exc:
+        raise RuntimeError("AIVIS_SPEAKER_IDは整数で設定してください。") from exc
+
     return speaker_id
 
 
@@ -414,8 +417,13 @@ def start_obs_for_upcoming_youtube_broadcast(
         )
     requested_stream_plan = None
     if command is not None and command.get("action") == "configure_broadcast":
+        schedule_id = command.get("schedule_id")
         draft_id = command.get("draft_id")
-        if draft_id:
+        if schedule_id:
+            requested_stream_plan = (
+                runtime.select_prepared_broadcast_schedule(schedule_id)
+            )
+        elif draft_id:
             requested_stream_plan = runtime.select_prepared_broadcast_plan(
                 draft_id
             )
@@ -432,7 +440,7 @@ def start_obs_for_upcoming_youtube_broadcast(
         if command is None or command.get("action") != "configure_broadcast":
             raise RuntimeError(
                 "開始可能なYouTube配信枠がありません。"
-                "先に管理画面でAI配信案を作成し、"
+                "先に管理画面でAI配信構成を作成し、"
                 "「内容を設定して開始」を押してください。"
             ) from exc
         runtime.update_admin_status(
@@ -510,6 +518,11 @@ def start_obs_for_upcoming_youtube_broadcast(
         starting_video_id=broadcast["video_id"],
         starting_broadcast_title=broadcast["title"],
     )
+    if command is not None and command.get("schedule_id"):
+        runtime.update_active_broadcast_schedule(
+            "youtube_scheduled",
+            video_id=broadcast["video_id"],
+        )
     return broadcast["video_id"], (
         requested_stream_plan
         if command is not None and command.get("action") == "configure_broadcast"
@@ -545,7 +558,7 @@ def wait_for_youtube_live(runtime=None, obs_websocket_client=None):
                     message=(
                         message
                         if obs_websocket_client is None
-                        else "管理画面でAI配信案を作成し、内容を設定して開始してください。"
+                        else "管理画面でAI配信構成を作成し、内容を設定して開始してください。"
                     ),
                     youtube_wait_attempts=attempt,
                 )
@@ -560,50 +573,74 @@ def wait_for_youtube_live(runtime=None, obs_websocket_client=None):
                     "start_broadcast",
                     "prepare_broadcast",
                     "configure_broadcast",
+                    "stop_live_control",
                 }:
                     runtime.update_admin_status(
                         phase="waiting_for_youtube",
                         message=(
-                            "配信開始前に利用できるのは、AI配信案の作成と"
+                            "配信開始前に利用できるのは、AI配信構成の作成と"
                             "OBS・YouTube配信開始だけです。"
                         ),
                     )
                     continue
+                if command.get("action") == "stop_live_control":
+                    runtime.update_admin_status(
+                        phase="stopping_live_control",
+                        message="配信開始前のライブ制御を停止します。",
+                    )
+                    raise AdminRequestedBroadcastEnd(
+                        "管理画面からライブ制御を停止しました。"
+                    )
                 if command.get("action") == "prepare_broadcast":
                     try:
                         from stream_theme import generate_stream_theme_plan
 
                         runtime.update_admin_status(
                             phase="preparing_broadcast_draft",
-                            message="AIがタイトル・説明文・配信構成を作成しています。",
+                            message="AIが配信構成表を作成しています。",
                         )
                         instruction = command.get("stream_plan") or None
                         plan = generate_stream_theme_plan(
                             instruction=instruction
                         )
-                        draft = runtime.store_prepared_broadcast_draft(
-                            plan,
-                            instruction,
-                            command["id"],
-                        )
+                        schedule_id = command.get("schedule_id")
+                        if schedule_id:
+                            draft = runtime.store_prepared_broadcast_draft(
+                                plan,
+                                instruction,
+                                command["id"],
+                                schedule_id=schedule_id,
+                            )
+                        else:
+                            draft = runtime.store_prepared_broadcast_draft(
+                                plan,
+                                instruction,
+                                command["id"],
+                            )
                         runtime.update_admin_status(
                             phase="waiting_for_youtube",
                             message=(
-                                "AI配信案を作成しました。内容を確認して開始してください。"
+                                "AI配信構成を作成しました。内容を確認して開始してください。"
                                 f" 企画={draft['theme']}"
                             ),
                         )
                         print(
-                            "AI配信案を作成しました："
-                            f"title={draft['title']} theme={draft['theme']} "
+                            "AI配信構成を作成しました："
+                            f"theme={draft['theme']} "
                             f"news={draft['news_description']}"
                         )
                     except (RuntimeError, ValueError) as prepare_exc:
+                        if command.get("schedule_id"):
+                            runtime.update_broadcast_schedule_status(
+                                command["schedule_id"],
+                                "error",
+                                error=str(prepare_exc),
+                            )
                         runtime.update_admin_status(
                             phase="waiting_for_youtube",
-                            message=f"AI配信案を作成できませんでした: {prepare_exc}",
+                            message=f"AI配信構成を作成できませんでした: {prepare_exc}",
                         )
-                        print(f"AI配信案作成エラー: {prepare_exc}")
+                        print(f"AI配信構成作成エラー: {prepare_exc}")
                     continue
                 try:
                     (
@@ -615,6 +652,12 @@ def wait_for_youtube_live(runtime=None, obs_websocket_client=None):
                         command=command,
                     )
                 except (RuntimeError, ValueError) as start_exc:
+                    if command.get("schedule_id"):
+                        runtime.update_broadcast_schedule_status(
+                            command["schedule_id"],
+                            "error",
+                            error=str(start_exc),
+                        )
                     runtime.update_admin_status(
                         phase="waiting_for_youtube",
                         message=f"配信を開始できませんでした: {start_exc}",
@@ -629,6 +672,10 @@ def wait_for_youtube_live(runtime=None, obs_websocket_client=None):
                 f" expected={expected_video_id} actual={video_id}"
             )
         if runtime is not None:
+            runtime.update_active_broadcast_schedule(
+                "live",
+                video_id=video_id,
+            )
             runtime.update_admin_status(
                 phase="preparing",
                 message="YouTubeライブを確認しました。配信を準備しています。",
@@ -1162,6 +1209,11 @@ def process_next_admin_command(
         return False
 
     action = command["action"]
+    if action == "stop_live_control":
+        autonomous_buffer.pause()
+        raise AdminRequestedBroadcastEnd(
+            "管理画面からライブ制御を停止しました。"
+        )
     try:
         if action == "start_broadcast":
             raise RuntimeError("YouTubeライブはすでに開始しています。")
@@ -1485,6 +1537,7 @@ def run_ai_youtuber_loop(
             if autonomous_buffer is not None:
                 autonomous_buffer.pause()
             if runtime is not None:
+                runtime.update_active_broadcast_schedule("completed")
                 runtime.update_admin_status(
                     autonomous_paused=True,
                     phase="youtube_ended",
@@ -1715,6 +1768,97 @@ def run_ai_youtuber_live(max_loops, stream_topic=None, stream_plan=None):
         local_services.stop()
 
 
+def run_managed_live_session(
+    runtime,
+    max_loops,
+    stream_topic=None,
+    stream_plan=None,
+):
+    # 常駐管理サーバーを止めず、配信に必要なアプリとライブ処理だけを起動します。
+    local_services = ensure_live_local_services()
+    try:
+        client = create_aivis_client()
+        version = client.get_version()
+        speaker_id = get_aivis_speaker_id(client)
+        runtime.aivis_client = client
+        runtime.speaker_id = speaker_id
+        print(
+            "ライブ制御用サービスを準備しました。"
+            f"AivisSpeech={version} speaker_id={speaker_id}"
+        )
+
+        from news_history import get_news_history_repository
+
+        news_history_repository = get_news_history_repository()
+        obs_websocket_client = ObsWebSocketClient.from_env()
+        if obs_websocket_client is not None:
+            output_active = wait_for_obs_ready(obs_websocket_client)
+            print(
+                "OBS WebSocket接続確認：成功 "
+                f"配信出力={'稼働中' if output_active else '停止中'}"
+            )
+        run_ai_youtuber_loop(
+            max_loops,
+            runtime=runtime,
+            stream_topic=stream_topic,
+            stream_plan=stream_plan,
+            obs_websocket_client=obs_websocket_client,
+            news_history_repository=news_history_repository,
+        )
+    finally:
+        local_services.stop()
+
+
+def run_admin_service(max_loops):
+    # ログイン中は管理画面だけを常駐させ、ボタン操作でライブ処理を起動します。
+    client = create_aivis_client()
+    speaker_id = get_configured_aivis_speaker_id()
+    port = get_control_server_port()
+    try:
+        server = ExternalControlServer(
+            aivis_client=client,
+            speaker_id=speaker_id,
+            port=port,
+        )
+        server.start()
+    except OSError as exc:
+        raise RuntimeError(
+            f"常駐管理サーバーを起動できません。port={port} detail={exc}"
+        ) from exc
+
+    def start_live_callback():
+        try:
+            run_managed_live_session(server.runtime, max_loops)
+        except AdminRequestedBroadcastEnd as exc:
+            print(str(exc))
+
+    controller = LiveServiceController(
+        server.runtime,
+        start_live_callback,
+    )
+    server.runtime.attach_live_service_controller(controller)
+    server.runtime.update_admin_status(
+        available=True,
+        phase="service_idle",
+        message="管理画面は稼働中です。ライブ制御は停止しています。",
+    )
+    print(f"常駐配信管理画面: http://127.0.0.1:{port}/admin")
+    print("ライブ制御は管理画面のボタンから開始できます。")
+    try:
+        threading.Event().wait()
+    except KeyboardInterrupt:
+        print("\n常駐配信管理の終了操作を受け付けました。")
+    finally:
+        if controller.is_running():
+            try:
+                controller.request_stop()
+                controller.wait(timeout=5)
+            except RuntimeError as exc:
+                print(f"ライブ制御停止エラー: {exc}")
+        server.stop()
+        print("常駐配信管理画面を停止しました。")
+
+
 def parse_args():
     parser = argparse.ArgumentParser(description="AI YouTuber Phase 1")
     parser.add_argument(
@@ -1734,6 +1878,7 @@ def parse_args():
             "news-test",
             "news-voice",
             "ai-youtuber-live",
+            "admin-service",
             "mock-live",
             "character-memory-drafts",
             "character-memory-approved",
@@ -1833,6 +1978,8 @@ def main():
                 args.stream_topic,
                 args.stream_plan,
             )
+        elif args.mode == "admin-service":
+            run_admin_service(args.max_loops)
         elif args.mode == "mock-live":
             run_mock_live(args.mock_delay_seconds)
         elif args.mode == "character-memory-drafts":

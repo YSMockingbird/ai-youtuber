@@ -3,12 +3,15 @@ import json
 import tempfile
 import threading
 import unittest
+import urllib.error
+import urllib.parse
 import urllib.request
 import wave
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock
 
+from broadcast_schedule import BroadcastScheduleRepository
 from character_memory import CharacterMemoryRepository
 from control_server import (
     AudioStore,
@@ -19,6 +22,7 @@ from control_server import (
     get_wav_duration_ms,
     normalize_motion_command,
 )
+from stream_theme import StreamSegmentPlan, StreamThemePlan
 
 
 def create_test_wav(duration_ms=1500, frame_rate=8000):
@@ -71,6 +75,39 @@ class WavDurationTest(unittest.TestCase):
 
 
 class ExternalControlRuntimeTest(unittest.TestCase):
+    def create_schedule_runtime(self):
+        temporary_directory = tempfile.TemporaryDirectory()
+        repository = BroadcastScheduleRepository(
+            Path(temporary_directory.name) / "broadcast_schedule.db"
+        )
+        runtime = ExternalControlRuntime(
+            aivis_client=FakeAivisSpeechClient(),
+            speaker_id=101,
+            public_base_url="http://127.0.0.1:8765",
+            broadcast_schedule_repository=repository,
+        )
+        return temporary_directory, repository, runtime
+
+    def create_stream_plan(self):
+        return StreamThemePlan(
+            theme="自己紹介配信",
+            core_question="ガン奈はどんなAIなのか",
+            opening_angle="まず仕組みから紹介する",
+            opening_greeting="こんばんは。今日はわたしがどんなAIなのか話します。",
+            segments=[
+                StreamSegmentPlan(
+                    title=f"話題{index}",
+                    talking_points=["具体例A", "具体例B"],
+                    tangent_ideas=["関連する話"],
+                    target_utterances=3,
+                )
+                for index in range(1, 4)
+            ],
+            closing_direction="今後やりたい配信を話す",
+            news_policy="off",
+            news_query=None,
+        )
+
     def test_obs_overlay_status_requires_subtitle_topic_and_chat(self):
         runtime = ExternalControlRuntime(
             aivis_client=FakeAivisSpeechClient(),
@@ -247,6 +284,85 @@ class ExternalControlRuntimeTest(unittest.TestCase):
         self.assertEqual(accepted["action"], "prepare_broadcast")
         self.assertEqual(accepted["stream_plan"], "")
 
+    def test_schedule_command_uses_values_saved_in_sqlite(self):
+        temporary_directory, repository, runtime = self.create_schedule_runtime()
+        self.addCleanup(temporary_directory.cleanup)
+        schedule = repository.create_schedule(
+            scheduled_start_at="2026-08-20T21:00:00+09:00",
+            planning_mode="manual",
+            content_request="初見向けの自己紹介配信",
+            title="保存済みタイトル",
+            description="保存済み説明",
+            privacy_status="unlisted",
+        )
+
+        prepare = runtime.enqueue_admin_command(
+            {"action": "prepare_broadcast", "schedule_id": schedule["schedule_id"]}
+        )
+        self.assertEqual(prepare["stream_plan"], "初見向けの自己紹介配信")
+
+        with self.assertRaisesRegex(ValueError, "まだ準備されていません"):
+            runtime.enqueue_admin_command(
+                {
+                    "action": "configure_broadcast",
+                    "schedule_id": schedule["schedule_id"],
+                    "title": "ブラウザからの別タイトル",
+                }
+            )
+
+        runtime.store_prepared_broadcast_draft(
+            self.create_stream_plan(),
+            schedule["content_request"],
+            "draft-schedule",
+            schedule_id=schedule["schedule_id"],
+        )
+        configure = runtime.enqueue_admin_command(
+            {
+                "action": "configure_broadcast",
+                "schedule_id": schedule["schedule_id"],
+                "title": "ブラウザからの別タイトル",
+            }
+        )
+
+        self.assertEqual(configure["title"], "保存済みタイトル")
+        self.assertEqual(configure["description"], "保存済み説明")
+
+    def test_prepared_schedule_plan_can_be_restored_from_sqlite(self):
+        temporary_directory, repository, runtime = self.create_schedule_runtime()
+        self.addCleanup(temporary_directory.cleanup)
+        schedule = repository.create_schedule(
+            scheduled_start_at="2026-08-20T21:00:00+09:00",
+            planning_mode="ai",
+            content_request="",
+            title="雑談配信",
+            description="説明",
+        )
+        plan = self.create_stream_plan()
+        runtime.store_prepared_broadcast_draft(
+            plan,
+            "",
+            "draft-schedule",
+            schedule_id=schedule["schedule_id"],
+        )
+        restarted_runtime = ExternalControlRuntime(
+            aivis_client=FakeAivisSpeechClient(),
+            speaker_id=101,
+            public_base_url="http://127.0.0.1:8765",
+            broadcast_schedule_repository=repository,
+        )
+
+        instruction = restarted_runtime.select_prepared_broadcast_schedule(
+            schedule["schedule_id"]
+        )
+        selected = restarted_runtime.consume_selected_broadcast_plan()
+
+        self.assertIsNone(instruction)
+        self.assertEqual(selected["plan"].theme, plan.theme)
+        self.assertEqual(
+            repository.get_schedule(schedule["schedule_id"])["status"],
+            "prepared",
+        )
+
     def test_prepared_broadcast_plan_is_selected_by_draft_id(self):
         runtime = ExternalControlRuntime(
             aivis_client=FakeAivisSpeechClient(),
@@ -254,8 +370,6 @@ class ExternalControlRuntimeTest(unittest.TestCase):
             public_base_url="http://127.0.0.1:8765",
         )
         plan = SimpleNamespace(
-            youtube_title="自己紹介をするAI VTuber雑談配信",
-            youtube_description="AI VTuberの才羽ガン奈が、仕組みや趣味を自己紹介します。",
             theme="自己紹介配信",
             segments=[SimpleNamespace(title="どんなAIか")],
             news_policy="off",
@@ -270,7 +384,8 @@ class ExternalControlRuntimeTest(unittest.TestCase):
         instruction = runtime.select_prepared_broadcast_plan("draft-1")
         selected = runtime.consume_selected_broadcast_plan()
 
-        self.assertEqual(public_draft["title"], plan.youtube_title)
+        self.assertNotIn("title", public_draft)
+        self.assertNotIn("description", public_draft)
         self.assertEqual(
             runtime.get_admin_status()["broadcast_draft"],
             public_draft,
@@ -286,7 +401,7 @@ class ExternalControlRuntimeTest(unittest.TestCase):
             public_base_url="http://127.0.0.1:8765",
         )
 
-        with self.assertRaisesRegex(RuntimeError, "AI配信案が見つからない"):
+        with self.assertRaisesRegex(RuntimeError, "AI配信構成が見つからない"):
             runtime.select_prepared_broadcast_plan("outdated-draft")
 
     def test_stream_plan_command_is_validated_and_queued(self):
@@ -708,12 +823,17 @@ class CharacterMemoryHttpTest(unittest.TestCase):
             0.8,
             "autonomous_speech",
         )
+        self.schedule_repository = BroadcastScheduleRepository(
+            Path(self.temporary_directory.name) / "broadcast_schedule.db"
+        )
         runtime = ExternalControlRuntime(
             aivis_client=FakeAivisSpeechClient(),
             speaker_id=101,
             public_base_url="http://127.0.0.1",
             character_memory_repository=self.repository,
+            broadcast_schedule_repository=self.schedule_repository,
         )
+        self.runtime = runtime
         self.server = ExternalControlHttpServer(("127.0.0.1", 0), runtime)
         self.thread = threading.Thread(
             target=self.server.serve_forever,
@@ -745,6 +865,106 @@ class CharacterMemoryHttpTest(unittest.TestCase):
         self.assertEqual(len(body["memories"]), 1)
         self.assertEqual(body["memories"][0]["status"], "draft")
 
+    def test_admin_panel_contains_broadcast_calendar(self):
+        with urllib.request.urlopen(
+            f"{self.base_url}/admin",
+            timeout=3,
+        ) as response:
+            html = response.read().decode("utf-8")
+
+        self.assertIn("配信カレンダー", html)
+        self.assertIn("タイトル・説明文テンプレート", html)
+        self.assertIn("/api/broadcast/schedules/save", html)
+        self.assertIn("ライブ制御を起動", html)
+
+    def test_managed_live_service_can_be_started_and_stopped_via_api(self):
+        controller = Mock()
+        controller.is_running.return_value = False
+        self.runtime.attach_live_service_controller(controller)
+
+        start_body = self._post_json("/api/live-service/start", {})
+        controller.is_running.return_value = True
+        stop_body = self._post_json("/api/live-service/stop", {})
+
+        self.assertEqual(start_body["status"], "starting")
+        self.assertEqual(stop_body["status"], "stopping")
+        controller.start.assert_called_once_with()
+        controller.request_stop.assert_called_once_with()
+
+    def test_broadcast_template_and_schedule_can_be_managed_via_api(self):
+        template_body = self._post_json(
+            "/api/broadcast/templates/save",
+            {
+                "name": "通常配信",
+                "title": "ガン奈の雑談配信",
+                "description": "コメント歓迎です。",
+                "privacy_status": "unlisted",
+            },
+        )
+        template = template_body["template"]
+        schedule_body = self._post_json(
+            "/api/broadcast/schedules/save",
+            {
+                "scheduled_start_at": "2026-08-20T12:00:00.000Z",
+                "planning_mode": "ai",
+                "content_request": "親しみやすい日常雑談",
+                "template_id": template["template_id"],
+                "title": template["title"],
+                "description": template["description"],
+                "privacy_status": template["privacy_status"],
+            },
+        )
+        schedule = schedule_body["schedule"]
+        query = urllib.parse.urlencode(
+            {
+                "start_at": "2026-08-01T00:00:00+00:00",
+                "end_at": "2026-09-01T00:00:00+00:00",
+            }
+        )
+
+        with urllib.request.urlopen(
+            f"{self.base_url}/api/broadcast/templates",
+            timeout=3,
+        ) as response:
+            templates = json.loads(response.read().decode("utf-8"))["templates"]
+        with urllib.request.urlopen(
+            f"{self.base_url}/api/broadcast/schedules?{query}",
+            timeout=3,
+        ) as response:
+            schedules = json.loads(response.read().decode("utf-8"))["schedules"]
+
+        self.assertEqual([item["template_id"] for item in templates], [template["template_id"]])
+        self.assertEqual([item["schedule_id"] for item in schedules], [schedule["schedule_id"]])
+
+        self._post_json(
+            "/api/broadcast/schedules/delete",
+            {"schedule_id": schedule["schedule_id"]},
+        )
+        self._post_json(
+            "/api/broadcast/templates/delete",
+            {"template_id": template["template_id"]},
+        )
+        self.assertEqual(self.schedule_repository.list_schedules(), [])
+        self.assertEqual(self.schedule_repository.list_templates(), [])
+
+    def test_invalid_manual_schedule_returns_readable_error(self):
+        with self.assertRaises(urllib.error.HTTPError) as context:
+            self._post_json(
+                "/api/broadcast/schedules/save",
+                {
+                    "scheduled_start_at": "2026-08-20T12:00:00.000Z",
+                    "planning_mode": "manual",
+                    "content_request": "",
+                    "title": "自己紹介配信",
+                    "description": "説明",
+                    "privacy_status": "unlisted",
+                },
+            )
+
+        self.assertEqual(context.exception.code, 400)
+        body = json.loads(context.exception.read().decode("utf-8"))
+        self.assertIn("配信内容を入力", body["error"])
+
     def test_topic_overlay_is_available_separately(self):
         with urllib.request.urlopen(
             f"{self.base_url}/topic-overlay",
@@ -773,6 +993,16 @@ class CharacterMemoryHttpTest(unittest.TestCase):
         self.assertEqual(body["status"], "approved")
         self.assertEqual(self.repository.list("draft"), [])
         self.assertEqual(len(self.repository.list("approved")), 1)
+
+    def _post_json(self, path, body):
+        request = urllib.request.Request(
+            f"{self.base_url}{path}",
+            data=json.dumps(body).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with urllib.request.urlopen(request, timeout=3) as response:
+            return json.loads(response.read().decode("utf-8"))
 
 
 if __name__ == "__main__":

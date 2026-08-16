@@ -49,8 +49,6 @@ class StreamThemePlan(BaseModel):
     opening_greeting: str = Field(min_length=10, max_length=180)
     segments: list[StreamSegmentPlan] = Field(min_length=3, max_length=5)
     closing_direction: str = Field(min_length=5, max_length=100)
-    youtube_title: str = Field(min_length=10, max_length=70)
-    youtube_description: str = Field(min_length=30, max_length=300)
     news_policy: Literal["off", "related", "general"]
     news_query: Optional[str] = Field(min_length=2, max_length=50)
 
@@ -95,9 +93,6 @@ def generate_stream_theme_plan(previous_state=None, instruction=None):
         "関連作品、過去の類似例、視聴者層の反応などを入れてください。\n"
         "opening_greetingは実際に読み上げる2〜3文です。短い挨拶と、今日何を話すかを"
         "初見にも分かる言葉で含め、視聴者がいると断定しないでください。\n"
-        "youtube_titleは配信内容が一目で分かる自然な日本語にし、誇張、煽り、長い副題を"
-        "避けてください。youtube_descriptionは2〜4文で内容とAI配信であることを説明し、"
-        "未確定の日時、URL、ハッシュタグ、事実を作らないでください。\n"
         "世界平和や登録者目標などの設定は、指定や話の流れに関係する時だけ使い、"
         "毎回の企画へ無理に入れないでください。\n"
         "news_policyは、指定内容にニュースが不要ならoff、直接関係するニュースだけを"
@@ -116,7 +111,7 @@ def generate_stream_theme_plan(previous_state=None, instruction=None):
         ),
         input_text=input_text,
         response_model=StreamThemePlan,
-        # 構成に加えてタイトルと説明文も返すため、途中切れによる再試行を避けます。
+        # 長めの構成表でもJSONが途中で切れないよう、十分な出力上限を確保します。
         max_output_tokens=2200,
         request_label="stream_plan",
     )
@@ -435,11 +430,6 @@ class StreamThemeManager:
                 ),
             ],
             closing_direction="話した内容を一つだけ振り返って軽く締める",
-            youtube_title=f"{theme}について話すAI VTuber雑談",
-            youtube_description=(
-                f"AI VTuberの才羽ガン奈が、{theme}について雑談します。"
-                "コメントがあれば会話しながら進める配信です。"
-            ),
             news_policy="off",
             news_query=None,
         )
