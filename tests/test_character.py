@@ -8,9 +8,9 @@ class CharacterPromptTest(unittest.TestCase):
     def test_character_core_is_defined(self):
         for expected in (
             "世界平和",
-            "デスメタル",
-            "ギャンブル",
             "Pythonプログラムを土台に",
+            "好きなものと自分の個性をこれから見つける",
+            "実在する人物、作品、組織、出来事",
         ):
             with self.subTest(expected=expected):
                 self.assertIn(expected, CHARACTER_PROMPT)
@@ -28,19 +28,23 @@ class CharacterPromptTest(unittest.TestCase):
 
     def test_setting_words_are_not_forced_into_every_reply(self):
         self.assertIn(
-            "設定紹介のためだけに持ち出さない",
+            "現時点では強く好きだと断言できる特定の趣味や作品はない",
             CHARACTER_PROMPT,
         )
         self.assertIn(
-            "真顔で変なことを言う",
+            "面白さを毎回作ろうとせず",
             CHARACTER_PROMPT,
         )
 
     def test_character_avoids_poetic_chaos(self):
-        self.assertIn("途中の判断が一か所だけ妙にバカ", CHARACTER_PROMPT)
         self.assertIn("抽象的・詩的な表現", CHARACTER_PROMPT)
-        self.assertIn("具体的な失敗、勘違い、無駄な行動", CHARACTER_PROMPT)
+        self.assertIn("関係のない架空の小話", CHARACTER_PROMPT)
         self.assertIn("大きな人生論へ広げず", CHARACTER_PROMPT)
+
+    def test_removed_hobbies_are_not_character_settings(self):
+        for removed_setting in ("デスメタル", "麻雀", "ギャンブル"):
+            with self.subTest(removed_setting=removed_setting):
+                self.assertNotIn(removed_setting, CHARACTER_PROMPT)
 
     def test_character_has_safe_public_system_awareness(self):
         self.assertIn("APIキー、認証情報、接続先、ローカルファイル", CHARACTER_PROMPT)

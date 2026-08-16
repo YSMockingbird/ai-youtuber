@@ -36,7 +36,13 @@ class ContextBuilder:
         self.conversation = conversation
         self.memory_repository = memory_repository
 
-    def build(self, current_input, user_id="", include_memories=True):
+    def build(
+        self,
+        current_input,
+        user_id="",
+        include_memories=True,
+        include_conversation=True,
+    ):
         original_current_input = str(current_input or "").strip()
         current_input = (
             f"{original_current_input}\n"
@@ -69,11 +75,13 @@ class ContextBuilder:
             int(context_config.get("recent_conversation_token_budget", 700)),
             remaining_budget,
         )
-        recent_lines, used_recent = _take_lines_within_budget(
-            self.conversation.recent_lines(),
-            recent_budget,
-            newest_first=True,
-        )
+        recent_lines, used_recent = ([], 0)
+        if include_conversation:
+            recent_lines, used_recent = _take_lines_within_budget(
+                self.conversation.recent_lines(),
+                recent_budget,
+                newest_first=True,
+            )
         remaining_budget -= used_recent
 
         memory_lines = []
@@ -96,7 +104,11 @@ class ContextBuilder:
             remaining_budget -= used_memory
 
         summary_lines = []
-        if self.conversation.summary and remaining_budget > 0:
+        if (
+            include_conversation
+            and self.conversation.summary
+            and remaining_budget > 0
+        ):
             summary_budget = min(
                 int(context_config.get("stream_summary_token_budget", 300)),
                 remaining_budget,

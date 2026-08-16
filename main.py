@@ -20,6 +20,7 @@ from character_memory import get_character_memory_repository
 from control_server import ALLOWED_EMOTIONS, ExternalControlServer
 from llm.config import load_llm_config
 from llm.session import StreamContextManager
+from local_services import ensure_live_local_services, wait_for_obs_ready
 from motion_control import MotionRateLimiter
 from news_source import fetch_news_articles, select_news_article
 from obs_websocket import ObsWebSocketClient
@@ -1336,6 +1337,8 @@ def run_ai_youtuber_loop(
     # コメントを優先し、音声終了後の無言時間が続いたら自発発話します。
     prepared_theme_plan = None
     if runtime is not None:
+        # OBSブラウザが保持している前回配信の字幕・話題・コメントを先に消去します。
+        runtime.clear_overlays()
         overlay_wait_seconds = get_obs_overlay_wait_seconds()
         runtime.update_admin_status(
             available=True,
@@ -1675,16 +1678,19 @@ def run_ai_youtuber_loop(
 
 def run_ai_youtuber_live(max_loops, stream_topic=None, stream_plan=None):
     # YouTube、OpenAI、AivisSpeech、AITuber OnAirをまとめて実行します。
-    server, version, speaker_id, port = start_external_control_server()
-    print_external_control_server_info(version, speaker_id, port)
+    local_services = ensure_live_local_services()
+    server = None
 
     try:
+        server, version, speaker_id, port = start_external_control_server()
+        print_external_control_server_info(version, speaker_id, port)
+
         from news_history import get_news_history_repository
 
         news_history_repository = get_news_history_repository()
         obs_websocket_client = ObsWebSocketClient.from_env()
         if obs_websocket_client is not None:
-            output_active = obs_websocket_client.get_stream_status()
+            output_active = wait_for_obs_ready(obs_websocket_client)
             print(
                 "OBS WebSocket接続確認：成功 "
                 f"配信出力={'稼働中' if output_active else '停止中'}"
@@ -1698,13 +1704,15 @@ def run_ai_youtuber_live(max_loops, stream_topic=None, stream_plan=None):
             news_history_repository=news_history_repository,
         )
     finally:
-        server.runtime.update_admin_status(
-            available=False,
-            phase="stopped",
-            message="ライブ制御は停止しています。",
-        )
-        server.stop()
-        print("外部制御サーバーを停止しました。")
+        if server is not None:
+            server.runtime.update_admin_status(
+                available=False,
+                phase="stopped",
+                message="ライブ制御は停止しています。",
+            )
+            server.stop()
+            print("外部制御サーバーを停止しました。")
+        local_services.stop()
 
 
 def parse_args():

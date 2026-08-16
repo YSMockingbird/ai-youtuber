@@ -40,9 +40,8 @@ class ContextManagementTest(unittest.TestCase):
             "視聴者コメントへの返答ではなく、現在の状況に合う独り言を話してください。\n"
             "視聴者がいると決めつけず、呼びかけ、同意の要求、質問はしないでください。\n"
             "直近の発言と話題、結論、導入表現が重ならない、自然な2〜4文にしてください。\n"
-            "聞いた人に知識や教訓を残そうとせず、どうでもいい一点への妙な執着や、"
-            "半歩ずれた仮説を優先してください。\n"
-            "無理にオチを付けず、真顔で少し変なことを言って終えてください。\n\n"
+            "実在する対象について、確認できる具体点への評価と理由を話してください。\n"
+            "架空の小話や無理なオチを作らず、普通の意見で終えて構いません。\n\n"
             "[配信テーマ]\n"
             "メインテーマ: インターネットと集中力\n"
             "中心となる問い: 集中力はどこまで環境に左右されるのか\n"
@@ -52,10 +51,10 @@ class ContextManagementTest(unittest.TestCase):
             "- ブラウザのタブを開きすぎると意識まで分割された気分になる\n"
             "- 通知音が鳴っていないのにスマートフォンを確認してしまう\n"
             "- 集中しようと決めた瞬間に机の汚れが気になり始める\n"
-            "今回の展開方法: メインテーマの周辺にある、どうでもいい一点へ寄り道する。\n"
+            "今回の展開方法: メインテーマの具体的な論点を一段だけ掘る。\n"
             "テーマを言い直さず、前の発言から話を続ける。\n"
             "同じ結論を繰り返さない。脱線を毎回戻す必要はない。\n\n"
-            "今回の話題方針: 身近な習慣から妙な分類を一つだけ話す\n"
+            "今回の話題方針: 身近な習慣への率直な評価を一つだけ話す\n"
             "現在の状況: ライブ配信中。コメントが来ていない静かな時間"
         )
 
@@ -98,6 +97,27 @@ class ContextManagementTest(unittest.TestCase):
             config["context"]["total_token_budget"],
         )
 
+    def test_autonomous_context_can_exclude_comment_history(self):
+        conversation = ConversationState(4, 200)
+        conversation.add("user", "かわいいね", user_name="視聴者")
+        conversation.add("assistant", "ありがとう。")
+        builder = ContextBuilder(
+            "短い人格設定",
+            {"context": {"total_token_budget": 500}},
+            conversation,
+            memory_repository=None,
+        )
+
+        prompt = builder.build(
+            "自己紹介の本編へ戻る",
+            include_memories=False,
+            include_conversation=False,
+        )
+
+        self.assertNotIn("かわいいね", prompt)
+        self.assertNotIn("ありがとう。", prompt)
+        self.assertNotIn("[Recent Conversation]", prompt)
+
     def test_old_messages_are_moved_to_bounded_summary(self):
         conversation = ConversationState(
             recent_message_count=2,
@@ -117,7 +137,7 @@ class ContextManagementTest(unittest.TestCase):
                 Path(temporary_directory) / "memory.db"
             )
             repository.save("user-a", "A", "北海道旅行が好き", "preference", 0.8)
-            repository.save("user-b", "B", "麻雀が好き", "preference", 1.0)
+            repository.save("user-b", "B", "サッカーが好き", "preference", 1.0)
             conversation = ConversationState(4, 200)
             conversation.add("assistant", "旅行の話をしていたね")
             config = {
@@ -139,7 +159,7 @@ class ContextManagementTest(unittest.TestCase):
             prompt = builder.build("北海道へまた行きたい", user_id="user-a")
 
             self.assertIn("北海道旅行が好き", prompt)
-            self.assertNotIn("麻雀が好き", prompt)
+            self.assertNotIn("サッカーが好き", prompt)
             self.assertLessEqual(
                 estimate_tokens("短い人格設定") + estimate_tokens(prompt),
                 500,

@@ -30,11 +30,11 @@ class ParseAiResponseTest(unittest.TestCase):
     @patch("ai_response._generate_structured_response")
     def test_admin_instruction_is_not_read_as_viewer_comment(self, generate_mock):
         generate_mock.return_value = {
-            "text": "麻雀の話へ移ろうか。",
+            "text": "VTuber界隈の話へ移ろうか。",
             "emotion": "relaxed",
         }
 
-        generate_admin_directed_speech("麻雀の話題へ自然に移って")
+        generate_admin_directed_speech("VTuber界隈の話題へ自然に移って")
 
         prompt = generate_mock.call_args.args[0]
         self.assertIn("配信管理者からの非公開指示", prompt)
@@ -171,7 +171,8 @@ class ParseAiResponseTest(unittest.TestCase):
         self.assertIn("確認できた情報源は一媒体です", prompt)
         self.assertIn("人物やファンを攻撃せず", prompt)
         self.assertIn("無関係な物やキャラクター設定を足さず", prompt)
-        self.assertIn("文学的・無難な結論を避け", prompt)
+        self.assertIn("ガン奈自身の評価とその理由", prompt)
+        self.assertIn("面白さを作るために事実を曲げない", prompt)
         self.assertIn("事件、事故、災害ではブラックジョーク", prompt)
         self.assertIn("誰または何がどうした記事なのか", prompt)
         self.assertIn("前提を知らない途中参加者", prompt)
@@ -245,10 +246,13 @@ class ParseAiResponseTest(unittest.TestCase):
         self.assertIn("- 前回の発言", prompt)
         self.assertIn("今回の話題方針: 役立つ雑学を一つ話す", prompt)
         self.assertIn("視聴者がいると決めつけず", prompt)
-        self.assertIn("メインテーマを最優先にしてください", prompt)
+        self.assertIn("配信構成表の現在区間を最優先にしてください", prompt)
         self.assertIn("途中から聞いた人にも何について話しているか", prompt)
         self.assertIn("冒頭に具体的な対象", prompt)
-        self.assertIn("[ガン奈の記録済みエピソード]", prompt)
+        self.assertIn("構成表の材料は読み上げ用の台本ではありません", prompt)
+        self.assertIn("現在の正体、個性、価値観", prompt)
+        self.assertIn("まだ好きなものを探している", prompt)
+        self.assertIn("架空の友達、過去の失敗", prompt)
         self.assertEqual(response["emotion"], "happy")
 
     @patch("ai_response._generate_structured_response")
@@ -278,6 +282,7 @@ class ParseAiResponseTest(unittest.TestCase):
         context_builder.build.assert_called_once_with(
             current_input,
             include_memories=False,
+            include_conversation=False,
         )
 
 

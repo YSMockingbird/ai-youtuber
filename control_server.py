@@ -330,6 +330,20 @@ class ChatEventBroker:
         except queue.Full:
             return 0
 
+    def clear(self):
+        # OBSが前回のDOMを保持していても、空のスナップショットで確実に消去します。
+        command = {"type": "chat_snapshot", "messages": []}
+        with self._lock:
+            self._history.clear()
+            subscriber = self._subscribers[-1] if self._subscribers else None
+        if subscriber is None:
+            return 0
+        try:
+            subscriber.put_nowait(command)
+            return 1
+        except queue.Full:
+            return 0
+
     def subscriber_count(self):
         with self._lock:
             return min(len(self._subscribers), 1)
@@ -661,6 +675,20 @@ class ExternalControlRuntime:
         return self.topic_event_broker.publish(
             {"type": "clear_topic_card", "id": uuid.uuid4().hex}
         )
+
+    def clear_overlays(self):
+        # 配信セッション開始時に、OBSへ残った前回の表示だけを初期化します。
+        clear_id = uuid.uuid4().hex
+        subtitle_delivered = self.subtitle_event_broker.publish(
+            {"type": "clear", "id": clear_id}
+        )
+        topic_delivered = self.clear_topic_card()
+        chat_delivered = self.chat_event_broker.clear()
+        return {
+            "subtitle": subtitle_delivered,
+            "topic": topic_delivered,
+            "chat": chat_delivered,
+        }
 
     def prepare_speech(self, text, emotion="neutral", speech_style="normal"):
         # 再生中に次の音声を先読みできるよう、合成と配信を分離します。

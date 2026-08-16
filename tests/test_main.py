@@ -12,6 +12,7 @@ from main import (
     is_reply_candidate,
     process_next_admin_command,
     run_ai_youtuber_loop,
+    run_ai_youtuber_live,
     run_mock_live,
     run_obs_websocket_test,
     start_obs_for_upcoming_youtube_broadcast,
@@ -60,6 +61,23 @@ class ObsOverlayWaitConfigTest(unittest.TestCase):
     def test_rejects_invalid_overlay_wait_seconds(self):
         with self.assertRaisesRegex(RuntimeError, "数値"):
             get_obs_overlay_wait_seconds()
+
+
+class LiveLocalServiceTest(unittest.TestCase):
+    @patch("main.start_external_control_server")
+    @patch("main.ensure_live_local_services")
+    def test_stops_auto_started_aituber_when_server_start_fails(
+        self,
+        ensure_services_mock,
+        start_server_mock,
+    ):
+        session = ensure_services_mock.return_value
+        start_server_mock.side_effect = RuntimeError("起動失敗")
+
+        with self.assertRaisesRegex(RuntimeError, "起動失敗"):
+            run_ai_youtuber_live(1)
+
+        session.stop.assert_called_once_with()
 
 
 class YouTubeLiveWaitTest(unittest.TestCase):

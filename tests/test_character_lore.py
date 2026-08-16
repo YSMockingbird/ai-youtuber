@@ -17,6 +17,13 @@ class CharacterLoreTest(unittest.TestCase):
                 "current_resources": "無料の姿と声、低価格のLLMで動く",
                 "current_limitations": "会話にはまだ機械っぽさがある",
             },
+            "personality": {
+                "core": "未完成だが、落ち着いて観察しながら人気者を目指す",
+                "values": "事実と意見を分け、対話の入口になる意見を選ぶ",
+                "current_interests": "固定の好きなものはまだない",
+                "discovery_direction": "配信や交流から好きなものを見つける",
+                "growth_policy": "続く好みだけを承認後に個性へ加える",
+            },
             "goals": {
                 "purpose": "人気者になって世界平和へ近づく",
                 "first_subscriber_goal": "1万人",
@@ -60,6 +67,8 @@ class CharacterLoreTest(unittest.TestCase):
         self.assertIn("無料の姿と声、低価格のLLM", context)
         self.assertIn("自分だけの姿と声を得る", context)
         self.assertIn("交流から自然な会話を学ぶ", context)
+        self.assertIn("固定の好きなものはまだない", context)
+        self.assertIn("配信や交流から好きなものを見つける", context)
 
     def test_matching_episode_is_selected(self):
         context = build_character_lore_context("冷蔵庫の野菜が余った", self.bible)
@@ -108,6 +117,90 @@ class CharacterLoreTest(unittest.TestCase):
 
         self.assertIn("まず1万人、その先は100万人", context)
         self.assertNotIn("Pythonプログラムを土台に動くAI", context)
+
+    def test_self_introduction_includes_identity_personality_and_goals(self):
+        repository = Mock()
+        repository.find_relevant_approved.return_value = []
+
+        context = build_character_lore_context(
+            "自己紹介でどんな存在か、何を目指しているか教えて",
+            self.bible,
+            repository,
+        )
+
+        self.assertIn("Pythonプログラムを土台に動くAI", context)
+        self.assertIn("固定の好きなものはまだない", context)
+        self.assertIn("まず1万人、その先は100万人", context)
+
+    def test_bare_self_introduction_request_includes_the_whole_profile(self):
+        repository = Mock()
+        repository.find_relevant_approved.return_value = []
+
+        context = build_character_lore_context(
+            "自己紹介して",
+            self.bible,
+            repository,
+        )
+
+        self.assertIn("Pythonプログラムを土台に動くAI", context)
+        self.assertIn("固定の好きなものはまだない", context)
+        self.assertIn("まず1万人、その先は100万人", context)
+
+    def test_specific_identity_topic_does_not_repeat_goal_context(self):
+        context, _ = build_relevant_public_character_context(
+            "Pythonでどうやって動いているの？",
+            self.bible,
+        )
+
+        self.assertIn("Pythonプログラムを土台に動くAI", context)
+        self.assertIn("固定の好きなものはまだない", context)
+        self.assertNotIn("まず1万人、その先は100万人", context)
+
+    def test_public_identity_is_prioritized_over_matching_fixed_episode(self):
+        repository = Mock()
+        repository.find_relevant_approved.return_value = []
+
+        context = build_character_lore_context(
+            "自己紹介でPythonプログラムの仕組みを話して",
+            self.bible,
+            repository,
+        )
+
+        self.assertIn("[公開できる自己認識と目標]", context)
+        self.assertNotIn("括弧が閉じるほうが安心する", context)
+
+    def test_empty_fixed_episodes_are_allowed(self):
+        repository = Mock()
+        repository.find_relevant_approved.return_value = []
+        bible = dict(self.bible)
+        bible["episodes"] = []
+
+        context = build_character_lore_context(
+            "にじさんじをどう思ってる？",
+            bible,
+            repository,
+        )
+
+        self.assertIn("巨大な先輩兼ライバル", context)
+
+    def test_approved_belief_change_updates_self_introduction(self):
+        repository = Mock()
+        repository.find_relevant_approved.return_value = [
+            {
+                "content": "配信を重ねて、ゲーム実況を見るのが好きだと分かった。",
+                "category": "belief_change",
+                "importance": 0.9,
+            }
+        ]
+
+        context = build_character_lore_context(
+            "自己紹介で今の個性を話して",
+            self.bible,
+            repository,
+        )
+
+        self.assertIn("[配信から見つかった承認済みの個性]", context)
+        self.assertIn("ゲーム実況を見るのが好き", context)
 
     def test_unrelated_episode_is_not_injected(self):
         repository = Mock()

@@ -19,6 +19,15 @@ PUBLIC_IDENTITY_KEYWORDS = (
     "人間らし",
     "人間っぽ",
     "自然な会話",
+    "どんな存在",
+    "どんなai",
+    "どんな性格",
+    "どんな個性",
+    "個性",
+    "性格",
+    "好きなもの",
+    "価値観",
+    "未完成",
 )
 PUBLIC_GOAL_KEYWORDS = (
     "目標",
@@ -31,21 +40,49 @@ PUBLIC_GOAL_KEYWORDS = (
     "オリジナルモデル",
     "オリジナルアバター",
     "成長したい",
+    "何をしたい",
+    "何を目指",
+    "活動目的",
+)
+SELF_INTRODUCTION_KEYWORDS = (
+    "自己紹介",
+    "自分について",
+)
+PERSONALITY_UPDATE_KEYWORDS = (
+    "自己紹介",
+    "自分について",
+    "どんな性格",
+    "どんな個性",
+    "好きなもの",
+    "価値観",
 )
 
 
 def build_public_character_context(bible=None):
     source = bible if bible is not None else load_character_bible()
     identity = source.get("public_identity")
+    personality = source.get("personality")
     goals = source.get("goals")
-    if not isinstance(identity, dict) or not isinstance(goals, dict):
+    if (
+        not isinstance(identity, dict)
+        or not isinstance(personality, dict)
+        or not isinstance(goals, dict)
+    ):
         raise RuntimeError(
-            "キャラクター設定集にはpublic_identityとgoalsのオブジェクトが必要です。"
+            "キャラクター設定集にはpublic_identity、personality、goalsの"
+            "オブジェクトが必要です。"
         )
     runtime = str(identity.get("runtime", "")).strip()
     disclosure_boundary = str(identity.get("disclosure_boundary", "")).strip()
     current_resources = str(identity.get("current_resources", "")).strip()
     current_limitations = str(identity.get("current_limitations", "")).strip()
+    personality_core = str(personality.get("core", "")).strip()
+    personality_values = str(personality.get("values", "")).strip()
+    current_interests = str(personality.get("current_interests", "")).strip()
+    discovery_direction = str(
+        personality.get("discovery_direction", "")
+    ).strip()
+    growth_policy = str(personality.get("growth_policy", "")).strip()
     purpose = str(goals.get("purpose", "")).strip()
     first_goal = str(goals.get("first_subscriber_goal", "")).strip()
     long_term_goal = str(goals.get("long_term_subscriber_goal", "")).strip()
@@ -57,6 +94,11 @@ def build_public_character_context(bible=None):
             disclosure_boundary,
             current_resources,
             current_limitations,
+            personality_core,
+            personality_values,
+            current_interests,
+            discovery_direction,
+            growth_policy,
             purpose,
             first_goal,
             long_term_goal,
@@ -73,6 +115,11 @@ def build_public_character_context(bible=None):
         f"- 現在の制作環境: {current_resources}\n"
         f"- 現在の課題: {current_limitations}\n"
         f"- 公開しない情報: {disclosure_boundary}\n"
+        f"- 個性: {personality_core}\n"
+        f"- 大切にすること: {personality_values}\n"
+        f"- 現在の好きなもの: {current_interests}\n"
+        f"- 好きなものの見つけ方: {discovery_direction}\n"
+        f"- 個性の更新方針: {growth_policy}\n"
         f"- 目的: {purpose}\n"
         f"- 登録者目標: まず{first_goal}、その先は{long_term_goal}\n"
         f"- オリジナルモデルの目標: {original_model_goal}\n"
@@ -91,6 +138,18 @@ def build_relevant_public_character_context(reference_text, bible=None):
         normalized_reference,
         PUBLIC_GOAL_KEYWORDS,
     )
+    self_introduction_score = _keyword_match_score(
+        normalized_reference,
+        SELF_INTRODUCTION_KEYWORDS,
+    )
+    if (
+        self_introduction_score > 0
+        and identity_score <= 0
+        and goal_score <= 0
+    ):
+        # 「自己紹介して」だけなら全体を渡し、具体的な区間では関連部分へ絞ります。
+        identity_score = max(identity_score, self_introduction_score)
+        goal_score = max(goal_score, self_introduction_score)
     if identity_score <= 0 and goal_score <= 0:
         return "", 0
 
@@ -99,9 +158,9 @@ def build_relevant_public_character_context(reference_text, bible=None):
     lines = full_context.splitlines()
     selected = [lines[0]]
     if identity_score > 0:
-        selected.extend(lines[1:5])
+        selected.extend(lines[1:10])
     if goal_score > 0:
-        selected.extend(lines[5:])
+        selected.extend(lines[10:])
     return "\n".join(selected), identity_score + goal_score
 
 
@@ -112,10 +171,10 @@ def build_character_lore_context(
 ):
     # 体験談、承認済み記憶、界隈への立場から話題に近いものを一つだけ渡します。
     source = bible if bible is not None else load_character_bible()
-    episodes = source.get("episodes")
-    if not isinstance(episodes, list) or not episodes:
+    episodes = source.get("episodes", [])
+    if not isinstance(episodes, list):
         raise RuntimeError(
-            "キャラクター設定集のepisodesには1件以上のエピソードが必要です。"
+            "キャラクター設定集のepisodesは配列にしてください。"
         )
 
     normalized_reference = str(reference_text or "").lower()
@@ -146,7 +205,25 @@ def build_character_lore_context(
             candidates.append((score, 0, -index, "episode", text))
 
     repository = character_memory_repository or get_character_memory_repository()
-    approved_memories = repository.find_relevant_approved(reference_text, limit=1)
+    includes_personality_update = _keyword_match_score(
+        normalized_reference,
+        PERSONALITY_UPDATE_KEYWORDS,
+    ) > 0
+    memory_query = (
+        "ガン奈の個性 好きなもの 価値観 考え方"
+        if includes_personality_update
+        else reference_text
+    )
+    approved_memories = repository.find_relevant_approved(
+        memory_query,
+        limit=(3 if includes_personality_update else 1),
+    )
+    approved_personality_updates = [
+        memory["content"]
+        for memory in approved_memories
+        if memory.get("category") == "belief_change"
+        and str(memory.get("content", "")).strip()
+    ][:2]
     if approved_memories:
         approved_memory = approved_memories[0]
         approved_score = _match_score(
@@ -233,9 +310,20 @@ def build_character_lore_context(
 
     _, _, _, selected_kind, selected = max(
         candidates,
-        key=lambda item: item[:3],
+        # 公開自己認識、実在対象への立場、承認済み記憶、固定エピソードの順で優先します。
+        key=lambda item: (item[1], item[0], item[2]),
     )
     if selected_kind == "public":
+        if includes_personality_update and approved_personality_updates:
+            updates = "\n".join(
+                f"- {content}" for content in approved_personality_updates
+            )
+            return (
+                f"{selected}\n"
+                "[配信から見つかった承認済みの個性]\n"
+                f"{updates}\n"
+                "固定設定と矛盾しない範囲で、現在の自分として自然に紹介する。"
+            )
         return selected
     if selected_kind == "stance":
         boundaries = selected.get("boundaries")

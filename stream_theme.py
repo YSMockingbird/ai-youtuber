@@ -8,6 +8,28 @@ from llm.config import load_llm_config
 from time_context import get_current_datetime_context
 
 
+DELIVERY_STYLES = (
+    (
+        "具体的な場面",
+        "中心材料が表れる具体的な場面を一つだけ話す。一般論や定義から始めない",
+    ),
+    (
+        "率直な好み",
+        "中心材料について、自分なら何を好きか、苦手に感じるか、どちらを選ぶかの"
+        "どれか一つを率直に話す。特徴を列挙しない",
+    ),
+    (
+        "小さな行動",
+        "中心材料に関して実際にする、または避ける小さな行動を一つ話す。"
+        "確認できない過去の出来事を事実として作らない",
+    ),
+    (
+        "短い立場",
+        "中心材料への立場を一つに絞り、理由を短く添える。無理にオチや教訓を付けない",
+    ),
+)
+
+
 class StreamSegmentPlan(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -52,7 +74,13 @@ def generate_stream_theme_plan(previous_state=None, instruction=None):
         "配信構成表を作ってください。発話本文を全部書く台本ではありません。\n"
         f"配信者からの指定: {requested_program}\n"
         "指定がある場合は最優先してください。『自己紹介配信』なら、AIとしての仕組み、"
-        "性格や趣味、活動目的、今後やりたいことなどを初見向けの順番にしてください。\n"
+        "性格と価値観、活動目的、目標、今後やりたいことを初見向けの順番にしてください。\n"
+        "自己紹介の場合、talking_pointsを『性格』『趣味』のような抽象語だけにせず、"
+        "Pythonを本体にして動くこと、未完成だが野心は強い個性、現時点では固定の"
+        "好きなものがなく配信を通じて見つけたいこと、笑いや対話を広げて世界平和へ"
+        "近づく活動目的、登録者とオリジナルモデルの目標、今後やりたい配信のうち"
+        "複数を具体的な材料として分けてください。一度にプロフィール一覧を読ませず、"
+        "別のtalking_pointsまたは区間として少しずつ話せる構成にしてください。\n"
         "具体的な指定がない場合は、VTuber、アニメ、ゲーム、配信文化、ネット上の出来事など、"
         "実在する人物・作品・発表・騒動を扱う時事雑談番組にしてください。"
         "『コンビニで買う物』『普段ついやること』のような一般的な日常あるあるを"
@@ -70,8 +98,8 @@ def generate_stream_theme_plan(previous_state=None, instruction=None):
         "youtube_titleは配信内容が一目で分かる自然な日本語にし、誇張、煽り、長い副題を"
         "避けてください。youtube_descriptionは2〜4文で内容とAI配信であることを説明し、"
         "未確定の日時、URL、ハッシュタグ、事実を作らないでください。\n"
-        "世界平和、デスメタル、麻雀、ギャンブルなどの設定は、指定や話の流れに"
-        "関係する時だけ使い、毎回の企画へ無理に入れないでください。\n"
+        "世界平和や登録者目標などの設定は、指定や話の流れに関係する時だけ使い、"
+        "毎回の企画へ無理に入れないでください。\n"
         "news_policyは、指定内容にニュースが不要ならoff、直接関係するニュースだけを"
         "使えるならrelated、AIにおまかせで幅広い時事を扱う場合だけgeneralにしてください。"
         "relatedの場合だけ、Google News検索用の短いnews_queryを設定してください。"
@@ -89,7 +117,7 @@ def generate_stream_theme_plan(previous_state=None, instruction=None):
         input_text=input_text,
         response_model=StreamThemePlan,
         # 構成に加えてタイトルと説明文も返すため、途中切れによる再試行を避けます。
-        max_output_tokens=1500,
+        max_output_tokens=2200,
         request_label="stream_plan",
     )
 
@@ -108,6 +136,7 @@ class StreamThemeState:
     last_speech: str = ""
     covered_points: list = field(default_factory=list)
     tangent_topic: str = ""
+    returning_from_comment: bool = False
     utterance_count: int = 0
     needs_new_plan: bool = False
     news_policy: str = "general"
@@ -172,18 +201,50 @@ class StreamThemeManager:
     def build_context(self, speech_type):
         self._renew_plan_if_needed()
         segment = self.current_segment
-        points = "\n".join(f"- {point}" for point in segment.talking_points)
-        tangents = "\n".join(f"- {idea}" for idea in segment.tangent_ideas)
-        covered = "\n".join(
-            f"- {point}" for point in self.state.covered_points[-2:]
+        # LLMへ全材料を一度に渡さず、Python側で今回扱う一件を決めます。
+        # 材料数より発話数が多い区間では脱線候補も使い、同じ説明の循環を避けます。
+        materials = list(segment.talking_points) + list(segment.tangent_ideas)
+        material_index = self.state.segment_utterance_count % len(materials)
+        current_material = materials[material_index]
+        style_index = (
+            self.state.utterance_count + self.state.segment_index
+        ) % len(DELIVERY_STYLES)
+        style_name, style_instruction = DELIVERY_STYLES[style_index]
+        is_last_utterance = (
+            self.state.segment_utterance_count + 1 >= segment.target_utterances
+        )
+        if is_last_utterance:
+            style_name = "次の区間へのつなぎ"
+            style_instruction = (
+                "中心材料への考えを一つだけ話し、要約や箇条書きをせず、次の話へ"
+                "移れる余白を残す。次の区間の内容を先に説明しない"
+            )
+        recent_covered = self.state.covered_points
+        if recent_covered and recent_covered[-1] == self.state.last_speech:
+            # 直前発話は専用欄へ出すため、同じ文章を二重に渡しません。
+            recent_covered = recent_covered[:-1]
+        reused_materials = "\n".join(
+            f"- {point[:56]}" for point in recent_covered[-4:]
         ) or "- まだなし"
+        displayed_tangent = self.state.tangent_topic or "なし"
+        displayed_last_speech = self.state.last_speech or "なし"
+        if self.state.returning_from_comment:
+            # 返信済みコメントの強い単語を再入力せず、本編の材料だけへ注意を戻します。
+            displayed_tangent = "視聴者コメントへの返信は完了"
+            displayed_last_speech = "視聴者コメントへの返信（完了）"
         mode_instruction = {
             "observation": "現在扱っている人物・作品・出来事への具体的な反応を一段だけ進める",
             "character_thought": "現在の実在ネタをキャラクターらしい判断で少し横へ広げる",
             "trivia": "現在の実在ネタへ直接つながる短い背景情報だけを足す",
             "news": "取得した実在の記事を今回の中心題材にして、同じ記事を数発話かけて掘る",
         }.get(speech_type, "現在の区間を自然に前へ進める")
-        if self.state.segment_utterance_count == 0:
+        if self.state.returning_from_comment:
+            transition = (
+                "視聴者コメントへの返答は直前の発言で完了した。コメントの言葉や"
+                "褒め言葉を解説せず、今回から現在の区間へ戻る。必要なら接点は冒頭の"
+                "一言だけにして、この区間の未使用材料を中心に話す"
+            )
+        elif self.state.segment_utterance_count == 0:
             transition = (
                 f"前の区間『{self.state.previous_segment_title}』から接点を一言残して"
                 "新しい話へ移る"
@@ -200,16 +261,17 @@ class StreamThemeManager:
             f"配信企画: {self.state.main_theme}\n"
             f"現在の区間: {self.state.segment_index + 1}/{len(self.state.segments)} "
             f"{segment.title}\n"
-            f"この区間の材料:\n{points}\n"
-            f"自然な脱線候補:\n{tangents}\n"
-            f"現在の一時的な脱線: {self.state.tangent_topic or 'なし'}\n"
-            f"直前の発言: {self.state.last_speech or 'なし'}\n"
-            f"最近すでに話した内容:\n{covered}\n"
-            f"今回の展開: {mode_instruction}\n"
+            f"今回必ず扱う中心材料: {current_material}\n"
+            f"今回の話し方: {style_name} - {style_instruction}\n"
+            f"現在の一時的な脱線: {displayed_tangent}\n"
+            f"直前の発言: {displayed_last_speech}\n"
+            f"再利用しない直近の具体例・論点:\n{reused_materials}\n"
+            f"話題種類による補助指示: {mode_instruction}\n"
             f"話題移動: {transition}\n"
-            "材料を順番に読み上げず、未使用の材料か脱線候補を一つ選ぶ。"
-            "同じ単語、例、結論を言い換えない。脱線は1〜2発話でよく、"
-            "面白ければ次の材料へ接続し、行き止まりなら現在の区間へ戻る。"
+            "直前発話との接続より、今回の中心材料を優先する。中心材料の文言を"
+            "見出しのように読み上げたり、定義・解説したりせず、一人称の自然な"
+            "発話に変える。再利用しない欄にある具体例、比喩、論点、結論を再登場させず、"
+            "同じ単語、例、結論を言い換えない。"
         )
 
     def record_opening(self, text):
@@ -218,15 +280,20 @@ class StreamThemeManager:
             self.state.last_speech = compact_text
 
     def record_autonomous_speech(self, text, speech_type):
+        returning_from_comment = self.state.returning_from_comment
         compact_text = " ".join(str(text).split())[:80]
         if compact_text:
             self.state.covered_points.append(compact_text)
             self.state.covered_points = self.state.covered_points[-10:]
             self.state.current_focus = compact_text
             self.state.last_speech = compact_text
-        self.state.tangent_topic = (
-            compact_text if speech_type in {"news", "trivia"} else ""
-        )
+        if returning_from_comment:
+            self.state.tangent_topic = ""
+            self.state.returning_from_comment = False
+        else:
+            self.state.tangent_topic = (
+                compact_text if speech_type in {"news", "trivia"} else ""
+            )
         self.state.utterance_count += 1
         self.state.segment_utterance_count += 1
         if self.state.segment_utterance_count >= self.current_segment.target_utterances:
@@ -240,10 +307,9 @@ class StreamThemeManager:
             if normalized_comment
             else "コメントからの枝分かれ"
         )
+        self.state.returning_from_comment = True
         if normalized_response:
             self.state.last_speech = normalized_response
-            self.state.covered_points.append(normalized_response)
-            self.state.covered_points = self.state.covered_points[-10:]
 
     def replace_program(self, instruction):
         normalized_instruction = str(instruction or "").strip()
@@ -352,7 +418,7 @@ class StreamThemeManager:
                 StreamSegmentPlan(
                     title="身近な入口",
                     talking_points=[f"{theme}を意識する場面", "最初に思い浮かぶ具体例"],
-                    tangent_ideas=["最近の小さな失敗"],
+                    tangent_ideas=["関連する実在の出来事"],
                     target_utterances=4,
                 ),
                 StreamSegmentPlan(
@@ -364,7 +430,7 @@ class StreamThemeManager:
                 StreamSegmentPlan(
                     title="少し横の話",
                     talking_points=["別の日常場面との共通点", "今後試してみたいこと"],
-                    tangent_ideas=["趣味との意外な接点"],
+                    tangent_ideas=["実在する人物や作品との接点"],
                     target_utterances=4,
                 ),
             ],

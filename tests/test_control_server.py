@@ -121,6 +121,8 @@ class ExternalControlRuntimeTest(unittest.TestCase):
 
         self.assertNotIn("topic-events", subtitle_html)
         self.assertNotIn("topicCard", subtitle_html)
+        self.assertIn("width: min(88%, 900px)", subtitle_html)
+        self.assertIn("const MAX_SEGMENT_LENGTH = 60", subtitle_html)
         self.assertIn("topic-events", topic_html)
         self.assertIn("topicCard", topic_html)
         self.assertNotIn("現在のトークテーマ", topic_html)
@@ -353,6 +355,36 @@ class ExternalControlRuntimeTest(unittest.TestCase):
 
         self.assertEqual(snapshot["type"], "chat_snapshot")
         self.assertEqual(snapshot["messages"][0]["comment"], "再接続後も表示")
+
+    def test_clear_overlays_removes_retained_display_state(self):
+        runtime = ExternalControlRuntime(
+            aivis_client=FakeAivisSpeechClient(),
+            speaker_id=101,
+            public_base_url="http://127.0.0.1:8765",
+        )
+        runtime.publish_chat_messages(
+            [
+                {
+                    "message_id": "old-message",
+                    "user_name": "前回の視聴者",
+                    "comment": "前回のコメント",
+                    "published_at": "",
+                }
+            ]
+        )
+        runtime.publish_topic_card(
+            {"kind": "talk", "title": "前回の話題", "summary": "前回の内容"}
+        )
+        runtime.speak("前回の字幕", "neutral")
+
+        runtime.clear_overlays()
+
+        chat_snapshot = runtime.chat_event_broker.subscribe().get_nowait()
+        topic_command = runtime.topic_event_broker.subscribe().get_nowait()
+        subtitle_command = runtime.subtitle_event_broker.subscribe().get_nowait()
+        self.assertEqual(chat_snapshot, {"type": "chat_snapshot", "messages": []})
+        self.assertEqual(topic_command["type"], "clear_topic_card")
+        self.assertEqual(subtitle_command["type"], "clear")
 
     def test_chat_reply_state_is_saved_and_published(self):
         runtime = ExternalControlRuntime(

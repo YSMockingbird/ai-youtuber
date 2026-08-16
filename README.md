@@ -177,7 +177,7 @@ YouTube Liveコメントを継続取得し、新規コメントにAIが返答し
 
 ## AivisSpeechとAITuber OnAirの接続
 
-先にAivisSpeechを起動します。接続確認とスタイルID一覧を表示します。
+接続確認とスタイルID一覧だけを表示する場合は、先にAivisSpeechを起動します。
 
 ```bash
 .venv/bin/python main.py --mode aivis-info
@@ -191,6 +191,25 @@ AIVIS_SPEAKER_ID=888753760
 AIVIS_TIMEOUT_SECONDS=180
 CONTROL_SERVER_PORT=8765
 ```
+
+`ai-youtuber-live`では、AivisSpeech、AITuber OnAir、OBSが停止していれば自動起動し、
+利用可能になるまで待ってから配信処理を始めます。AITuber OnAirはOBSの
+ブラウザソース用サーバーだけを起動し、SafariやChromeなどの通常ブラウザは開きません。
+
+```dotenv
+AUTO_START_AIVIS=true
+AIVIS_APP_PATH=/Applications/AivisSpeech.app
+AUTO_START_AITUBER=true
+AITUBER_DIRECTORY=~/my-aituber
+AITUBER_ONAIR_URL=http://localhost:5173/?mode=broadcast
+AUTO_START_OBS=true
+OBS_APP_PATH=/Applications/OBS.app
+LOCAL_SERVICE_START_TIMEOUT_SECONDS=120
+```
+
+すでに起動しているサービスはそのまま再利用します。Pythonが自動起動した
+AITuber OnAirだけはライブ終了時に停止します。AivisSpeechとOBSは終了しません。
+自動起動を無効にする場合は、対応する`AUTO_START_...`を`false`にします。
 
 外部制御サーバーを起動します。
 
@@ -466,8 +485,8 @@ NEWS_HISTORY_DAYS=14
 
 ## LLMコンテキストと記憶
 
-固定人格は`config/character_prompt.txt`、公開できる自己認識・活動目標・
-小さな過去は`config/character_bible.json`、LLM関連設定は
+固定人格は`config/character_prompt.txt`、公開できる自己認識・個性・活動目標・
+実在対象への立場は`config/character_bible.json`、LLM関連設定は
 `config/llm_config.json`で管理します。現在のプロバイダーはOpenAIです。
 
 LLMには各生成時点の年月日、曜日、時刻を短い参照情報として渡します。日時は
@@ -475,11 +494,12 @@ LLMには各生成時点の年月日、曜日、時刻を短い参照情報と�
 `Asia/Tokyo`で、必要な場合は`.env`の`AITUBER_TIMEZONE`で変更できます。
 
 `character_bible.json`の`public_identity`には配信で説明できる技術的自己認識、
-`goals`には登録者目標、`episodes`には会話で使える小さな過去を設定します。
-各応答には話題に近いエピソードを最大1件だけ渡すため、設定を毎回読み上げません。
+`personality`には現在の個性と好きなものを見つける方針、`goals`には登録者目標、
+`industry_stances`には実在する組織や配信文化への立場を設定します。
+各応答には話題に近い設定だけを渡すため、設定を毎回読み上げません。
 実際の登録者数は外部から渡された値がない限り発言しません。
 
-配信中に生まれたガン奈自身の小さな出来事や考えの変化は、重要度が設定値以上の
+配信中に生まれたガン奈自身の共有イベントや、好み・価値観の変化は、重要度が設定値以上の
 候補だけを`data/character_memory.db`へ下書き保存します。視聴者ごとの
 `memory.db`とは分離されています。承認したものだけが将来の会話で使われます。
 
