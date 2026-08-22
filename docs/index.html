@@ -1,0 +1,107 @@
+<!doctype html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="description" content="AI YouTuber Local Controllerの機能とYouTube APIの利用目的を説明します。">
+  <title>AI YouTuber Local Controller</title>
+  <style>
+    :root {
+      color-scheme: dark;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      background: #0b1020;
+      color: #eef2ff;
+    }
+    body {
+      margin: 0;
+      line-height: 1.75;
+    }
+    main {
+      box-sizing: border-box;
+      width: min(820px, calc(100% - 32px));
+      margin: 48px auto;
+      padding: 40px;
+      border: 1px solid #29314b;
+      border-radius: 18px;
+      background: #11172a;
+    }
+    h1, h2 {
+      line-height: 1.35;
+    }
+    h1 {
+      margin-top: 0;
+    }
+    h2 {
+      margin-top: 2em;
+      color: #c7d2fe;
+    }
+    a {
+      color: #93c5fd;
+    }
+    .summary {
+      font-size: 1.08rem;
+      color: #dbeafe;
+    }
+    .en {
+      margin-top: 48px;
+      padding-top: 24px;
+      border-top: 1px solid #29314b;
+      color: #cbd5e1;
+    }
+    @media (max-width: 600px) {
+      main {
+        margin: 16px auto;
+        padding: 24px;
+      }
+    }
+  </style>
+</head>
+<body>
+  <main>
+    <h1>AI YouTuber Local Controller</h1>
+    <p class="summary">
+      AI YouTuber Local Controllerは、所有者本人がMac上で使用する個人用の
+      AI YouTuber配信管理ツールです。
+    </p>
+
+    <h2>主な機能</h2>
+    <ul>
+      <li>YouTube Liveの配信枠の作成・更新・開始・終了</li>
+      <li>YouTube Liveコメントの取得とAIによる返信</li>
+      <li>配信予定、字幕、コメント表示、OBSの制御</li>
+      <li>音声合成およびVRMキャラクターの表情・モーション制御</li>
+    </ul>
+
+    <h2>Google・YouTubeデータの利用目的</h2>
+    <p>
+      YouTube Data APIを使用して、所有者本人のYouTubeチャンネルにあるライブ配信と
+      ライブコメントを管理します。取得した情報はAI YouTuber配信の運営にのみ使用し、
+      広告配信、販売、第三者向けの利用には使用しません。
+    </p>
+
+    <h2>運用形態</h2>
+    <p>
+      アプリ本体と認証情報は所有者のローカルMac上で動作・保存されます。
+      一般利用者向けのログイン機能やサービス提供は行っていません。
+    </p>
+
+    <h2>関連情報</h2>
+    <p><a href="privacy-policy.html">プライバシーポリシー</a></p>
+    <p>
+      <a href="https://github.com/YSMockingbird/ai-youtuber/issues">お問い合わせ（GitHub Issues）</a>
+    </p>
+
+    <section class="en" lang="en">
+      <h2>English</h2>
+      <p>
+        AI YouTuber Local Controller is a personal, locally operated tool used by its owner
+        to manage AI YouTuber live streams on YouTube. It uses the YouTube Data API to create,
+        update, start and stop live broadcasts, and to retrieve live chat messages for on-stream
+        responses and display. The application and its OAuth credentials are operated and stored
+        on the owner's local Mac. It is not offered as a login service or application for the public.
+      </p>
+      <p><a href="privacy-policy.html">Privacy Policy</a></p>
+    </section>
+  </main>
+</body>
+</html>
