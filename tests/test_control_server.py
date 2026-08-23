@@ -9,7 +9,7 @@ import urllib.request
 import wave
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 from broadcast_schedule import BroadcastScheduleRepository
 from character_memory import CharacterMemoryRepository
@@ -284,6 +284,41 @@ class ExternalControlRuntimeTest(unittest.TestCase):
         self.assertEqual(accepted["action"], "prepare_broadcast")
         self.assertEqual(accepted["stream_plan"], "")
 
+    def test_broadcast_draft_is_generated_without_starting_live_service(self):
+        temporary_directory, repository, runtime = self.create_schedule_runtime()
+        self.addCleanup(temporary_directory.cleanup)
+        schedule = repository.create_schedule(
+            scheduled_start_at="2026-08-20T21:00:00+09:00",
+            planning_mode="ai",
+            content_request="初見向けの自己紹介配信",
+            title="自己紹介",
+            description="説明",
+        )
+        controller = Mock()
+        controller.is_running.return_value = False
+        runtime.attach_live_service_controller(controller)
+        runtime.update_admin_status(
+            available=True,
+            phase="service_idle",
+            message="管理画面のみ稼働中です。",
+        )
+
+        with patch(
+            "stream_theme.generate_stream_theme_plan",
+            return_value=self.create_stream_plan(),
+        ):
+            draft = runtime.generate_broadcast_draft(
+                schedule_id=schedule["schedule_id"]
+            )
+
+        self.assertEqual(draft["theme"], "自己紹介配信")
+        self.assertEqual(
+            repository.get_schedule(schedule["schedule_id"])["status"],
+            "prepared",
+        )
+        self.assertEqual(runtime.get_admin_status()["phase"], "service_idle")
+        controller.start.assert_not_called()
+
     def test_schedule_command_uses_values_saved_in_sqlite(self):
         temporary_directory, repository, runtime = self.create_schedule_runtime()
         self.addCleanup(temporary_directory.cleanup)
@@ -326,6 +361,48 @@ class ExternalControlRuntimeTest(unittest.TestCase):
 
         self.assertEqual(configure["title"], "保存済みタイトル")
         self.assertEqual(configure["description"], "保存済み説明")
+
+    def test_schedule_start_is_claimed_before_live_service_starts(self):
+        temporary_directory, repository, runtime = self.create_schedule_runtime()
+        self.addCleanup(temporary_directory.cleanup)
+        schedule = repository.create_schedule(
+            scheduled_start_at="2026-08-20T21:00:00+09:00",
+            planning_mode="ai",
+            content_request="自己紹介配信",
+            title="自己紹介",
+            description="説明",
+        )
+        runtime.store_prepared_broadcast_draft(
+            self.create_stream_plan(),
+            schedule["content_request"],
+            "draft-start",
+            schedule_id=schedule["schedule_id"],
+        )
+        controller = Mock()
+        controller.is_running.return_value = False
+        runtime.attach_live_service_controller(controller)
+
+        runtime.queue_broadcast_start(
+            {
+                "action": "configure_broadcast",
+                "schedule_id": schedule["schedule_id"],
+            }
+        )
+
+        self.assertEqual(
+            repository.get_schedule(schedule["schedule_id"])["status"],
+            "starting",
+        )
+        controller.start.assert_called_once_with(
+            schedule_id=schedule["schedule_id"]
+        )
+        with self.assertRaisesRegex(ValueError, "現在の状態"):
+            runtime.queue_broadcast_start(
+                {
+                    "action": "configure_broadcast",
+                    "schedule_id": schedule["schedule_id"],
+                }
+            )
 
     def test_prepared_schedule_plan_can_be_restored_from_sqlite(self):
         temporary_directory, repository, runtime = self.create_schedule_runtime()
@@ -874,8 +951,23 @@ class CharacterMemoryHttpTest(unittest.TestCase):
 
         self.assertIn("配信カレンダー", html)
         self.assertIn("タイトル・説明文テンプレート", html)
+        self.assertIn("配信内容の希望（任意）", html)
+        self.assertIn("空欄ならAIにおまかせ", html)
+        self.assertIn("予定時刻に自動で配信開始する", html)
+        self.assertIn("予定時刻の自動配信：有効", html)
+        self.assertLess(
+            html.index('<div class="calendar-weekday">日</div>'),
+            html.index('<div class="calendar-weekday">月</div>'),
+        )
+        self.assertIn("const sundayOffset = first.getDay();", html)
+        self.assertNotIn('id="schedulePlanningMode"', html)
+        self.assertGreater(
+            html.index("<h2>タイトル・説明文テンプレート</h2>"),
+            html.index("<h2>文章をそのまま発話</h2>"),
+        )
         self.assertIn("/api/broadcast/schedules/save", html)
-        self.assertIn("ライブ制御を起動", html)
+        self.assertNotIn("ライブ制御を起動", html)
+        self.assertIn("開始待機を中止", html)
 
     def test_managed_live_service_can_be_started_and_stopped_via_api(self):
         controller = Mock()
@@ -888,8 +980,49 @@ class CharacterMemoryHttpTest(unittest.TestCase):
 
         self.assertEqual(start_body["status"], "starting")
         self.assertEqual(stop_body["status"], "stopping")
-        controller.start.assert_called_once_with()
+        controller.start.assert_called_once_with(schedule_id=None)
         controller.request_stop.assert_called_once_with()
+
+    def test_configure_broadcast_starts_managed_live_service_automatically(self):
+        controller = Mock()
+        controller.is_running.return_value = False
+        self.runtime.attach_live_service_controller(controller)
+
+        body = self._post_json(
+            "/api/admin/command",
+            {
+                "action": "configure_broadcast",
+                "title": "自己紹介ライブ",
+                "description": "説明",
+                "privacy_status": "unlisted",
+                "stream_plan": "初見向けの自己紹介配信",
+            },
+        )
+
+        self.assertEqual(body["action"], "configure_broadcast")
+        controller.start.assert_called_once_with(schedule_id="")
+
+    def test_broadcast_plan_can_be_prepared_without_live_service(self):
+        schedule = self.schedule_repository.create_schedule(
+            scheduled_start_at="2026-08-20T21:00:00+09:00",
+            planning_mode="ai",
+            content_request="初見向けの自己紹介配信",
+            title="自己紹介",
+            description="説明",
+        )
+        plan = ExternalControlRuntimeTest().create_stream_plan()
+
+        with patch(
+            "stream_theme.generate_stream_theme_plan",
+            return_value=plan,
+        ):
+            body = self._post_json(
+                "/api/broadcast/prepare",
+                {"schedule_id": schedule["schedule_id"]},
+            )
+
+        self.assertEqual(body["status"], "prepared")
+        self.assertEqual(body["draft"]["theme"], "自己紹介配信")
 
     def test_broadcast_template_and_schedule_can_be_managed_via_api(self):
         template_body = self._post_json(
@@ -915,6 +1048,7 @@ class CharacterMemoryHttpTest(unittest.TestCase):
             },
         )
         schedule = schedule_body["schedule"]
+        self.assertTrue(schedule["auto_start"])
         query = urllib.parse.urlencode(
             {
                 "start_at": "2026-08-01T00:00:00+00:00",

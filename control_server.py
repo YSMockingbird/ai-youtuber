@@ -376,6 +376,8 @@ class ExternalControlRuntime:
         self._selected_broadcast_plan = None
         self._active_broadcast_schedule_id = None
         self._live_service_controller = None
+        self._broadcast_preparation_lock = threading.Lock()
+        self._broadcast_start_lock = threading.Lock()
         self._admin_status = {
             "available": False,
             "autonomous_paused": False,
@@ -403,7 +405,13 @@ class ExternalControlRuntime:
             schedule = None
             if schedule_id:
                 schedule = self.get_broadcast_schedule(schedule_id)
-                if schedule["status"] in {"live", "completed", "cancelled"}:
+                if schedule["status"] in {
+                    "starting",
+                    "youtube_scheduled",
+                    "live",
+                    "completed",
+                    "cancelled",
+                }:
                     raise ValueError(
                         "この配信予定は現在の状態では準備・開始できません。"
                         f" status={schedule['status']}"
@@ -680,15 +688,156 @@ class ExternalControlRuntime:
             raise ValueError("ライブ制御コントローラーが設定されていません。")
         self._live_service_controller = controller
 
-    def start_live_service(self):
+    def start_live_service(self, schedule_id=None):
         if self._live_service_controller is None:
             raise RuntimeError("この起動モードでは常駐ライブ制御を利用できません。")
-        return self._live_service_controller.start()
+        return self._live_service_controller.start(schedule_id=schedule_id)
+
+    def prepare_live_service(self, schedule_id):
+        controller = self._live_service_controller
+        if controller is None:
+            raise RuntimeError("この起動モードでは配信アプリを事前準備できません。")
+        return controller.prepare(schedule_id)
+
+    def discard_live_service_preparation(self, schedule_id=None):
+        controller = self._live_service_controller
+        if controller is None:
+            return False
+        return controller.discard_preparation(schedule_id)
+
+    def ensure_live_service_started(self, schedule_id=None):
+        # 配信開始操作から呼ばれた場合だけ、必要に応じてライブ制御を自動起動します。
+        controller = self._live_service_controller
+        if controller is None or controller.is_running():
+            return False
+        try:
+            controller.start(schedule_id=schedule_id)
+        except RuntimeError:
+            # 同時操作で先に起動された場合は、そのライブ制御をそのまま使用します。
+            if not controller.is_running():
+                raise
+            return False
+        return True
+
+    def queue_broadcast_start(self, values):
+        # 手動開始と自動開始を同じ排他処理へ通し、同じ予定の二重起動を防ぎます。
+        if not self._broadcast_start_lock.acquire(blocking=False):
+            raise RuntimeError("別の配信開始処理を受け付け中です。")
+        schedule_id = str(values.get("schedule_id", "")).strip()
+        claimed_schedule = False
+        try:
+            command = self.enqueue_admin_command(values)
+            if command["action"] != "configure_broadcast":
+                raise ValueError("配信開始にはconfigure_broadcastを指定してください。")
+            if schedule_id:
+                self.update_broadcast_schedule_status(
+                    schedule_id,
+                    "starting",
+                    error=None,
+                )
+                claimed_schedule = True
+            self.ensure_live_service_started(schedule_id=schedule_id)
+            return command
+        except Exception as exc:
+            if claimed_schedule:
+                self.update_broadcast_schedule_status(
+                    schedule_id,
+                    "error",
+                    error=f"配信開始処理を起動できませんでした: {exc}",
+                )
+            raise
+        finally:
+            self._broadcast_start_lock.release()
+
+    def fail_pending_broadcast_starts(self, error):
+        # アプリ起動前の失敗時に、次回起動で古い開始命令を誤実行しないよう破棄します。
+        failed_schedule_ids = []
+        with self.admin_command_queue.mutex:
+            retained_commands = deque()
+            while self.admin_command_queue.queue:
+                command = self.admin_command_queue.queue.popleft()
+                if (
+                    command.get("action") == "configure_broadcast"
+                    and command.get("schedule_id")
+                ):
+                    failed_schedule_ids.append(command["schedule_id"])
+                else:
+                    retained_commands.append(command)
+            self.admin_command_queue.queue.extend(retained_commands)
+            self.admin_command_queue.not_full.notify_all()
+        for schedule_id in failed_schedule_ids:
+            self.update_broadcast_schedule_status(
+                schedule_id,
+                "error",
+                error=f"ライブ制御を起動できませんでした: {error}",
+            )
+        return failed_schedule_ids
 
     def stop_live_service(self):
         if self._live_service_controller is None:
             raise RuntimeError("この起動モードでは常駐ライブ制御を利用できません。")
         return self._live_service_controller.request_stop()
+
+    def generate_broadcast_draft(self, schedule_id=None, stream_plan=None):
+        # 配信アプリを起動せず、常駐管理サーバーだけでAI配信構成を作成します。
+        if not self._broadcast_preparation_lock.acquire(blocking=False):
+            raise RuntimeError("別の配信構成を作成中です。完了後に再度お試しください。")
+        previous_status = self.get_admin_status()
+        try:
+            normalized_schedule_id = str(schedule_id or "").strip()
+            if len(normalized_schedule_id) > 64:
+                raise ValueError("配信予定IDが長すぎます。")
+            if normalized_schedule_id:
+                schedule = self.get_broadcast_schedule(normalized_schedule_id)
+                if schedule["status"] in {"live", "completed", "cancelled"}:
+                    raise ValueError(
+                        "この配信予定は現在の状態では準備できません。"
+                        f" status={schedule['status']}"
+                    )
+                instruction = str(schedule["content_request"] or "").strip()
+            else:
+                instruction = str(stream_plan or "").strip()
+            if len(instruction) > 200:
+                raise ValueError("配信内容の希望は200文字以内にしてください。")
+
+            self.update_admin_status(
+                phase="preparing_broadcast_draft",
+                message="AIが配信構成表を作成しています。",
+            )
+            from stream_theme import generate_stream_theme_plan
+
+            plan = generate_stream_theme_plan(instruction=instruction or None)
+            draft = self.store_prepared_broadcast_draft(
+                plan,
+                instruction or None,
+                uuid.uuid4().hex,
+                schedule_id=normalized_schedule_id or None,
+            )
+            controller = self._live_service_controller
+            if controller is None:
+                next_phase = previous_status.get("phase", "waiting_for_youtube")
+            else:
+                next_phase = (
+                    "waiting_for_youtube"
+                    if controller.is_running()
+                    else "service_idle"
+                )
+            self.update_admin_status(
+                phase=next_phase,
+                message=(
+                    "AI配信構成を作成しました。内容を確認して開始してください。"
+                    f" 企画={draft['theme']}"
+                ),
+            )
+            return draft
+        except Exception as exc:
+            self.update_admin_status(
+                phase=previous_status.get("phase", "service_idle"),
+                message=f"配信構成を作成できませんでした: {exc}",
+            )
+            raise
+        finally:
+            self._broadcast_preparation_lock.release()
 
     def get_obs_overlay_status(self):
         subtitle_clients = self.subtitle_event_broker.subscriber_count()
@@ -775,6 +924,7 @@ class ExternalControlRuntime:
             "title": values.get("title"),
             "description": values.get("description"),
             "privacy_status": values.get("privacy_status", "unlisted"),
+            "auto_start": values.get("auto_start", True),
             "template_id": values.get("template_id"),
         }
         if schedule_id:
@@ -1099,6 +1249,9 @@ class ExternalControlRequestHandler(BaseHTTPRequestHandler):
         if path == "/api/live-service/stop":
             self._handle_live_service_stop()
             return
+        if path == "/api/broadcast/prepare":
+            self._handle_broadcast_prepare()
+            return
         if path == "/api/character-memories/review":
             self._handle_character_memory_review()
             return
@@ -1319,7 +1472,10 @@ class ExternalControlRequestHandler(BaseHTTPRequestHandler):
         if body is None:
             return
         try:
-            command = self.runtime.enqueue_admin_command(body)
+            if body.get("action") == "configure_broadcast":
+                command = self.runtime.queue_broadcast_start(body)
+            else:
+                command = self.runtime.enqueue_admin_command(body)
         except ValueError as exc:
             self._send_json(400, {"error": str(exc)})
             return
@@ -1337,6 +1493,32 @@ class ExternalControlRequestHandler(BaseHTTPRequestHandler):
                 "action": command["action"],
             },
         )
+
+    def _handle_broadcast_prepare(self):
+        body = self._read_json_object()
+        if body is None:
+            return
+        try:
+            draft = self.runtime.generate_broadcast_draft(
+                schedule_id=body.get("schedule_id"),
+                stream_plan=body.get("stream_plan"),
+            )
+        except ValueError as exc:
+            self._send_json(400, {"error": str(exc)})
+            return
+        except KeyError as exc:
+            self._send_json(404, {"error": str(exc)})
+            return
+        except RuntimeError as exc:
+            self._send_json(503, {"error": str(exc)})
+            return
+        except Exception as exc:
+            self._send_json(
+                500,
+                {"error": f"AI配信構成の作成に失敗しました: {exc}"},
+            )
+            return
+        self._send_json(200, {"status": "prepared", "draft": draft})
 
     def _handle_live_service_start(self):
         try:

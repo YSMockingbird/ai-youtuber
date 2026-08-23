@@ -10,7 +10,7 @@ class LiveServiceControllerTest(unittest.TestCase):
         runtime = Mock()
         completed = threading.Event()
 
-        def live_callback():
+        def live_callback(_prepared_context):
             completed.set()
 
         controller = LiveServiceController(runtime, live_callback)
@@ -30,7 +30,7 @@ class LiveServiceControllerTest(unittest.TestCase):
         release = threading.Event()
         started = threading.Event()
 
-        def live_callback():
+        def live_callback(_prepared_context):
             started.set()
             release.wait(timeout=1)
 
@@ -50,7 +50,7 @@ class LiveServiceControllerTest(unittest.TestCase):
         release = threading.Event()
         controller = LiveServiceController(
             runtime,
-            lambda: release.wait(timeout=1),
+            lambda _prepared_context: release.wait(timeout=1),
         )
         controller.start()
 
@@ -61,6 +61,46 @@ class LiveServiceControllerTest(unittest.TestCase):
         )
         release.set()
         controller._thread.join(timeout=1)
+
+    def test_prepared_context_is_reused_by_matching_schedule(self):
+        runtime = Mock()
+        prepared_context = Mock()
+        received = []
+        completed = threading.Event()
+
+        def live_callback(context):
+            received.append(context)
+            completed.set()
+
+        controller = LiveServiceController(
+            runtime,
+            live_callback,
+            prepare_callback=lambda: prepared_context,
+        )
+
+        self.assertTrue(controller.prepare("schedule-1"))
+        self.assertTrue(controller.is_prepared("schedule-1"))
+        self.assertFalse(controller.prepare("schedule-1"))
+        controller.start(schedule_id="schedule-1")
+        self.assertTrue(completed.wait(timeout=1))
+        controller._thread.join(timeout=1)
+
+        self.assertEqual(received, [prepared_context])
+
+    def test_discard_preparation_stops_prepared_context(self):
+        runtime = Mock()
+        prepared_context = Mock()
+        controller = LiveServiceController(
+            runtime,
+            lambda _prepared_context: None,
+            prepare_callback=lambda: prepared_context,
+        )
+        controller.prepare("schedule-1")
+
+        self.assertTrue(controller.discard_preparation("schedule-1"))
+
+        prepared_context.stop.assert_called_once_with()
+        self.assertFalse(controller.is_prepared("schedule-1"))
 
 
 if __name__ == "__main__":

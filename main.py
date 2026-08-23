@@ -17,6 +17,7 @@ from ai_response import (
 )
 from autonomous_topics import AutonomousTopicSelector, TOPIC_INSTRUCTIONS
 from autonomous_buffer import AutonomousSpeechBuffer
+from broadcast_auto_scheduler import BroadcastAutoScheduler, auto_schedule_enabled
 from character_memory import get_character_memory_repository
 from control_server import ALLOWED_EMOTIONS, ExternalControlServer
 from llm.config import load_llm_config
@@ -1768,14 +1769,44 @@ def run_ai_youtuber_live(max_loops, stream_topic=None, stream_plan=None):
         local_services.stop()
 
 
+def prepare_managed_live_services():
+    # 予定時刻より前にローカルアプリを起動し、ライブ開始に必要な接続だけ確認します。
+    local_services = ensure_live_local_services()
+    try:
+        client = create_aivis_client()
+        version = client.get_version()
+        speaker_id = get_aivis_speaker_id(client)
+        print(
+            "配信アプリの事前準備を確認しました。"
+            f"AivisSpeech={version} speaker_id={speaker_id}"
+        )
+        obs_websocket_client = ObsWebSocketClient.from_env()
+        if obs_websocket_client is not None:
+            output_active = wait_for_obs_ready(obs_websocket_client)
+            print(
+                "OBS WebSocket事前接続確認：成功 "
+                f"配信出力={'稼働中' if output_active else '停止中'}"
+            )
+            if output_active:
+                raise RuntimeError(
+                    "予定時刻前ですがOBSの配信出力がすでに稼働しています。"
+                    "OBSで配信を停止してから再度予定を準備してください。"
+                )
+        return local_services
+    except Exception:
+        local_services.stop()
+        raise
+
+
 def run_managed_live_session(
     runtime,
     max_loops,
     stream_topic=None,
     stream_plan=None,
+    local_services=None,
 ):
-    # 常駐管理サーバーを止めず、配信に必要なアプリとライブ処理だけを起動します。
-    local_services = ensure_live_local_services()
+    # 常駐管理サーバーを止めず、事前準備済みまたは新規起動したアプリで配信します。
+    local_services = local_services or ensure_live_local_services()
     try:
         client = create_aivis_client()
         version = client.get_version()
@@ -1826,15 +1857,20 @@ def run_admin_service(max_loops):
             f"常駐管理サーバーを起動できません。port={port} detail={exc}"
         ) from exc
 
-    def start_live_callback():
+    def start_live_callback(prepared_local_services=None):
         try:
-            run_managed_live_session(server.runtime, max_loops)
+            run_managed_live_session(
+                server.runtime,
+                max_loops,
+                local_services=prepared_local_services,
+            )
         except AdminRequestedBroadcastEnd as exc:
             print(str(exc))
 
     controller = LiveServiceController(
         server.runtime,
         start_live_callback,
+        prepare_callback=prepare_managed_live_services,
     )
     server.runtime.attach_live_service_controller(controller)
     server.runtime.update_admin_status(
@@ -1842,13 +1878,25 @@ def run_admin_service(max_loops):
         phase="service_idle",
         message="管理画面は稼働中です。ライブ制御は停止しています。",
     )
+    auto_scheduler = None
+    if auto_schedule_enabled():
+        auto_scheduler = BroadcastAutoScheduler.from_env(server.runtime)
+        auto_scheduler.start()
+        server.runtime.update_admin_status(auto_scheduler_running=True)
+    else:
+        server.runtime.update_admin_status(auto_scheduler_running=False)
     print(f"常駐配信管理画面: http://127.0.0.1:{port}/admin")
-    print("ライブ制御は管理画面のボタンから開始できます。")
+    print(
+        "予定時刻の自動配信開始: "
+        f"{'有効' if auto_scheduler is not None else '無効'}"
+    )
     try:
         threading.Event().wait()
     except KeyboardInterrupt:
         print("\n常駐配信管理の終了操作を受け付けました。")
     finally:
+        if auto_scheduler is not None:
+            auto_scheduler.stop()
         if controller.is_running():
             try:
                 controller.request_stop()

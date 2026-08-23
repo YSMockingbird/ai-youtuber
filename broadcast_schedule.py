@@ -12,6 +12,7 @@ ALLOWED_PRIVACY_STATUSES = {"public", "unlisted", "private"}
 ALLOWED_SCHEDULE_STATUSES = {
     "draft",
     "prepared",
+    "starting",
     "youtube_scheduled",
     "live",
     "completed",
@@ -61,6 +62,7 @@ class BroadcastScheduleRepository:
                         title TEXT NOT NULL,
                         description TEXT NOT NULL,
                         privacy_status TEXT NOT NULL,
+                        auto_start INTEGER NOT NULL DEFAULT 1,
                         template_id TEXT,
                         status TEXT NOT NULL,
                         youtube_video_id TEXT,
@@ -74,6 +76,18 @@ class BroadcastScheduleRepository:
                     )
                     """
                 )
+                schedule_columns = {
+                    row[1]
+                    for row in connection.execute(
+                        "PRAGMA table_info(broadcast_schedules)"
+                    ).fetchall()
+                }
+                if "auto_start" not in schedule_columns:
+                    # 既存の予定DBを削除せず、自動開始設定だけを追加します。
+                    connection.execute(
+                        "ALTER TABLE broadcast_schedules "
+                        "ADD COLUMN auto_start INTEGER NOT NULL DEFAULT 1"
+                    )
                 connection.execute(
                     "CREATE INDEX IF NOT EXISTS idx_broadcast_schedules_start "
                     "ON broadcast_schedules(scheduled_start_at ASC)"
@@ -240,6 +254,7 @@ class BroadcastScheduleRepository:
         title,
         description,
         privacy_status="unlisted",
+        auto_start=True,
         template_id=None,
     ):
         values = _validate_schedule_values(
@@ -249,6 +264,7 @@ class BroadcastScheduleRepository:
             title=title,
             description=description,
             privacy_status=privacy_status,
+            auto_start=auto_start,
             template_id=template_id,
         )
         if values["template_id"] is not None:
@@ -262,10 +278,10 @@ class BroadcastScheduleRepository:
                     INSERT INTO broadcast_schedules (
                         schedule_id, scheduled_start_at, planning_mode,
                         content_request, prepared_stream_plan, title,
-                        description, privacy_status, template_id, status,
+                        description, privacy_status, auto_start, template_id, status,
                         youtube_video_id, last_error, prepared_at,
                         created_at, updated_at
-                    ) VALUES (?, ?, ?, ?, NULL, ?, ?, ?, ?, 'draft',
+                    ) VALUES (?, ?, ?, ?, NULL, ?, ?, ?, ?, ?, 'draft',
                               NULL, NULL, NULL, ?, ?)
                     """,
                     (
@@ -276,6 +292,7 @@ class BroadcastScheduleRepository:
                         values["title"],
                         values["description"],
                         values["privacy_status"],
+                        int(values["auto_start"]),
                         values["template_id"],
                         now,
                         now,
@@ -313,7 +330,7 @@ class BroadcastScheduleRepository:
                 ).fetchall()
         except sqlite3.Error as exc:
             raise RuntimeError("配信予定をSQLiteから読み込めませんでした。") from exc
-        return [dict(row) for row in rows]
+        return [_schedule_row_to_dict(row) for row in rows]
 
     def get_schedule(self, schedule_id):
         normalized_id = _required_text(schedule_id, "schedule_id", 64)
@@ -331,7 +348,7 @@ class BroadcastScheduleRepository:
             raise RuntimeError("配信予定をSQLiteから読み込めませんでした。") from exc
         if row is None:
             raise KeyError(f"配信予定が見つかりません: schedule_id={normalized_id}")
-        return dict(row)
+        return _schedule_row_to_dict(row)
 
     def update_schedule(self, schedule_id, **changes):
         normalized_id = _required_text(schedule_id, "schedule_id", 64)
@@ -345,6 +362,7 @@ class BroadcastScheduleRepository:
             "title",
             "description",
             "privacy_status",
+            "auto_start",
             "template_id",
             "status",
             "youtube_video_id",
@@ -420,7 +438,7 @@ class BroadcastScheduleRepository:
 
 _SCHEDULE_COLUMNS = """
 schedule_id, scheduled_start_at, planning_mode, content_request,
-prepared_stream_plan, title, description, privacy_status, template_id,
+prepared_stream_plan, title, description, privacy_status, auto_start, template_id,
 status, youtube_video_id, last_error, prepared_at, created_at, updated_at
 """
 
@@ -459,6 +477,7 @@ def _validate_schedule_values(
     title,
     description,
     privacy_status,
+    auto_start,
     template_id,
 ):
     normalized_mode = _allowed_value(
@@ -469,7 +488,7 @@ def _validate_schedule_values(
     normalized_request = _optional_text(
         content_request,
         "配信内容の希望",
-        1000,
+        200,
     )
     if normalized_mode == "manual" and not normalized_request:
         raise ValueError("自分で配信内容を決める場合は、配信内容を入力してください。")
@@ -487,6 +506,7 @@ def _validate_schedule_values(
             "公開設定",
             ALLOWED_PRIVACY_STATUSES,
         ),
+        "auto_start": _normalize_bool(auto_start, "予定時刻の自動開始"),
         "template_id": (
             _required_text(template_id, "template_id", 64)
             if template_id is not None
@@ -507,7 +527,7 @@ def _normalize_schedule_changes(changes):
                 ALLOWED_PLANNING_MODES,
             )
         elif field == "content_request":
-            normalized[field] = _optional_text(value, "配信内容の希望", 1000)
+            normalized[field] = _optional_text(value, "配信内容の希望", 200)
         elif field == "prepared_stream_plan":
             normalized[field] = _nullable_text(value, "配信構成表", 12000)
         elif field == "title":
@@ -520,6 +540,8 @@ def _normalize_schedule_changes(changes):
                 "公開設定",
                 ALLOWED_PRIVACY_STATUSES,
             )
+        elif field == "auto_start":
+            normalized[field] = _normalize_bool(value, "予定時刻の自動開始")
         elif field == "template_id":
             normalized[field] = (
                 _required_text(value, "template_id", 64)
@@ -553,6 +575,20 @@ def _normalize_datetime(value, label):
     if parsed.tzinfo is None:
         raise ValueError(f"{label}にはタイムゾーンを含めてください。")
     return parsed.astimezone(timezone.utc).isoformat()
+
+
+def _normalize_bool(value, label):
+    if isinstance(value, bool):
+        return value
+    if value in {0, 1}:
+        return bool(value)
+    raise ValueError(f"{label}はtrueまたはfalseで指定してください。")
+
+
+def _schedule_row_to_dict(row):
+    schedule = dict(row)
+    schedule["auto_start"] = bool(schedule["auto_start"])
+    return schedule
 
 
 def _required_text(value, label, max_length):

@@ -227,6 +227,16 @@
       .field-pair { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
       .compact-textarea { min-height: 82px; }
       .editor-note { margin: 9px 0 0; color: #848c9e; font-size: 11px; line-height: 1.5; }
+      .checkbox-row {
+        display: flex;
+        align-items: center;
+        gap: 9px;
+        margin-top: 13px;
+        color: #dfe4ef;
+        font-size: 13px;
+        cursor: pointer;
+      }
+      .checkbox-row input { width: 18px; height: 18px; margin: 0; }
       .schedule-state {
         margin-top: 12px;
         padding: 10px 12px;
@@ -274,13 +284,13 @@
       </section>
       <div id="theme" class="theme"></div>
       <div id="discardedPrefetches" class="theme"></div>
+      <div id="autoScheduler" class="theme"></div>
 
       <div class="grid">
         <section id="serviceControlCard" class="card full" style="display: none;">
-          <h2>ライブ制御</h2>
-          <p class="description">管理画面は常時利用できます。配信するときだけAivisSpeech、AITuber OnAir、OBSとライブ処理を起動します。</p>
+          <h2>配信開始処理</h2>
+          <p class="description">AivisSpeech、AITuber OnAir、OBSの準備とYouTube開始待機を中止できます。</p>
           <div class="action-row">
-            <button id="startLiveControl">ライブ制御を起動</button>
             <button id="stopLiveControl" class="secondary" disabled>開始待機を中止</button>
           </div>
           <div class="notice">YouTubeライブ開始後は「開始待機を中止」ではなく、「終了挨拶して配信終了」を使用してください。</div>
@@ -298,13 +308,13 @@
                 <button id="nextMonth" class="secondary" aria-label="次の月">→</button>
               </div>
               <div class="calendar-weekdays" aria-hidden="true">
+                <div class="calendar-weekday">日</div>
                 <div class="calendar-weekday">月</div>
                 <div class="calendar-weekday">火</div>
                 <div class="calendar-weekday">水</div>
                 <div class="calendar-weekday">木</div>
                 <div class="calendar-weekday">金</div>
                 <div class="calendar-weekday">土</div>
-                <div class="calendar-weekday">日</div>
               </div>
               <div id="calendarGrid" class="calendar-grid"></div>
             </div>
@@ -322,13 +332,14 @@
                   <input id="scheduleTime" type="time" value="21:00">
                 </div>
               </div>
-              <label for="schedulePlanningMode">配信内容の決め方</label>
-              <select id="schedulePlanningMode">
-                <option value="ai">AIに任せる</option>
-                <option value="manual">自分で指定する</option>
-              </select>
-              <label id="scheduleContentLabel" for="scheduleContent">AIへの希望（任意）</label>
-              <textarea id="scheduleContent" class="compact-textarea" maxlength="1000" placeholder="空欄なら日常雑談などをAIが考えます"></textarea>
+              <label class="checkbox-row" for="scheduleAutoStart">
+                <input id="scheduleAutoStart" type="checkbox" checked>
+                <span>予定時刻に自動で配信開始する</span>
+              </label>
+              <p class="editor-note">開始10分前に配信構成を準備し、予定時刻に必要なアプリとYouTube配信を自動で開始します。</p>
+              <label for="scheduleContent">配信内容の希望（任意）</label>
+              <textarea id="scheduleContent" class="compact-textarea" maxlength="200" placeholder="空欄ならAIにおまかせ。例：初見向けの自己紹介配信"></textarea>
+              <p class="editor-note">空欄の場合はAIが配信内容を考えます。入力した場合は、その希望を優先して配信構成を作ります。</p>
               <label for="scheduleTemplate">タイトル・説明文テンプレート</label>
               <select id="scheduleTemplate">
                 <option value="">テンプレートを使わない</option>
@@ -358,38 +369,6 @@
           </div>
         </section>
 
-        <section class="card full template-editor">
-          <h2>タイトル・説明文テンプレート</h2>
-          <p class="description">よく使う配信タイトル、説明文、公開設定を保存して、予定登録時に呼び出します。</p>
-          <div class="broadcast-grid">
-            <div class="broadcast-column">
-              <label for="templateEditorSelect">保存済みテンプレート</label>
-              <select id="templateEditorSelect">
-                <option value="">新しいテンプレート</option>
-              </select>
-              <label for="templateName">テンプレート名</label>
-              <input id="templateName" maxlength="80" placeholder="例：通常の雑談配信">
-              <label for="templateTitle">配信タイトル</label>
-              <input id="templateTitle" maxlength="100">
-            </div>
-            <div class="broadcast-column">
-              <label for="templateDescription">配信説明</label>
-              <textarea id="templateDescription" class="compact-textarea" maxlength="5000"></textarea>
-              <label for="templatePrivacy">公開設定</label>
-              <select id="templatePrivacy">
-                <option value="unlisted">限定公開</option>
-                <option value="private">非公開</option>
-                <option value="public">公開</option>
-              </select>
-              <div class="action-row">
-                <button id="newTemplate" class="secondary">新規入力</button>
-                <button id="saveTemplate">テンプレートを保存</button>
-                <button id="deleteTemplate" class="danger" disabled>削除</button>
-              </div>
-            </div>
-          </div>
-        </section>
-
         <section class="card full">
           <h2>配信開始</h2>
           <p class="description">AIは配信構成表だけを作成します。タイトルと説明文は手入力するか、保存済みテンプレートを使用してください。</p>
@@ -400,7 +379,7 @@
               <div class="action-row">
                 <button id="prepareBroadcast">AIで配信構成を作成</button>
               </div>
-              <div class="notice">PythonがYouTube開始待機中のときだけ利用できます。配信枠は必要に応じて自動作成されます。</div>
+              <div class="notice">配信構成だけを作成します。この操作ではAivisSpeech、AITuber OnAir、OBSは起動しません。</div>
             </div>
             <div class="broadcast-column">
               <label for="broadcastTemplate">タイトル・説明文テンプレート</label>
@@ -507,6 +486,38 @@
             <button id="speakDirectly">そのまま発話</button>
           </div>
         </section>
+
+        <section class="card full template-editor">
+          <h2>タイトル・説明文テンプレート</h2>
+          <p class="description">よく使う配信タイトル、説明文、公開設定を保存して、予定登録時に呼び出します。</p>
+          <div class="broadcast-grid">
+            <div class="broadcast-column">
+              <label for="templateEditorSelect">保存済みテンプレート</label>
+              <select id="templateEditorSelect">
+                <option value="">新しいテンプレート</option>
+              </select>
+              <label for="templateName">テンプレート名</label>
+              <input id="templateName" maxlength="80" placeholder="例：通常の雑談配信">
+              <label for="templateTitle">配信タイトル</label>
+              <input id="templateTitle" maxlength="100">
+            </div>
+            <div class="broadcast-column">
+              <label for="templateDescription">配信説明</label>
+              <textarea id="templateDescription" class="compact-textarea" maxlength="5000"></textarea>
+              <label for="templatePrivacy">公開設定</label>
+              <select id="templatePrivacy">
+                <option value="unlisted">限定公開</option>
+                <option value="private">非公開</option>
+                <option value="public">公開</option>
+              </select>
+              <div class="action-row">
+                <button id="newTemplate" class="secondary">新規入力</button>
+                <button id="saveTemplate">テンプレートを保存</button>
+                <button id="deleteTemplate" class="danger" disabled>削除</button>
+              </div>
+            </div>
+          </div>
+        </section>
       </div>
       <div id="result" class="result" role="status" aria-live="polite"></div>
     </main>
@@ -520,8 +531,8 @@
         queue: document.getElementById('queue'),
         theme: document.getElementById('theme'),
         discardedPrefetches: document.getElementById('discardedPrefetches'),
+        autoScheduler: document.getElementById('autoScheduler'),
         serviceControlCard: document.getElementById('serviceControlCard'),
-        startLiveControl: document.getElementById('startLiveControl'),
         stopLiveControl: document.getElementById('stopLiveControl'),
         result: document.getElementById('result'),
         instruction: document.getElementById('instruction'),
@@ -556,8 +567,7 @@
         scheduleId: document.getElementById('scheduleId'),
         scheduleDate: document.getElementById('scheduleDate'),
         scheduleTime: document.getElementById('scheduleTime'),
-        schedulePlanningMode: document.getElementById('schedulePlanningMode'),
-        scheduleContentLabel: document.getElementById('scheduleContentLabel'),
+        scheduleAutoStart: document.getElementById('scheduleAutoStart'),
         scheduleContent: document.getElementById('scheduleContent'),
         scheduleTemplate: document.getElementById('scheduleTemplate'),
         scheduleTitle: document.getElementById('scheduleTitle'),
@@ -581,12 +591,8 @@
       const commandButtons = [
         elements.sendInstruction, elements.pause, elements.resume,
         elements.cancel, elements.closing, elements.endBroadcast,
-        elements.configureBroadcast,
-        elements.prepareBroadcast,
         elements.speakDirectly,
         elements.changePlan,
-        elements.prepareSchedule,
-        elements.startSchedule,
       ];
       let latestStatus = null;
       let latestDraftId = '';
@@ -617,9 +623,9 @@
           calendarMonthDate.getMonth(),
           1
         );
-        const mondayOffset = (first.getDay() + 6) % 7;
+        const sundayOffset = first.getDay();
         const start = new Date(first);
-        start.setDate(first.getDate() - mondayOffset);
+        start.setDate(first.getDate() - sundayOffset);
         const end = new Date(start);
         end.setDate(start.getDate() + 42);
         return {start, end};
@@ -725,23 +731,13 @@
         elements.broadcastPrivacy.value = template.privacy_status;
       }
 
-      function syncPlanningMode() {
-        const manual = elements.schedulePlanningMode.value === 'manual';
-        elements.scheduleContentLabel.textContent = manual
-          ? '配信内容（必須）'
-          : 'AIへの希望（任意）';
-        elements.scheduleContent.placeholder = manual
-          ? '例：ガン奈が自分の仕組みと今後の目標を紹介する'
-          : '空欄なら日常雑談などをAIが考えます';
-      }
-
       function resetScheduleEditor(dateKey = selectedCalendarDate) {
         selectedCalendarDate = dateKey || localDateKey(new Date());
         elements.scheduleEditorTitle.textContent = '新しい配信予定';
         elements.scheduleId.value = '';
         elements.scheduleDate.value = selectedCalendarDate;
         elements.scheduleTime.value = '21:00';
-        elements.schedulePlanningMode.value = 'ai';
+        elements.scheduleAutoStart.checked = true;
         elements.scheduleContent.value = '';
         elements.scheduleTemplate.value = '';
         elements.scheduleTitle.value = '';
@@ -751,7 +747,6 @@
         elements.prepareSchedule.disabled = true;
         elements.startSchedule.disabled = true;
         elements.scheduleState.textContent = '状態：未保存';
-        syncPlanningMode();
         renderCalendar();
       }
 
@@ -762,7 +757,7 @@
         elements.scheduleId.value = schedule.schedule_id;
         elements.scheduleDate.value = selectedCalendarDate;
         elements.scheduleTime.value = `${padNumber(start.getHours())}:${padNumber(start.getMinutes())}`;
-        elements.schedulePlanningMode.value = schedule.planning_mode;
+        elements.scheduleAutoStart.checked = schedule.auto_start !== false;
         elements.scheduleContent.value = schedule.content_request || '';
         elements.scheduleTemplate.value = schedule.template_id || '';
         elements.scheduleTitle.value = schedule.title;
@@ -771,6 +766,7 @@
         elements.deleteSchedule.disabled = false;
         const statusLabels = {
           draft: '未準備', prepared: '準備済み',
+          starting: '開始処理中',
           youtube_scheduled: 'YouTube開始処理済み', live: '配信中',
           completed: '完了', cancelled: '取消', error: 'エラー',
         };
@@ -787,7 +783,6 @@
           ? `\nエラー：${schedule.last_error}`
           : '';
         elements.scheduleState.textContent = `状態：${statusLabels[schedule.status] || schedule.status}${planSummary}${errorSummary}`;
-        syncPlanningMode();
         renderCalendar();
       }
 
@@ -819,7 +814,8 @@
             const event = document.createElement('button');
             event.type = 'button';
             event.className = `calendar-event ${schedule.planning_mode}`;
-            event.textContent = `${padNumber(startAt.getHours())}:${padNumber(startAt.getMinutes())} ${schedule.title}`;
+            const autoLabel = schedule.auto_start ? '⏱ ' : '';
+            event.textContent = `${autoLabel}${padNumber(startAt.getHours())}:${padNumber(startAt.getMinutes())} ${schedule.title}`;
             event.title = schedule.title;
             event.addEventListener('click', eventObject => {
               eventObject.stopPropagation();
@@ -884,6 +880,9 @@
         elements.discardedPrefetches.textContent = discarded
           ? `コメント到着で破棄した先読み：${discarded}回`
           : '';
+        elements.autoScheduler.textContent = status.auto_scheduler_running
+          ? `予定時刻の自動配信：有効${status.auto_scheduler_error ? ` / エラー：${status.auto_scheduler_error}` : ''}`
+          : '予定時刻の自動配信：無効';
         elements.statusDot.className = 'status-dot';
         if (status.phase === 'error') elements.statusDot.classList.add('error');
         else if (['processing', 'speaking'].includes(status.phase)) elements.statusDot.classList.add('busy');
@@ -892,18 +891,20 @@
         const available = Boolean(status.available);
         const liveControlRunning = Boolean(status.live_control_running);
         const liveCommandsAvailable = available && liveControlRunning;
-        elements.serviceControlCard.style.display = status.managed_live_service
-          ? ''
-          : 'none';
-        elements.startLiveControl.disabled = !available || liveControlRunning;
-        elements.stopLiveControl.disabled = !available || !liveControlRunning
-          || ![
+        const canStopLiveControl = available && liveControlRunning
+          && [
             'starting_live_control', 'waiting_for_obs', 'waiting_for_youtube',
             'preparing_broadcast_draft'
           ].includes(status.phase);
+        elements.serviceControlCard.style.display = status.managed_live_service
+          && canStopLiveControl ? '' : 'none';
+        elements.stopLiveControl.disabled = !canStopLiveControl;
         for (const button of commandButtons) button.disabled = !liveCommandsAvailable;
-        elements.configureBroadcast.disabled = !liveCommandsAvailable || status.phase !== 'waiting_for_youtube';
-        elements.prepareBroadcast.disabled = !liveCommandsAvailable || status.phase !== 'waiting_for_youtube';
+        const preLiveActionAvailable = available && [
+          'service_idle', 'waiting_for_youtube', 'live_control_error'
+        ].includes(status.phase);
+        elements.configureBroadcast.disabled = !preLiveActionAvailable;
+        elements.prepareBroadcast.disabled = !preLiveActionAvailable;
         elements.pause.disabled = !liveCommandsAvailable || Boolean(status.autonomous_paused);
         elements.resume.disabled = !liveCommandsAvailable || !status.autonomous_paused;
         const draft = status.broadcast_draft;
@@ -933,8 +934,7 @@
         const selectedSchedule = broadcastSchedules.find(
           item => item.schedule_id === elements.scheduleId.value
         );
-        const scheduleActionAvailable = liveCommandsAvailable
-          && status.phase === 'waiting_for_youtube'
+        const scheduleActionAvailable = preLiveActionAvailable
           && Boolean(selectedSchedule);
         elements.prepareSchedule.disabled = !scheduleActionAvailable
           || ['live', 'completed', 'cancelled'].includes(selectedSchedule?.status);
@@ -973,6 +973,19 @@
         }
       }
 
+      async function prepareBroadcastDraft(values, successMessage) {
+        showResult('AIが配信構成表を作成しています...');
+        try {
+          await postJson('/api/broadcast/prepare', values);
+          showResult(successMessage);
+          await loadSchedules();
+          await refreshStatus();
+        } catch (error) {
+          showResult(error.message, true);
+          await refreshStatus();
+        }
+      }
+
       async function sendLiveServiceRequest(path, successMessage) {
         showResult('ライブ制御を操作しています...');
         try {
@@ -984,12 +997,6 @@
         }
       }
 
-      elements.startLiveControl.addEventListener('click', () => {
-        sendLiveServiceRequest(
-          '/api/live-service/start',
-          'ライブ制御の起動を受け付けました。準備完了までお待ちください。'
-        );
-      });
       elements.stopLiveControl.addEventListener('click', () => {
         sendLiveServiceRequest(
           '/api/live-service/stop',
@@ -1048,14 +1055,13 @@
           '終了挨拶後のYouTube配信終了命令を受け付けました。'
         );
       });
-      elements.prepareBroadcast.addEventListener('click', () => {
+      elements.prepareBroadcast.addEventListener('click', async () => {
         ignoredDraftId = latestDraftId;
         latestDraftId = '';
         elements.configureBroadcast.disabled = true;
         elements.broadcastDraftPreview.textContent = 'AIが配信構成表を作成しています...';
         elements.broadcastDraftPreview.classList.add('visible');
-        sendCommand({
-          action: 'prepare_broadcast',
+        await prepareBroadcastDraft({
           stream_plan: elements.broadcastPlan.value.trim(),
         }, 'AI配信構成の作成を受け付けました。');
       });
@@ -1085,7 +1091,7 @@
           privacy_status: privacyStatus,
           stream_plan: streamPlan,
           draft_id: latestDraftId,
-        }, 'YouTube配信の開始命令を受け付けました。');
+        }, '配信開始を受け付けました。必要なアプリを自動で準備します。');
       });
 
       elements.broadcastPlan.addEventListener('input', () => {
@@ -1122,7 +1128,6 @@
         selectedCalendarDate = elements.scheduleDate.value;
         renderCalendar();
       });
-      elements.schedulePlanningMode.addEventListener('change', syncPlanningMode);
       elements.scheduleTemplate.addEventListener('change', applySelectedTemplate);
       elements.broadcastTemplate.addEventListener('change', applyBroadcastTemplate);
       elements.newSchedule.addEventListener('click', () => resetScheduleEditor());
@@ -1133,9 +1138,6 @@
         const contentRequest = elements.scheduleContent.value.trim();
         if (!date || !time) return showResult('配信日時を入力してください。', true);
         if (!title) return showResult('配信タイトルを入力してください。', true);
-        if (elements.schedulePlanningMode.value === 'manual' && !contentRequest) {
-          return showResult('自分で指定する場合は配信内容を入力してください。', true);
-        }
         const scheduledStart = new Date(`${date}T${time}:00`);
         if (Number.isNaN(scheduledStart.getTime())) {
           return showResult('配信日時を正しく入力してください。', true);
@@ -1144,12 +1146,13 @@
           const body = await postJson('/api/broadcast/schedules/save', {
             schedule_id: elements.scheduleId.value,
             scheduled_start_at: scheduledStart.toISOString(),
-            planning_mode: elements.schedulePlanningMode.value,
+            planning_mode: 'ai',
             content_request: contentRequest,
             template_id: elements.scheduleTemplate.value || null,
             title,
             description: elements.scheduleDescription.value.trim(),
             privacy_status: elements.schedulePrivacy.value,
+            auto_start: elements.scheduleAutoStart.checked,
           });
           await loadSchedules();
           editSchedule(body.schedule);
@@ -1173,12 +1176,12 @@
           showResult(error.message, true);
         }
       });
-      elements.prepareSchedule.addEventListener('click', () => {
+      elements.prepareSchedule.addEventListener('click', async () => {
         const scheduleId = elements.scheduleId.value;
         if (!scheduleId) return showResult('先に配信予定を保存してください。', true);
-        sendCommand(
-          {action: 'prepare_broadcast', schedule_id: scheduleId},
-          'この予定の配信構成作成を受け付けました。'
+        await prepareBroadcastDraft(
+          {schedule_id: scheduleId},
+          'この予定の配信構成を作成しました。'
         );
       });
       elements.startSchedule.addEventListener('click', () => {
@@ -1194,7 +1197,7 @@
         )) return;
         sendCommand(
           {action: 'configure_broadcast', schedule_id: schedule.schedule_id},
-          '予定に基づくYouTube配信開始を受け付けました。'
+          '予定に基づく配信開始を受け付けました。必要なアプリを自動で準備します。'
         );
       });
 

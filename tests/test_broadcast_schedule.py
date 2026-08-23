@@ -1,3 +1,4 @@
+import sqlite3
 import tempfile
 import unittest
 from datetime import datetime, timedelta, timezone
@@ -78,7 +79,64 @@ class BroadcastScheduleRepositoryTest(unittest.TestCase):
         self.assertEqual(saved["title"], "最初のタイトル")
         self.assertEqual(saved["description"], "最初の説明")
         self.assertEqual(saved["planning_mode"], "ai")
+        self.assertTrue(saved["auto_start"])
         self.assertEqual(saved["status"], "draft")
+
+    def test_schedule_auto_start_can_be_disabled(self):
+        schedule = self.repository.create_schedule(
+            scheduled_start_at="2026-08-20T21:00:00+09:00",
+            planning_mode="ai",
+            content_request="",
+            title="手動開始の配信",
+            description="説明",
+            auto_start=False,
+        )
+
+        self.assertFalse(schedule["auto_start"])
+        updated = self.repository.update_schedule(
+            schedule["schedule_id"],
+            auto_start=True,
+            status="starting",
+        )
+        self.assertTrue(updated["auto_start"])
+        self.assertEqual(updated["status"], "starting")
+
+    def test_existing_database_is_migrated_with_auto_start_enabled(self):
+        database_path = Path(self.temporary_directory.name) / "legacy.db"
+        with sqlite3.connect(str(database_path)) as connection:
+            connection.execute(
+                """
+                CREATE TABLE broadcast_schedules (
+                    schedule_id TEXT PRIMARY KEY,
+                    scheduled_start_at TEXT NOT NULL,
+                    planning_mode TEXT NOT NULL,
+                    content_request TEXT NOT NULL,
+                    prepared_stream_plan TEXT,
+                    title TEXT NOT NULL,
+                    description TEXT NOT NULL,
+                    privacy_status TEXT NOT NULL,
+                    template_id TEXT,
+                    status TEXT NOT NULL,
+                    youtube_video_id TEXT,
+                    last_error TEXT,
+                    prepared_at TEXT,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                )
+                """
+            )
+
+        BroadcastScheduleRepository(database_path)
+
+        with sqlite3.connect(str(database_path)) as connection:
+            columns = {
+                row[1]: row
+                for row in connection.execute(
+                    "PRAGMA table_info(broadcast_schedules)"
+                )
+            }
+        self.assertIn("auto_start", columns)
+        self.assertEqual(columns["auto_start"][4], "1")
 
     def test_manual_schedule_requires_content(self):
         with self.assertRaisesRegex(ValueError, "配信内容を入力"):
