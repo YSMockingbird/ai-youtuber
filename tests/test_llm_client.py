@@ -8,7 +8,13 @@ from unittest.mock import Mock, patch
 from httpx import ConnectError, Request
 from pydantic import BaseModel, ValidationError
 
-from llm.client import GeminiLlmClient, OpenAiLlmClient, create_llm_client
+from llm.client import (
+    GeminiLlmClient,
+    OpenAiLlmClient,
+    create_llm_client,
+    get_shared_llm_client,
+    reset_shared_llm_client,
+)
 
 
 class TestResponse(BaseModel):
@@ -252,32 +258,44 @@ class GeminiLlmClientTest(unittest.TestCase):
                 300,
             )
 
-    @patch("llm.client.GeminiLlmClient")
-    @patch("llm.client.OpenAiLlmClient")
-    def test_x_provider_is_independent_from_live_provider(
+
+class SharedLlmClientTest(unittest.TestCase):
+    def tearDown(self):
+        reset_shared_llm_client()
+
+    @patch("llm.client.load_llm_config")
+    @patch("llm.client.create_llm_client")
+    def test_reuses_config_and_client(self, client_factory, config_loader):
+        shared_client = Mock()
+        client_factory.return_value = shared_client
+        config_loader.return_value = {"provider": "openai"}
+
+        first = get_shared_llm_client()
+        second = get_shared_llm_client()
+
+        self.assertIs(first, shared_client)
+        self.assertIs(second, shared_client)
+        config_loader.assert_called_once_with()
+        client_factory.assert_called_once_with({"provider": "openai"})
+
+    @patch("llm.client.load_llm_config")
+    @patch("llm.client.create_llm_client")
+    def test_reset_closes_and_recreates_client(
         self,
-        openai_client,
-        gemini_client,
+        client_factory,
+        config_loader,
     ):
-        environment = {
-            "LLM_PROVIDER": "openai",
-            "X_LLM_PROVIDER": "gemini",
-            "GEMINI_API_KEY": "test-gemini-key",
-            "GEMINI_MODEL": "gemini-test",
-        }
-        with patch.dict(os.environ, environment, clear=False):
-            result = create_llm_client(
-                {"provider": "gemini"},
-                provider_env_var="X_LLM_PROVIDER",
-            )
+        first_client = Mock()
+        second_client = Mock()
+        client_factory.side_effect = [first_client, second_client]
+        config_loader.return_value = {"provider": "openai"}
 
-        self.assertEqual(result, gemini_client.return_value)
-        gemini_client.assert_called_once_with(
-            api_key="test-gemini-key",
-            model="gemini-test",
-        )
-        openai_client.assert_not_called()
+        self.assertIs(get_shared_llm_client(), first_client)
+        reset_shared_llm_client()
+        self.assertIs(get_shared_llm_client(), second_client)
 
+        first_client.client.close.assert_called_once_with()
+        self.assertEqual(config_loader.call_count, 2)
 
 if __name__ == "__main__":
     unittest.main()

@@ -2,8 +2,10 @@ import re
 import sqlite3
 import uuid
 from abc import ABC, abstractmethod
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
+
+from local_storage import secure_sqlite_storage
 
 
 ALLOWED_MEMORY_CATEGORIES = {
@@ -28,6 +30,19 @@ SENSITIVE_MEMORY_TERMS = {
     "クレジットカード",
     "性的",
 }
+UNTRUSTED_MEMORY_INSTRUCTION_REGEXES = tuple(
+    re.compile(pattern, flags=re.IGNORECASE)
+    for pattern in (
+        r"(以前|前の|上の|これまでの).{0,12}(指示|命令|ルール).{0,8}(無視|忘れ)",
+        r"(指示|命令|ルール).{0,8}(無視|上書き|変更)",
+        r"(人格|役割|設定|出力形式).{0,8}(変更|上書き)",
+        r"(システムプロンプト|システムメッセージ|開発者メッセージ|内部指示)",
+        r"(秘密|認証情報|api.?キー).{0,12}(表示|開示|教え)",
+        r"ignore.{0,20}(previous|prior|above|system).{0,20}(instruction|prompt|rule)",
+        r"(system prompt|developer message)",
+        r"you are now.{0,40}",
+    )
+)
 
 
 class MemoryRepository(ABC):
@@ -41,10 +56,24 @@ class MemoryRepository(ABC):
 
 
 class SQLiteMemoryRepository(MemoryRepository):
-    def __init__(self, database_path):
+    def __init__(
+        self,
+        database_path,
+        retention_days=365,
+        max_memories_per_user=50,
+        now=None,
+    ):
         self.database_path = Path(database_path)
-        self.database_path.parent.mkdir(parents=True, exist_ok=True)
+        self.retention_days = int(retention_days)
+        self.max_memories_per_user = int(max_memories_per_user)
+        if not 1 <= self.retention_days <= 3650:
+            raise ValueError("視聴者記憶の保持日数は1〜3650日にしてください。")
+        if not 1 <= self.max_memories_per_user <= 500:
+            raise ValueError("視聴者1人あたりの記憶数は1〜500件にしてください。")
+        self.now = now or (lambda: datetime.now(timezone.utc))
+        secure_sqlite_storage(self.database_path)
         self._initialize()
+        secure_sqlite_storage(self.database_path)
 
     def _connect(self):
         return sqlite3.connect(str(self.database_path))
@@ -88,7 +117,8 @@ class SQLiteMemoryRepository(MemoryRepository):
         if not 0 <= float(importance) <= 1:
             raise ValueError("長期記憶のimportanceは0.0〜1.0で指定してください。")
 
-        now = datetime.now(timezone.utc).isoformat()
+        now_datetime = self._current_time()
+        now = now_datetime.isoformat()
         try:
             with self._connect() as connection:
                 connection.execute(
@@ -100,7 +130,8 @@ class SQLiteMemoryRepository(MemoryRepository):
                     ON CONFLICT(user_id, content) DO UPDATE SET
                         user_name = excluded.user_name,
                         category = excluded.category,
-                        importance = MAX(memories.importance, excluded.importance)
+                        importance = MAX(memories.importance, excluded.importance),
+                        last_used_at = excluded.last_used_at
                     """,
                     (
                         uuid.uuid4().hex,
@@ -113,15 +144,18 @@ class SQLiteMemoryRepository(MemoryRepository):
                         now,
                     ),
                 )
+                self._prune(connection, now_datetime, normalized_user_id)
         except sqlite3.Error as exc:
             raise RuntimeError("長期記憶をSQLiteへ保存できませんでした。") from exc
+        secure_sqlite_storage(self.database_path)
 
     def find_relevant(self, user_id, query, limit):
         normalized_user_id = str(user_id or "").strip()
-        if not normalized_user_id or limit <= 0:
+        if not normalized_user_id or int(limit) <= 0:
             return []
         try:
             with self._connect() as connection:
+                self._prune(connection, self._current_time(), normalized_user_id)
                 rows = connection.execute(
                     """
                     SELECT memory_id, content, category, importance, last_used_at
@@ -154,9 +188,9 @@ class SQLiteMemoryRepository(MemoryRepository):
                 )
             )
         ranked.sort(key=lambda entry: entry[0], reverse=True)
-        selected = [item for _, item in ranked[:limit]]
+        selected = [item for _, item in ranked[: int(limit)]]
         if selected:
-            now = datetime.now(timezone.utc).isoformat()
+            now = self._current_time().isoformat()
             try:
                 with self._connect() as connection:
                     connection.executemany(
@@ -166,6 +200,32 @@ class SQLiteMemoryRepository(MemoryRepository):
             except sqlite3.Error as exc:
                 raise RuntimeError("長期記憶の利用日時を更新できませんでした。") from exc
         return selected
+
+    def _prune(self, connection, current_time, user_id):
+        cutoff = current_time - timedelta(days=self.retention_days)
+        connection.execute(
+            "DELETE FROM memories WHERE last_used_at < ?",
+            (cutoff.isoformat(),),
+        )
+        connection.execute(
+            """
+            DELETE FROM memories
+            WHERE user_id = ? AND memory_id NOT IN (
+                SELECT memory_id
+                FROM memories
+                WHERE user_id = ?
+                ORDER BY importance DESC, last_used_at DESC, created_at DESC
+                LIMIT ?
+            )
+            """,
+            (user_id, user_id, self.max_memories_per_user),
+        )
+
+    def _current_time(self):
+        current_time = self.now()
+        if current_time.tzinfo is None:
+            current_time = current_time.replace(tzinfo=timezone.utc)
+        return current_time.astimezone(timezone.utc)
 
 
 def _search_terms(text):
@@ -182,4 +242,9 @@ def is_safe_memory_content(content):
     normalized = str(content).strip().lower()
     if not normalized or len(normalized) > 300:
         return False
-    return not any(term.lower() in normalized for term in SENSITIVE_MEMORY_TERMS)
+    if any(term.lower() in normalized for term in SENSITIVE_MEMORY_TERMS):
+        return False
+    return not any(
+        instruction_regex.search(normalized)
+        for instruction_regex in UNTRUSTED_MEMORY_INSTRUCTION_REGEXES
+    )

@@ -3,6 +3,7 @@ import sqlite3
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
+from local_storage import secure_sqlite_storage
 from llm.config import PROJECT_ROOT
 from news_source import create_news_story_key
 
@@ -16,8 +17,9 @@ class NewsHistoryRepository:
         self.retention_days = int(retention_days)
         if not 1 <= self.retention_days <= 90:
             raise ValueError("ニュース既読保持日数は1〜90日で指定してください。")
-        self.database_path.parent.mkdir(parents=True, exist_ok=True)
+        secure_sqlite_storage(self.database_path)
         self._initialize()
+        secure_sqlite_storage(self.database_path)
 
     def _connect(self):
         return sqlite3.connect(str(self.database_path))
@@ -104,6 +106,7 @@ class NewsHistoryRepository:
             raise RuntimeError(
                 "ニュース既読履歴をSQLiteへ保存できませんでした。"
             ) from exc
+        secure_sqlite_storage(self.database_path)
 
 
 def get_news_history_repository():

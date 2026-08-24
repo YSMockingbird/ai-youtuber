@@ -65,6 +65,7 @@
     </main>
     <div id="toast" class="toast" role="status" aria-live="polite"></div>
     <script>
+      const controlApiToken = __CONTROL_API_TOKEN__;
       const labels = {draft:'未確認の記憶', approved:'承認済みの記憶', rejected:'却下済みの記憶', episode:'小さな出来事', relationship:'共有イベント', belief_change:'考えの変化', autonomous_speech:'自発雑談', comment_reply:'コメント返信', news:'ニュース雑談'};
       const state = {status:'draft', busy:false};
       const list = document.getElementById('list');
@@ -98,7 +99,7 @@
       }
       async function review(memoryId, status) {
         const verb = status === 'approved' ? '承認' : '却下'; setBusy(true);
-        try { const response = await fetch('/api/character-memories/review', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({memory_id:memoryId,status})}); const body = await response.json(); if (!response.ok) throw new Error(body.error || `${verb}エラー (${response.status})`); showToast(`記憶を${verb}しました。`); await loadMemories(); }
+        try { const response = await fetch('/api/character-memories/review', {method:'POST', headers:{'Content-Type':'application/json','X-Control-Token':controlApiToken}, body:JSON.stringify({memory_id:memoryId,status})}); const body = await response.json(); if (!response.ok) throw new Error(body.error || `${verb}エラー (${response.status})`); showToast(`記憶を${verb}しました。`); await loadMemories(); }
         catch (error) { showToast(error.message,true); setBusy(false); }
       }
       document.querySelectorAll('.tab').forEach(tab => tab.addEventListener('click', () => { if (state.busy || tab.dataset.status === state.status) return; state.status = tab.dataset.status; document.querySelectorAll('.tab').forEach(item => item.classList.toggle('active', item === tab)); loadMemories(); }));

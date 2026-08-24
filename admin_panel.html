@@ -79,6 +79,18 @@
       .status-title { margin-bottom: 3px; font-size: 15px; font-weight: 750; }
       .status-message { color: #aab1c0; font-size: 13px; }
       .queue { color: #7f8798; font-size: 12px; }
+      .automation-alert {
+        margin: 0 0 16px;
+        padding: 13px 15px;
+        border: 1px solid #8d3c43;
+        border-radius: 12px;
+        background: rgba(102, 42, 48, 0.35);
+        color: #ffd1d4;
+        font-size: 13px;
+        line-height: 1.55;
+        white-space: pre-wrap;
+      }
+      .automation-alert strong { color: #ff8d91; }
       .theme {
         margin: -5px 0 18px;
         padding: 0 6px;
@@ -218,6 +230,7 @@
         white-space: nowrap;
       }
       .calendar-event.manual { border-color: #6c5a8f; background: #3c3159; }
+      .calendar-event.error { border-color: #bd525d; background: #6b2931; }
       .editor-panel {
         padding: 16px;
         border: 1px solid #2d3442;
@@ -285,6 +298,7 @@
       <div id="theme" class="theme"></div>
       <div id="discardedPrefetches" class="theme"></div>
       <div id="autoScheduler" class="theme"></div>
+      <div id="automationAlert" class="automation-alert" role="alert" hidden></div>
 
       <div class="grid">
         <section id="serviceControlCard" class="card full" style="display: none;">
@@ -298,7 +312,7 @@
 
         <section class="card full">
           <h2>配信カレンダー</h2>
-          <p class="description">配信日時と内容の決め方を登録します。この段階ではYouTube枠の作成やAI生成は行いません。</p>
+          <p class="description">配信日時と内容を登録します。YouTube待機枠は開始48時間前、AIによる配信構成は開始10分前に自動準備します。</p>
           <div class="scheduler-grid">
             <div>
               <div class="calendar-toolbar">
@@ -329,14 +343,14 @@
                 </div>
                 <div>
                   <label for="scheduleTime">開始時刻</label>
-                  <input id="scheduleTime" type="time" value="21:00">
+                  <input id="scheduleTime" type="time" value="22:00">
                 </div>
               </div>
               <label class="checkbox-row" for="scheduleAutoStart">
                 <input id="scheduleAutoStart" type="checkbox" checked>
                 <span>予定時刻に自動で配信開始する</span>
               </label>
-              <p class="editor-note">開始10分前に配信構成を準備し、予定時刻に必要なアプリとYouTube配信を自動で開始します。</p>
+              <p class="editor-note">開始48時間前にYouTube待機枠を作成し、開始10分前に配信構成と必要なアプリを準備します。</p>
               <label for="scheduleContent">配信内容の希望（任意）</label>
               <textarea id="scheduleContent" class="compact-textarea" maxlength="200" placeholder="空欄ならAIにおまかせ。例：初見向けの自己紹介配信"></textarea>
               <p class="editor-note">空欄の場合はAIが配信内容を考えます。入力した場合は、その希望を優先して配信構成を作ります。</p>
@@ -360,6 +374,11 @@
                 <button id="deleteSchedule" class="danger" disabled>予定を削除</button>
               </div>
               <div id="scheduleState" class="schedule-state">状態：未保存</div>
+              <div id="scheduleYoutubeActions" class="action-row" hidden>
+                <button id="createYoutubeFrame" class="secondary" disabled>今すぐYouTube枠を作成</button>
+                <button id="copyYoutubeLink" class="secondary" disabled>リンクをコピー</button>
+                <button id="openYoutubeFrame" class="secondary" disabled>YouTubeで確認</button>
+              </div>
               <div class="action-row">
                 <button id="prepareSchedule" class="secondary" disabled>この予定を準備</button>
                 <button id="startSchedule" disabled>この予定で配信開始</button>
@@ -523,6 +542,7 @@
     </main>
 
     <script>
+      const controlApiToken = __CONTROL_API_TOKEN__;
       const elements = {
         connection: document.getElementById('connection'),
         statusDot: document.getElementById('statusDot'),
@@ -532,6 +552,7 @@
         theme: document.getElementById('theme'),
         discardedPrefetches: document.getElementById('discardedPrefetches'),
         autoScheduler: document.getElementById('autoScheduler'),
+        automationAlert: document.getElementById('automationAlert'),
         serviceControlCard: document.getElementById('serviceControlCard'),
         stopLiveControl: document.getElementById('stopLiveControl'),
         result: document.getElementById('result'),
@@ -577,6 +598,10 @@
         saveSchedule: document.getElementById('saveSchedule'),
         deleteSchedule: document.getElementById('deleteSchedule'),
         scheduleState: document.getElementById('scheduleState'),
+        scheduleYoutubeActions: document.getElementById('scheduleYoutubeActions'),
+        createYoutubeFrame: document.getElementById('createYoutubeFrame'),
+        copyYoutubeLink: document.getElementById('copyYoutubeLink'),
+        openYoutubeFrame: document.getElementById('openYoutubeFrame'),
         prepareSchedule: document.getElementById('prepareSchedule'),
         startSchedule: document.getElementById('startSchedule'),
         templateEditorSelect: document.getElementById('templateEditorSelect'),
@@ -646,7 +671,10 @@
       async function postJson(path, body) {
         return requestJson(path, {
           method: 'POST',
-          headers: {'Content-Type': 'application/json'},
+          headers: {
+            'Content-Type': 'application/json',
+            'X-Control-Token': controlApiToken,
+          },
           body: JSON.stringify(body),
         });
       }
@@ -736,7 +764,7 @@
         elements.scheduleEditorTitle.textContent = '新しい配信予定';
         elements.scheduleId.value = '';
         elements.scheduleDate.value = selectedCalendarDate;
-        elements.scheduleTime.value = '21:00';
+        elements.scheduleTime.value = '22:00';
         elements.scheduleAutoStart.checked = true;
         elements.scheduleContent.value = '';
         elements.scheduleTemplate.value = '';
@@ -747,6 +775,10 @@
         elements.prepareSchedule.disabled = true;
         elements.startSchedule.disabled = true;
         elements.scheduleState.textContent = '状態：未保存';
+        elements.scheduleYoutubeActions.hidden = true;
+        elements.createYoutubeFrame.disabled = true;
+        elements.copyYoutubeLink.disabled = true;
+        elements.openYoutubeFrame.disabled = true;
         renderCalendar();
       }
 
@@ -782,7 +814,14 @@
         const errorSummary = schedule.last_error
           ? `\nエラー：${schedule.last_error}`
           : '';
-        elements.scheduleState.textContent = `状態：${statusLabels[schedule.status] || schedule.status}${planSummary}${errorSummary}`;
+        const youtubeSummary = schedule.youtube_video_id
+          ? `\nYouTube枠：https://www.youtube.com/watch?v=${schedule.youtube_video_id}`
+          : '\nYouTube枠：未作成（通常は開始48時間前に自動作成）';
+        elements.scheduleState.textContent = `状態：${statusLabels[schedule.status] || schedule.status}${planSummary}${youtubeSummary}${errorSummary}`;
+        elements.scheduleYoutubeActions.hidden = false;
+        elements.createYoutubeFrame.disabled = Boolean(schedule.youtube_video_id);
+        elements.copyYoutubeLink.disabled = !schedule.youtube_video_id;
+        elements.openYoutubeFrame.disabled = !schedule.youtube_video_id;
         renderCalendar();
       }
 
@@ -814,9 +853,13 @@
             const event = document.createElement('button');
             event.type = 'button';
             event.className = `calendar-event ${schedule.planning_mode}`;
+            if (schedule.status === 'error' || schedule.last_error) event.classList.add('error');
             const autoLabel = schedule.auto_start ? '⏱ ' : '';
-            event.textContent = `${autoLabel}${padNumber(startAt.getHours())}:${padNumber(startAt.getMinutes())} ${schedule.title}`;
-            event.title = schedule.title;
+            const youtubeLabel = schedule.youtube_video_id ? '🎬 ' : '';
+            event.textContent = `${autoLabel}${youtubeLabel}${padNumber(startAt.getHours())}:${padNumber(startAt.getMinutes())} ${schedule.title}`;
+            event.title = schedule.last_error
+              ? `${schedule.title} / エラー：${schedule.last_error}`
+              : schedule.title;
             event.addEventListener('click', eventObject => {
               eventObject.stopPropagation();
               editSchedule(schedule);
@@ -835,7 +878,37 @@
         });
         const body = await requestJson(`/api/broadcast/schedules?${query}`);
         broadcastSchedules = body.schedules || [];
+        renderAutomationAlert();
         renderCalendar();
+      }
+
+      function renderAutomationAlert() {
+        const failedSchedules = broadcastSchedules
+          .filter(schedule => schedule.status === 'error' || schedule.last_error)
+          .sort((left, right) => (
+            new Date(right.scheduled_start_at).getTime()
+            - new Date(left.scheduled_start_at).getTime()
+          ));
+        if (!failedSchedules.length) {
+          elements.automationAlert.hidden = true;
+          elements.automationAlert.textContent = '';
+          return;
+        }
+        const schedule = failedSchedules[0];
+        const scheduledAt = new Date(schedule.scheduled_start_at).toLocaleString(
+          'ja-JP',
+          {dateStyle: 'medium', timeStyle: 'short', timeZone: 'Asia/Tokyo'}
+        );
+        const remaining = failedSchedules.length > 1
+          ? `\nほか${failedSchedules.length - 1}件の失敗があります。`
+          : '';
+        elements.automationAlert.textContent = (
+          `要確認：自動配信「${schedule.title}」\n`
+          + `予定日時：${scheduledAt}\n`
+          + `失敗理由：${schedule.last_error || '原因を取得できませんでした。'}`
+          + remaining
+        );
+        elements.automationAlert.hidden = false;
       }
 
       async function refreshCalendarData() {
@@ -940,6 +1013,11 @@
           || ['live', 'completed', 'cancelled'].includes(selectedSchedule?.status);
         elements.startSchedule.disabled = !scheduleActionAvailable
           || selectedSchedule?.status !== 'prepared';
+        if (selectedSchedule) {
+          elements.createYoutubeFrame.disabled = !preLiveActionAvailable
+            || Boolean(selectedSchedule.youtube_video_id)
+            || ['starting', 'youtube_scheduled', 'live', 'completed', 'cancelled'].includes(selectedSchedule.status);
+        }
       }
 
       async function refreshStatus() {
@@ -961,7 +1039,10 @@
         try {
           const response = await fetch('/api/admin/command', {
             method: 'POST',
-            headers: {'Content-Type': 'application/json'},
+            headers: {
+              'Content-Type': 'application/json',
+              'X-Control-Token': controlApiToken,
+            },
             body: JSON.stringify(command),
           });
           const body = await response.json();
@@ -1164,7 +1245,11 @@
       elements.deleteSchedule.addEventListener('click', async () => {
         const scheduleId = elements.scheduleId.value;
         if (!scheduleId) return;
-        if (!window.confirm('この配信予定を削除しますか？')) return;
+        const schedule = broadcastSchedules.find(item => item.schedule_id === scheduleId);
+        const youtubeNotice = schedule?.youtube_video_id
+          ? '\n未開始のYouTube待機枠も削除します。'
+          : '';
+        if (!window.confirm(`この配信予定を削除しますか？${youtubeNotice}`)) return;
         try {
           await postJson('/api/broadcast/schedules/delete', {
             schedule_id: scheduleId,
@@ -1175,6 +1260,45 @@
         } catch (error) {
           showResult(error.message, true);
         }
+      });
+      elements.createYoutubeFrame.addEventListener('click', async () => {
+        const scheduleId = elements.scheduleId.value;
+        if (!scheduleId) return showResult('先に配信予定を保存してください。', true);
+        try {
+          const body = await postJson('/api/broadcast/schedules/youtube', {
+            schedule_id: scheduleId,
+          });
+          await loadSchedules();
+          editSchedule(body.schedule);
+          showResult('YouTube待機枠を作成しました。');
+        } catch (error) {
+          await loadSchedules().catch(() => {});
+          showResult(error.message, true);
+        }
+      });
+      elements.copyYoutubeLink.addEventListener('click', async () => {
+        const schedule = broadcastSchedules.find(
+          item => item.schedule_id === elements.scheduleId.value
+        );
+        if (!schedule?.youtube_video_id) return;
+        const url = `https://www.youtube.com/watch?v=${schedule.youtube_video_id}`;
+        try {
+          await navigator.clipboard.writeText(url);
+          showResult('YouTube待機枠のリンクをコピーしました。');
+        } catch (_error) {
+          showResult(`リンクをコピーできませんでした：${url}`, true);
+        }
+      });
+      elements.openYoutubeFrame.addEventListener('click', () => {
+        const schedule = broadcastSchedules.find(
+          item => item.schedule_id === elements.scheduleId.value
+        );
+        if (!schedule?.youtube_video_id) return;
+        window.open(
+          `https://www.youtube.com/watch?v=${schedule.youtube_video_id}`,
+          '_blank',
+          'noopener,noreferrer'
+        );
       });
       elements.prepareSchedule.addEventListener('click', async () => {
         const scheduleId = elements.scheduleId.value;

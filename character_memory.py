@@ -1,9 +1,10 @@
 import os
 import sqlite3
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
+from local_storage import secure_sqlite_storage
 from llm.config import PROJECT_ROOT
 from llm.memory import is_safe_memory_content
 
@@ -17,10 +18,25 @@ ALLOWED_CHARACTER_MEMORY_STATUSES = {"draft", "approved", "rejected"}
 
 
 class CharacterMemoryRepository:
-    def __init__(self, database_path):
+    def __init__(
+        self,
+        database_path,
+        max_drafts=200,
+        rejected_retention_days=30,
+        now=None,
+    ):
         self.database_path = Path(database_path)
-        self.database_path.parent.mkdir(parents=True, exist_ok=True)
+        self.max_drafts = int(max_drafts)
+        self.rejected_retention_days = int(rejected_retention_days)
+        if not 1 <= self.max_drafts <= 2000:
+            raise ValueError("キャラクター記憶の下書き保持数は1〜2000件にしてください。")
+        if not 1 <= self.rejected_retention_days <= 3650:
+            raise ValueError("却下済み記憶の保持日数は1〜3650日にしてください。")
+        self.now = now or (lambda: datetime.now(timezone.utc))
+        secure_sqlite_storage(self.database_path)
         self._initialize()
+        self._cleanup()
+        secure_sqlite_storage(self.database_path)
 
     def _connect(self):
         return sqlite3.connect(str(self.database_path))
@@ -67,7 +83,8 @@ class CharacterMemoryRepository:
         if not normalized_source:
             raise ValueError("キャラクター記憶のsourceが空です。")
 
-        now = datetime.now(timezone.utc).isoformat()
+        now_datetime = self._current_time()
+        now = now_datetime.isoformat()
         memory_id = uuid.uuid4().hex
         try:
             with self._connect() as connection:
@@ -100,6 +117,7 @@ class CharacterMemoryRepository:
                         now,
                     ),
                 )
+                self._prune(connection, now_datetime)
         except sqlite3.Error as exc:
             raise RuntimeError("キャラクター記憶の下書きを保存できませんでした。") from exc
 
@@ -110,6 +128,7 @@ class CharacterMemoryRepository:
             raise ValueError("キャラクター記憶のlimitは1〜500で指定してください。")
         try:
             with self._connect() as connection:
+                self._prune(connection, self._current_time())
                 rows = connection.execute(
                     """
                     SELECT memory_id, content, category, status, importance,
@@ -138,7 +157,7 @@ class CharacterMemoryRepository:
         ranked.sort(key=lambda item: item[0], reverse=True)
         selected = [memory for _, memory in ranked[: int(limit)]]
         if selected:
-            now = datetime.now(timezone.utc).isoformat()
+            now = self._current_time().isoformat()
             try:
                 with self._connect() as connection:
                     connection.executemany(
@@ -158,9 +177,11 @@ class CharacterMemoryRepository:
             raise ValueError("キャラクター記憶のmemory_idが空です。")
         if status not in {"approved", "rejected"}:
             raise ValueError("キャラクター記憶はapprovedまたはrejectedにしてください。")
-        now = datetime.now(timezone.utc).isoformat()
+        now_datetime = self._current_time()
+        now = now_datetime.isoformat()
         try:
             with self._connect() as connection:
+                self._prune(connection, now_datetime)
                 cursor = connection.execute(
                     """
                     UPDATE character_memories
@@ -176,6 +197,42 @@ class CharacterMemoryRepository:
                 "下書き状態のキャラクター記憶が見つかりません: "
                 f"memory_id={normalized_memory_id}"
             )
+
+    def _cleanup(self):
+        try:
+            with self._connect() as connection:
+                self._prune(connection, self._current_time())
+        except sqlite3.Error as exc:
+            raise RuntimeError("キャラクター記憶を整理できませんでした。") from exc
+
+    def _prune(self, connection, current_time):
+        rejected_cutoff = current_time - timedelta(
+            days=self.rejected_retention_days
+        )
+        connection.execute(
+            "DELETE FROM character_memories "
+            "WHERE status = 'rejected' AND reviewed_at < ?",
+            (rejected_cutoff.isoformat(),),
+        )
+        connection.execute(
+            """
+            DELETE FROM character_memories
+            WHERE status = 'draft' AND memory_id NOT IN (
+                SELECT memory_id
+                FROM character_memories
+                WHERE status = 'draft'
+                ORDER BY importance DESC, created_at DESC
+                LIMIT ?
+            )
+            """,
+            (self.max_drafts,),
+        )
+
+    def _current_time(self):
+        current_time = self.now()
+        if current_time.tzinfo is None:
+            current_time = current_time.replace(tzinfo=timezone.utc)
+        return current_time.astimezone(timezone.utc)
 
     @staticmethod
     def _row_to_memory(row):

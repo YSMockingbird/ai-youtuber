@@ -1,5 +1,6 @@
 import os
 import logging
+import threading
 import time
 from abc import ABC, abstractmethod
 
@@ -13,6 +14,12 @@ from openai import (
     OpenAI,
     RateLimitError,
 )
+
+from llm.config import load_llm_config
+
+
+_shared_client = None
+_shared_client_lock = threading.Lock()
 
 
 class LlmClient(ABC):
@@ -325,10 +332,10 @@ def _print_gemini_usage(response, request_label, elapsed_seconds):
     )
 
 
-def create_llm_client(config=None, provider_env_var="LLM_PROVIDER"):
+def create_llm_client(config=None):
     config = config or {}
     provider = os.getenv(
-        provider_env_var,
+        "LLM_PROVIDER",
         str(config.get("provider", "openai")),
     ).strip().lower()
     if provider == "openai":
@@ -347,3 +354,30 @@ def create_llm_client(config=None, provider_env_var="LLM_PROVIDER"):
             "プロバイダー決定後に対応クライアントを追加してください。"
         )
     raise RuntimeError(f"未対応のLLM_PROVIDERです: {provider}")
+
+
+def get_shared_llm_client():
+    """常駐プロセス内で共有するLLMクライアントを返します。"""
+    global _shared_client
+    if _shared_client is not None:
+        return _shared_client
+
+    # 同時に複数の発話処理が始まっても、設定読込とクライアント生成は一度にします。
+    with _shared_client_lock:
+        if _shared_client is None:
+            _shared_client = create_llm_client(load_llm_config())
+        return _shared_client
+
+
+def reset_shared_llm_client():
+    """テストや明示的な再初期化のため、共有クライアントを破棄します。"""
+    global _shared_client
+    with _shared_client_lock:
+        client = _shared_client
+        _shared_client = None
+
+    if client is None:
+        return
+    close = getattr(getattr(client, "client", None), "close", None)
+    if callable(close):
+        close()

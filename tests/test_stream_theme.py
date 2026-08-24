@@ -290,7 +290,7 @@ class StreamThemeManagerTest(unittest.TestCase):
         self.assertIn("設定画面の保存ボタン", context)
         self.assertIn("論点、結論を再登場させず", context)
 
-    @patch("stream_theme.create_llm_client")
+    @patch("stream_theme.get_shared_llm_client")
     def test_plan_prompt_requires_real_world_topics(self, client_factory):
         client = client_factory.return_value
         client.generate_structured.return_value = create_plan()

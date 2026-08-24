@@ -29,11 +29,12 @@ Python 3.12を使用します。Python 3.9はGoogle認証ライブラリのサ�
 
 ```bash
 python3.12 -m venv .venv
-.venv/bin/python -m pip install -r requirements.txt
+.venv/bin/python -m pip install --upgrade "pip==26.2"
+.venv/bin/python -m pip install -r requirements.lock
 ```
 
 1. Python仮想環境を作成する
-2. `requirements.txt` のライブラリをインストールする
+2. `requirements.lock` の動作確認済みライブラリをインストールする
 3. `.env.example` を参考に `.env` を作成する
 4. OpenAIまたはGemini API接続を確認する
 5. YouTube Liveコメント取得を確認する
@@ -57,73 +58,6 @@ OpenAI API接続だけ確認します。
 ```bash
 .venv/bin/python main.py --mode openai-test
 ```
-
-### X投稿案をGeminiで作る
-
-Google AI StudioでGemini APIキーを発行し、`.env`へ次を設定します。
-
-```dotenv
-LLM_PROVIDER=openai
-X_LLM_PROVIDER=gemini
-GEMINI_API_KEY=取得したGemini APIキー
-GEMINI_MODEL=gemini-3.5-flash
-```
-
-`LLM_PROVIDER`はライブ処理用です。X投稿案の生成は`X_LLM_PROVIDER`だけを
-参照するため、ライブをOpenAIのまま運用できます。X投稿案の生成に失敗した場合も、
-エラーはX処理内で表示して終了し、ライブ処理へは伝播しません。
-
-話題を自動で選んで投稿案を1件表示します。このモードはXへ送信しません。
-
-```bash
-.venv/bin/python main.py --mode x-draft
-```
-
-話題を指定する場合は次のように実行します。
-
-```bash
-.venv/bin/python main.py --mode x-draft --x-topic "深夜のインターネット"
-```
-
-投稿案は130文字以内で、内容に合う場合は絵文字を1個まで使用します。
-Gemini APIの無料枠で利用できるモデルと上限は変更される可能性があるため、
-Google AI Studioに表示される現在の割り当てを確認してください。
-
-### 確認後にXへ投稿する
-
-X Developer ConsoleでOAuth 1.0の読み取り・書き込み権限を設定し、`.env`へ
-次の認証情報を保存します。
-
-```dotenv
-X_API_KEY=取得したコンシューマーキー
-X_API_KEY_SECRET=取得したコンシューマーキーシークレット
-X_ACCESS_TOKEN=取得したアクセストークン
-X_ACCESS_TOKEN_SECRET=取得したアクセストークンシークレット
-X_POST_HISTORY_DB_PATH=data/x_posts.db
-```
-
-次のコマンドは投稿候補を表示するだけで、Xへは送信しません。
-
-```bash
-.venv/bin/python main.py --mode x-post
-```
-
-投稿を許可する場合は`--confirm`を付けます。候補を確認した後、プロンプトへ
-大文字で`POST`と入力した場合だけ送信します。
-
-```bash
-.venv/bin/python main.py --mode x-post --confirm
-```
-
-話題も指定できます。
-
-```bash
-.venv/bin/python main.py --mode x-post --x-topic "深夜のインターネット" --confirm
-```
-
-投稿成功時は投稿ID、本文、日時を`data/x_posts.db`へ保存し、同じ本文の
-二重投稿を防止します。料金が高くなるURL付き投稿は現在禁止しています。
-X投稿処理のエラーはこのモード内で表示して終了し、ライブ処理へ伝播しません。
 
 ### YouTube配信IDの自動取得
 
@@ -341,8 +275,9 @@ YouTubeライブの開始へ進みます。待機中は「開始待機を中止�
 YouTubeライブ開始後は、従来どおり「終了挨拶して配信終了」を使用してください。
 配信終了後も管理画面だけは稼働し続けます。
 
-カレンダーで「予定時刻に自動で配信開始する」を有効にした予定は、常駐サービスが
-開始10分前にAI配信構成を準備し、AivisSpeech、AITuber OnAir、OBSを起動して接続を
+カレンダーへ保存した予定は、開始48時間前に告知用のYouTube待機枠を自動作成します。
+「予定時刻に自動で配信開始する」を有効にした予定は、常駐サービスが開始10分前に
+AI配信構成を準備し、AivisSpeech、AITuber OnAir、OBSを起動して接続を
 確認します。OBSの配信出力とYouTubeライブは予定時刻まで開始しません。予定時刻になると
 準備済みのアプリを再利用して配信を開始します。Macがスリープしていた場合も、予定時刻から15分以内に
 復帰すれば遅れて開始します。それより古い予定は誤配信防止のため自動開始しません。
@@ -352,11 +287,14 @@ YouTubeライブ開始後は、従来どおり「終了挨拶して配信終了�
 ```dotenv
 AUTO_SCHEDULE_ENABLED=true
 AUTO_SCHEDULE_CHECK_INTERVAL_SECONDS=15
+YOUTUBE_FRAME_CREATE_HOURS_BEFORE=48
+YOUTUBE_FRAME_CREATE_RETRY_MINUTES=15
 AUTO_SCHEDULE_PREPARE_MINUTES_BEFORE=10
 AUTO_SCHEDULE_LATE_GRACE_MINUTES=15
 ```
 
-通常待機中は15秒ごとのSQLite確認だけで、LLMやYouTube APIは呼び出しません。
+通常待機中は15秒ごとのSQLite確認だけです。YouTube APIは待機枠の作成・同期時だけ呼び出し、
+失敗時は標準15分間隔で再試行します。LLMは配信構成の準備時間まで呼び出しません。
 自動配信にはMacへのログインと起動状態が必要です。スリープ中のMac自体を起こす機能はありません。
 
 常駐サービスのログは次の場所へ保存します。
@@ -365,6 +303,9 @@ AUTO_SCHEDULE_LATE_GRACE_MINUTES=15
 ~/Library/Logs/AiYoutuber/admin-service.log
 ~/Library/Logs/AiYoutuber/admin-service-error.log
 ```
+
+各ログは5MBで自動的に切り替わり、過去3世代まで保持します。ログディレクトリと
+ログファイルはMacの所有者本人だけが読み書きできます。
 
 常駐を解除する場合は次を実行します。保存済みの予定・記憶・ログは削除しません。
 
@@ -541,7 +482,7 @@ NEWS_HISTORY_DAYS=14
 継続または変更を見直します。テーマを手動指定する場合は次のように起動します。
 
 ```bash
-.venv/bin/python main.py --mode ai-youtuber-live --max-loops 1000 \
+.venv/bin/python main.py --mode ai-youtuber-live \
   --stream-topic "AI時代に人間の仕事はどう変わるか"
 ```
 
@@ -551,8 +492,12 @@ NEWS_HISTORY_DAYS=14
 実行する場合は次のモードを使用します。
 
 ```bash
-.venv/bin/python main.py --mode ai-youtuber-live --max-loops 1000
+.venv/bin/python main.py --mode ai-youtuber-live
 ```
+
+本番モードのコメント取得回数は既定で無制限です。YouTube側の配信終了、
+管理画面からの終了、または致命的なエラーまで稼働します。確認用に取得回数を
+制限する場合だけ`--max-loops`を指定します。
 
 コメントがある場合はコメントへの返答を優先します。ニュースのタイトル、
 配信元、公開日時、参照URLは確認できるようターミナルへ表示します。
@@ -562,6 +507,11 @@ NEWS_HISTORY_DAYS=14
 固定人格は`config/character_prompt.txt`、公開できる自己認識・個性・活動目標・
 実在対象への立場は`config/character_bible.json`、LLM関連設定は
 `config/llm_config.json`で管理します。現在のプロバイダーはOpenAIです。
+
+視聴者ごとの記憶は1人50件まで保持し、最後に参照してから365日経過したものを
+自動整理します。ガン奈自身の承認済み記憶は期限なしで保持し、下書きは最大200件、
+却下済み記憶は30日間保持します。`data`内のSQLiteファイルはMacの所有者本人だけが
+読み書きできるアクセス権で保存します。
 
 LLMには各生成時点の年月日、曜日、時刻を短い参照情報として渡します。日時は
 関連する場合だけ発言に使い、毎回読み上げないよう指示しています。既定のタイムゾーンは

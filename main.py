@@ -1,4 +1,5 @@
 import argparse
+from collections import deque
 import os
 import re
 import threading
@@ -164,50 +165,6 @@ def run_youtube_upcoming_test():
         "YouTube自動ストップ："
         f"{'ON' if broadcast['enable_auto_stop'] else 'OFF'}"
     )
-
-
-def run_x_post_draft(topic=None):
-    # Xへは送信せず、確認用の投稿候補だけを表示します。
-    try:
-        # X機能の依存関係や障害をライブ起動経路から分離します。
-        from x_post import generate_x_post_draft
-
-        draft = generate_x_post_draft(topic=topic)
-    except (RuntimeError, ValueError) as exc:
-        print(f"X投稿案生成エラー: {exc}")
-        return False
-    print("X投稿案:")
-    print(draft["text"])
-    print(f"文字数: {len(draft['text'])}")
-    return True
-
-
-def run_x_post(topic=None, confirm=False, input_func=input):
-    # 明示確認がない限りXへ送信せず、候補の表示だけで終了します。
-    try:
-        from x_post import generate_x_post_draft, publish_x_post
-
-        draft = generate_x_post_draft(topic=topic)
-        text = draft["text"]
-        print("X投稿候補:")
-        print(text)
-        print(f"文字数: {len(text)}")
-        if not confirm:
-            print("投稿していません。投稿する場合は--confirmを付けて再実行してください。")
-            return False
-
-        answer = input_func("投稿する場合は POST と入力してください: ").strip()
-        if answer != "POST":
-            print("Xへの投稿をキャンセルしました。")
-            return False
-
-        result = publish_x_post(text)
-    except (RuntimeError, ValueError) as exc:
-        print(f"X投稿エラー: {exc}")
-        return False
-
-    print(f"Xへ投稿しました。post_id={result['post_id']}")
-    return True
 
 
 def run_character_memory_list(status="draft"):
@@ -407,6 +364,7 @@ def start_obs_for_upcoming_youtube_broadcast(
     from youtube_oauth import (
         create_youtube_broadcast,
         find_upcoming_youtube_broadcast,
+        get_youtube_broadcast,
         NoUpcomingYouTubeBroadcastError,
         transition_youtube_broadcast_to_live,
         update_youtube_broadcast_metadata,
@@ -435,15 +393,22 @@ def start_obs_for_upcoming_youtube_broadcast(
         runtime.clear_selected_broadcast_plan()
 
     created_broadcast = False
-    try:
-        broadcast = find_upcoming_youtube_broadcast()
-    except NoUpcomingYouTubeBroadcastError as exc:
-        if command is None or command.get("action") != "configure_broadcast":
+    schedule_id = str((command or {}).get("schedule_id") or "").strip()
+    if schedule_id:
+        schedule = runtime.get_broadcast_schedule(schedule_id)
+        if not schedule.get("youtube_video_id"):
+            schedule = runtime.ensure_youtube_broadcast_for_schedule(schedule_id)
+        broadcast = get_youtube_broadcast(schedule["youtube_video_id"])
+        if broadcast["life_cycle_status"] != "ready":
             raise RuntimeError(
-                "開始可能なYouTube配信枠がありません。"
-                "先に管理画面でAI配信構成を作成し、"
-                "「内容を設定して開始」を押してください。"
-            ) from exc
+                "予定に紐付いたYouTube枠は開始可能な状態ではありません。"
+                f" status={broadcast['life_cycle_status']}"
+            )
+        if not broadcast["bound_stream_id"]:
+            raise RuntimeError(
+                "予定に紐付いたYouTube枠へ配信ストリームが接続されていません。"
+            )
+    elif command is not None and command.get("action") == "configure_broadcast":
         runtime.update_admin_status(
             phase="configuring_broadcast",
             message="YouTubeに新しい配信枠を作成しています。",
@@ -459,6 +424,15 @@ def start_obs_for_upcoming_youtube_broadcast(
             f"{broadcast['title']} / video_id={broadcast['video_id']} "
             f"privacy={broadcast['privacy_status']}"
         )
+    else:
+        try:
+            broadcast = find_upcoming_youtube_broadcast()
+        except NoUpcomingYouTubeBroadcastError as exc:
+            raise RuntimeError(
+                "開始可能なYouTube配信枠がありません。"
+                "先に管理画面でAI配信構成を作成し、"
+                "「内容を設定して開始」を押してください。"
+            ) from exc
 
     if command is not None and command.get("action") == "configure_broadcast":
         runtime.update_admin_status(
@@ -469,7 +443,7 @@ def start_obs_for_upcoming_youtube_broadcast(
                 else "YouTube配信の内容を更新しています。"
             ),
         )
-        if not created_broadcast:
+        if not created_broadcast and not schedule_id:
             updated = update_youtube_broadcast_metadata(
                 video_id=broadcast["video_id"],
                 title=command["title"],
@@ -1139,7 +1113,8 @@ def run_youtube_loop_test(max_loops):
     # YouTube Liveコメントを指定回数だけ継続取得します。
     live_chat_id = get_live_chat_id()
     print("YouTube Liveコメントの取得ループを開始します。")
-    print(f"最大取得回数：{max_loops}")
+    max_loops_label = max_loops if max_loops is not None else "無制限"
+    print(f"最大取得回数：{max_loops_label}")
 
     for index, result in enumerate(iter_chat_messages(live_chat_id, max_loops=max_loops), start=1):
         messages = result["messages"]
@@ -1149,8 +1124,82 @@ def run_youtube_loop_test(max_loops):
             print(f"{message['user_name']}：{message['comment']}")
 
 
-def select_reply_target(messages):
-    # Phase 1では、返答しやすい新規コメントの先頭1件に返答します。
+class CommentReplyLimiter:
+    def __init__(
+        self,
+        max_attempts_per_minute=6,
+        viewer_priority_seconds=60,
+        now=None,
+    ):
+        if not 1 <= int(max_attempts_per_minute) <= 60:
+            raise ValueError("1分あたりのコメント返答上限は1〜60回で指定してください。")
+        if not 1 <= float(viewer_priority_seconds) <= 3600:
+            raise ValueError("視聴者の返答優先時間は1〜3600秒で指定してください。")
+        self.max_attempts_per_minute = int(max_attempts_per_minute)
+        self.viewer_priority_seconds = float(viewer_priority_seconds)
+        self.now = now or time.monotonic
+        self.attempt_times = deque()
+        self.last_attempt_by_viewer = {}
+
+    def select(self, messages):
+        current_time = self.now()
+        self._prune(current_time)
+        if len(self.attempt_times) >= self.max_attempts_per_minute:
+            return None
+
+        candidates = [message for message in messages if is_reply_candidate(message)]
+        if not candidates:
+            return None
+
+        unique_viewers = {
+            self._viewer_key(message) for message in candidates
+        }
+        preferred = [
+            message
+            for message in candidates
+            if current_time
+            - self.last_attempt_by_viewer.get(
+                self._viewer_key(message),
+                float("-inf"),
+            )
+            >= self.viewer_priority_seconds
+        ]
+        if preferred:
+            return preferred[0]
+        if len(unique_viewers) == 1:
+            # 他の返答候補がいない配信では、同じ視聴者との会話を妨げません。
+            return candidates[0]
+        return None
+
+    def record_attempt(self, message):
+        current_time = self.now()
+        self._prune(current_time)
+        self.attempt_times.append(current_time)
+        self.last_attempt_by_viewer[self._viewer_key(message)] = current_time
+
+    def _prune(self, current_time):
+        rate_limit_start = current_time - 60
+        while self.attempt_times and self.attempt_times[0] <= rate_limit_start:
+            self.attempt_times.popleft()
+        priority_start = current_time - self.viewer_priority_seconds
+        self.last_attempt_by_viewer = {
+            viewer: attempted_at
+            for viewer, attempted_at in self.last_attempt_by_viewer.items()
+            if attempted_at > priority_start
+        }
+
+    @staticmethod
+    def _viewer_key(message):
+        user_id = str(message.get("user_id", "")).strip()
+        if user_id:
+            return f"id:{user_id}"
+        return f"name:{str(message.get('user_name', '')).strip()}"
+
+
+def select_reply_target(messages, reply_limiter=None):
+    # 返答制御があるライブでは、連投と視聴者間の公平性も考慮します。
+    if reply_limiter is not None:
+        return reply_limiter.select(messages)
     for message in messages:
         if is_reply_candidate(message):
             return message
@@ -1428,7 +1477,7 @@ def run_ai_youtuber_loop(
     else:
         live_chat_id = get_live_chat_id()
         video_id = None
-    processed_message_ids = set()
+    comment_reply_limiter = CommentReplyLimiter()
     used_news_links = set()
     llm_config = load_llm_config()
     stream_context = StreamContextManager(config=llm_config)
@@ -1460,7 +1509,8 @@ def run_ai_youtuber_loop(
         )
 
     print("AI YouTuberループを開始します。")
-    print(f"最大取得回数：{max_loops}")
+    max_loops_label = max_loops if max_loops is not None else "無制限"
+    print(f"最大取得回数：{max_loops_label}")
     if autonomous_buffer is not None:
         print(autonomous_buffer.theme_manager.describe())
         runtime.update_admin_status(
@@ -1548,17 +1598,10 @@ def run_ai_youtuber_loop(
             print("新しい発話を停止し、音声完了を待たずPythonを終了します。")
             break
         index += 1
-        messages = [
-            message
-            for message in result["messages"]
-            if message["message_id"] not in processed_message_ids
-        ]
-        target_message = select_reply_target(messages)
+        messages = result["messages"]
+        target_message = select_reply_target(messages, comment_reply_limiter)
 
         print(f"--- {index}回目 / 新規コメント数：{len(messages)} ---")
-
-        for message in messages:
-            processed_message_ids.add(message["message_id"])
 
         if target_message is None:
             print("返答対象のコメントはありませんでした。")
@@ -1668,6 +1711,8 @@ def run_ai_youtuber_loop(
                 target_message["message_id"],
                 "thinking",
             )
+        # 生成失敗も上限へ含め、障害時の連続LLM呼び出しを防ぎます。
+        comment_reply_limiter.record_attempt(target_message)
         try:
             ai_response = generate_ai_response(
                 target_message["user_name"],
@@ -1932,27 +1977,18 @@ def parse_args():
             "character-memory-approved",
             "character-memory-approve",
             "character-memory-reject",
-            "x-draft",
-            "x-post",
         ],
         default="openai-test",
         help="実行する確認処理を選びます。",
     )
     parser.add_argument(
-        "--x-topic",
-        default=None,
-        help="x-draftまたはx-postモードで投稿案の話題を任意指定します。",
-    )
-    parser.add_argument(
-        "--confirm",
-        action="store_true",
-        help="x-postモードで対話確認を有効にします。",
-    )
-    parser.add_argument(
         "--max-loops",
         type=int,
-        default=3,
-        help="youtube-loopまたはai-youtuber-loopモードでコメント取得を繰り返す回数です。",
+        default=None,
+        help=(
+            "コメント取得を繰り返す回数です。"
+            "確認用モードは省略時3回、本番モードは省略時無制限です。"
+        ),
     )
     parser.add_argument(
         "--mock-delay-seconds",
@@ -1984,32 +2020,40 @@ def parse_args():
     return parser.parse_args()
 
 
+def resolve_max_loops(mode, configured_max_loops):
+    if configured_max_loops is not None:
+        if configured_max_loops <= 0:
+            raise ValueError("--max-loopsは1以上の整数にしてください。")
+        return configured_max_loops
+    if mode in {"youtube-loop", "ai-youtuber-loop"}:
+        # 確認用モードは指定がなくても短時間で終了させます。
+        return 3
+    return None
+
+
 def main():
     # .envの内容を環境変数として読み込みます。
     load_dotenv()
     args = parse_args()
 
     try:
+        max_loops = resolve_max_loops(args.mode, args.max_loops)
         if args.mode == "openai-test":
             run_openai_test()
         elif args.mode == "obs-test":
             run_obs_websocket_test()
         elif args.mode == "youtube-upcoming":
             run_youtube_upcoming_test()
-        elif args.mode == "x-draft":
-            run_x_post_draft(args.x_topic)
-        elif args.mode == "x-post":
-            run_x_post(args.x_topic, confirm=args.confirm)
         elif args.mode == "youtube-chat-id":
             run_youtube_chat_id_test()
         elif args.mode == "youtube-messages":
             run_youtube_messages_test()
         elif args.mode == "youtube-loop":
-            run_youtube_loop_test(args.max_loops)
+            run_youtube_loop_test(max_loops)
         elif args.mode == "ai-youtuber-once":
             run_ai_youtuber_once()
         elif args.mode == "ai-youtuber-loop":
-            run_ai_youtuber_loop(args.max_loops)
+            run_ai_youtuber_loop(max_loops)
         elif args.mode == "aivis-info":
             run_aivis_info()
         elif args.mode == "external-control-server":
@@ -2022,12 +2066,12 @@ def main():
             run_news_voice_test()
         elif args.mode == "ai-youtuber-live":
             run_ai_youtuber_live(
-                args.max_loops,
+                max_loops,
                 args.stream_topic,
                 args.stream_plan,
             )
         elif args.mode == "admin-service":
-            run_admin_service(args.max_loops)
+            run_admin_service(max_loops)
         elif args.mode == "mock-live":
             run_mock_live(args.mock_delay_seconds)
         elif args.mode == "character-memory-drafts":

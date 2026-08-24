@@ -1,7 +1,9 @@
+import hmac
 import io
 import json
 import math
 import queue
+import secrets
 import sys
 import threading
 import time
@@ -9,6 +11,7 @@ import uuid
 import wave
 from collections import OrderedDict, deque
 from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
@@ -570,7 +573,6 @@ class ExternalControlRuntime:
                 schedule_id,
                 prepared_stream_plan=serialized_plan,
                 status="prepared",
-                youtube_video_id=None,
                 last_error=None,
             )
         return public_draft
@@ -928,12 +930,106 @@ class ExternalControlRuntime:
             "template_id": values.get("template_id"),
         }
         if schedule_id:
-            return repository.update_schedule(schedule_id, **arguments)
-        return repository.create_schedule(**arguments)
+            schedule = repository.update_schedule(schedule_id, **arguments)
+        else:
+            schedule = repository.create_schedule(**arguments)
+        if schedule.get("youtube_video_id"):
+            return self._synchronize_youtube_broadcast_schedule(schedule)
+        from broadcast_auto_scheduler import youtube_frame_create_hours_before
+
+        scheduled_at = datetime.fromisoformat(schedule["scheduled_start_at"])
+        hours_until_start = (
+            scheduled_at - datetime.now(timezone.utc)
+        ).total_seconds() / 3600
+        if 0 < hours_until_start <= youtube_frame_create_hours_before():
+            try:
+                self.ensure_youtube_broadcast_for_schedule(
+                    schedule["schedule_id"]
+                )
+            except RuntimeError:
+                pass
+            schedule = repository.get_schedule(schedule["schedule_id"])
+        return schedule
 
     def delete_broadcast_schedule(self, schedule_id):
         repository = self._get_broadcast_schedule_repository()
+        schedule = repository.get_schedule(schedule_id)
+        if schedule["status"] in {"starting", "youtube_scheduled", "live"}:
+            raise RuntimeError("開始処理中または配信中の予定は削除できません。")
+        video_id = schedule.get("youtube_video_id")
+        if video_id and schedule["status"] != "completed":
+            from youtube_oauth import delete_youtube_broadcast
+
+            delete_youtube_broadcast(video_id)
         repository.delete_schedule(schedule_id)
+
+    def ensure_youtube_broadcast_for_schedule(self, schedule_id):
+        repository = self._get_broadcast_schedule_repository()
+        schedule = repository.get_schedule(schedule_id)
+        if schedule["status"] in {
+            "youtube_scheduled",
+            "live",
+            "completed",
+            "cancelled",
+        }:
+            raise RuntimeError(
+                "この状態の配信予定にはYouTube枠を作成できません。"
+                f" status={schedule['status']}"
+            )
+        if schedule.get("youtube_video_id"):
+            return self._synchronize_youtube_broadcast_schedule(schedule)
+        from youtube_oauth import create_youtube_broadcast
+
+        scheduled_start_time = datetime.fromisoformat(
+            schedule["scheduled_start_at"]
+        )
+        if scheduled_start_time <= datetime.now(timezone.utc):
+            # 事前作成に失敗して開始時刻を迎えた場合も、開始処理内で枠を作れるようにする。
+            scheduled_start_time = datetime.now(timezone.utc) + timedelta(
+                minutes=5
+            )
+        try:
+            broadcast = create_youtube_broadcast(
+                title=schedule["title"],
+                description=schedule["description"],
+                privacy_status=schedule["privacy_status"],
+                scheduled_start_time=scheduled_start_time,
+            )
+        except (RuntimeError, ValueError) as exc:
+            repository.update_schedule(
+                schedule["schedule_id"],
+                last_error=f"YouTube枠の作成に失敗しました: {exc}",
+            )
+            raise RuntimeError(
+                f"YouTube枠の作成に失敗しました: {exc}"
+            ) from exc
+        return repository.update_schedule(
+            schedule["schedule_id"],
+            youtube_video_id=broadcast["video_id"],
+            last_error=None,
+        )
+
+    def _synchronize_youtube_broadcast_schedule(self, schedule):
+        repository = self._get_broadcast_schedule_repository()
+        from youtube_oauth import update_youtube_scheduled_broadcast
+
+        try:
+            update_youtube_scheduled_broadcast(
+                schedule["youtube_video_id"],
+                title=schedule["title"],
+                description=schedule["description"],
+                privacy_status=schedule["privacy_status"],
+                scheduled_start_time=schedule["scheduled_start_at"],
+            )
+        except (RuntimeError, ValueError) as exc:
+            return repository.update_schedule(
+                schedule["schedule_id"],
+                last_error=f"YouTube枠の同期に失敗しました: {exc}",
+            )
+        return repository.update_schedule(
+            schedule["schedule_id"],
+            last_error=None,
+        )
 
     def _get_broadcast_schedule_repository(self):
         if self.broadcast_schedule_repository is None:
@@ -1136,9 +1232,10 @@ class ExternalControlHttpServer(ThreadingHTTPServer):
     daemon_threads = True
     allow_reuse_address = True
 
-    def __init__(self, server_address, runtime):
+    def __init__(self, server_address, runtime, control_token=None):
         super().__init__(server_address, ExternalControlRequestHandler)
         self.runtime = runtime
+        self.control_token = control_token or secrets.token_urlsafe(32)
 
     def handle_error(self, request, client_address):
         error = sys.exc_info()[1]
@@ -1159,6 +1256,8 @@ class ExternalControlRequestHandler(BaseHTTPRequestHandler):
         return self.server.runtime
 
     def do_GET(self):
+        if not self._validate_host():
+            return
         parsed_url = urlparse(self.path)
         path = parsed_url.path
         if path == "/events":
@@ -1227,6 +1326,8 @@ class ExternalControlRequestHandler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         path = urlparse(self.path).path
+        if not self._validate_host() or not self._authorize_write_request(path):
+            return
         if path == "/api/speak":
             self._handle_speak()
             return
@@ -1267,13 +1368,25 @@ class ExternalControlRequestHandler(BaseHTTPRequestHandler):
         if path == "/api/broadcast/schedules/delete":
             self._handle_broadcast_schedule_delete()
             return
+        if path == "/api/broadcast/schedules/youtube":
+            self._handle_broadcast_schedule_youtube()
+            return
         self._send_json(404, {"error": "指定されたエンドポイントはありません。"})
 
     def do_OPTIONS(self):
+        if not self._validate_host():
+            return
+        origin = self.headers.get("Origin", "")
+        if origin and not is_allowed_local_origin(origin):
+            self._send_json(403, {"error": "許可されていない接続元です。"})
+            return
         self.send_response(204)
         self._send_cors_headers()
         self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
-        self.send_header("Access-Control-Allow-Headers", "Content-Type")
+        self.send_header(
+            "Access-Control-Allow-Headers",
+            "Content-Type, X-Control-Token",
+        )
         self.end_headers()
 
     def _serve_events(self, event_broker):
@@ -1358,7 +1471,10 @@ class ExternalControlRequestHandler(BaseHTTPRequestHandler):
 
     def _serve_admin_panel(self):
         try:
-            payload = ADMIN_PANEL_PATH.read_bytes()
+            payload = ADMIN_PANEL_PATH.read_text(encoding="utf-8").replace(
+                "__CONTROL_API_TOKEN__",
+                json.dumps(self.server.control_token),
+            ).encode("utf-8")
         except OSError as exc:
             print(f"配信管理画面を読み込めませんでした: {exc}")
             self._send_json(
@@ -1376,7 +1492,12 @@ class ExternalControlRequestHandler(BaseHTTPRequestHandler):
 
     def _serve_character_memory_panel(self):
         try:
-            payload = CHARACTER_MEMORY_PANEL_PATH.read_bytes()
+            payload = CHARACTER_MEMORY_PANEL_PATH.read_text(
+                encoding="utf-8"
+            ).replace(
+                "__CONTROL_API_TOKEN__",
+                json.dumps(self.server.control_token),
+            ).encode("utf-8")
         except OSError as exc:
             print(f"キャラクター記憶管理画面を読み込めませんでした: {exc}")
             self._send_json(
@@ -1669,6 +1790,25 @@ class ExternalControlRequestHandler(BaseHTTPRequestHandler):
             return
         self._send_json(200, {"status": "deleted"})
 
+    def _handle_broadcast_schedule_youtube(self):
+        body = self._read_json_object()
+        if body is None:
+            return
+        try:
+            schedule = self.runtime.ensure_youtube_broadcast_for_schedule(
+                body.get("schedule_id")
+            )
+        except ValueError as exc:
+            self._send_json(400, {"error": str(exc)})
+            return
+        except KeyError as exc:
+            self._send_json(404, {"error": str(exc)})
+            return
+        except RuntimeError as exc:
+            self._send_json(500, {"error": str(exc)})
+            return
+        self._send_json(200, {"schedule": schedule})
+
     def _read_json_object(self):
         try:
             content_length = int(self.headers.get("Content-Length", "0"))
@@ -1696,6 +1836,39 @@ class ExternalControlRequestHandler(BaseHTTPRequestHandler):
             )
             return None
         return body
+
+    def _validate_host(self):
+        host = self.headers.get("Host", "")
+        try:
+            hostname = urlparse(f"//{host}").hostname
+        except ValueError:
+            hostname = None
+        if hostname in {"127.0.0.1", "localhost", "::1"}:
+            return True
+        self._send_json(403, {"error": "ローカルホストからのみ接続できます。"})
+        return False
+
+    def _authorize_write_request(self, path):
+        origin = self.headers.get("Origin", "")
+        if origin and not is_allowed_local_origin(origin):
+            self._send_json(403, {"error": "許可されていない接続元です。"})
+            return False
+
+        content_type = self.headers.get("Content-Type", "")
+        media_type = content_type.split(";", 1)[0].strip().lower()
+        if media_type != "application/json":
+            self._send_json(
+                415,
+                {"error": "Content-Typeはapplication/jsonにしてください。"},
+            )
+            return False
+
+        if _requires_control_token(path):
+            supplied_token = self.headers.get("X-Control-Token", "")
+            if not hmac.compare_digest(supplied_token, self.server.control_token):
+                self._send_json(403, {"error": "管理APIの認証に失敗しました。"})
+                return False
+        return True
 
     def _send_json(self, status_code, body):
         payload = json.dumps(body, ensure_ascii=False).encode("utf-8")
@@ -1730,6 +1903,12 @@ def is_allowed_local_origin(origin):
         "127.0.0.1",
         "localhost",
     }
+
+
+def _requires_control_token(path):
+    return path == "/api/character-memories/review" or path.startswith(
+        ("/api/admin/", "/api/live-service/", "/api/broadcast/")
+    )
 
 
 class ExternalControlServer:

@@ -76,7 +76,7 @@ class BroadcastAutoSchedulerTest(unittest.TestCase):
 
     def test_disabled_schedule_is_not_processed(self):
         self.runtime.list_broadcast_schedules.return_value = [
-            self.create_schedule(starts_in_minutes=0, auto_start=False)
+            self.create_schedule(starts_in_minutes=5, auto_start=False)
         ]
 
         self.create_scheduler().run_once()
@@ -84,6 +84,36 @@ class BroadcastAutoSchedulerTest(unittest.TestCase):
         self.runtime.generate_broadcast_draft.assert_not_called()
         self.runtime.prepare_live_service.assert_not_called()
         self.runtime.queue_broadcast_start.assert_not_called()
+        self.runtime.ensure_youtube_broadcast_for_schedule.assert_called_once_with(
+            "schedule-1"
+        )
+
+    def test_youtube_frame_is_not_created_more_than_48_hours_early(self):
+        self.runtime.list_broadcast_schedules.return_value = [
+            self.create_schedule(starts_in_minutes=48 * 60 + 1)
+        ]
+
+        self.create_scheduler().run_once()
+
+        self.runtime.ensure_youtube_broadcast_for_schedule.assert_not_called()
+
+    def test_youtube_frame_creation_is_retried_after_interval(self):
+        schedule = self.create_schedule(starts_in_minutes=60)
+        self.runtime.list_broadcast_schedules.return_value = [schedule]
+        self.runtime.ensure_youtube_broadcast_for_schedule.side_effect = (
+            RuntimeError("一時エラー")
+        )
+        scheduler = self.create_scheduler()
+
+        scheduler.run_once()
+        scheduler.run_once()
+        self.current += timedelta(minutes=15)
+        scheduler.run_once()
+
+        self.assertEqual(
+            self.runtime.ensure_youtube_broadcast_for_schedule.call_count,
+            2,
+        )
 
     def test_schedule_older_than_grace_period_is_not_started(self):
         self.runtime.list_broadcast_schedules.return_value = [

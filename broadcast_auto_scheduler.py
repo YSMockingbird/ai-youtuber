@@ -22,6 +22,8 @@ class BroadcastAutoScheduler:
         check_interval_seconds=15,
         prepare_minutes_before=10,
         late_start_grace_minutes=15,
+        youtube_create_hours_before=48,
+        youtube_retry_minutes=15,
         now=None,
     ):
         self.runtime = runtime
@@ -40,12 +42,23 @@ class BroadcastAutoScheduler:
             "自動配信の遅延許容時間",
             maximum=1440,
         ) * 60
+        self.youtube_create_seconds_before = _positive_number(
+            youtube_create_hours_before,
+            "YouTube枠の事前作成時間",
+            maximum=24 * 365,
+        ) * 3600
+        self.youtube_retry_seconds = _positive_number(
+            youtube_retry_minutes,
+            "YouTube枠作成の再試行間隔",
+            maximum=1440,
+        ) * 60
         self.now = now or (lambda: datetime.now(timezone.utc))
         self._stop_event = threading.Event()
         self._thread = None
         self._preparation_attempts = {}
         self._service_preparation_attempts = {}
         self._prepared_service_ids = set()
+        self._youtube_retry_after = {}
 
     @classmethod
     def from_env(cls, runtime):
@@ -61,6 +74,11 @@ class BroadcastAutoScheduler:
             ),
             late_start_grace_minutes=os.getenv(
                 "AUTO_SCHEDULE_LATE_GRACE_MINUTES",
+                "15",
+            ),
+            youtube_create_hours_before=youtube_frame_create_hours_before(),
+            youtube_retry_minutes=os.getenv(
+                "YOUTUBE_FRAME_CREATE_RETRY_MINUTES",
                 "15",
             ),
         )
@@ -92,7 +110,10 @@ class BroadcastAutoScheduler:
             start_at=current - timedelta(seconds=self.late_start_grace_seconds),
             end_at=current
             + timedelta(
-                seconds=self.prepare_seconds_before
+                seconds=max(
+                    self.prepare_seconds_before,
+                    self.youtube_create_seconds_before,
+                )
                 + self.check_interval_seconds
                 + 1
             ),
@@ -121,9 +142,6 @@ class BroadcastAutoScheduler:
 
     def _process_schedule(self, schedule, current):
         schedule_id = schedule["schedule_id"]
-        if not schedule.get("auto_start", False):
-            self._discard_service_preparation(schedule_id)
-            return
         status = schedule.get("status")
         if status in FINAL_STATUSES:
             self._discard_service_preparation(schedule_id)
@@ -132,6 +150,13 @@ class BroadcastAutoScheduler:
             return
         scheduled_at = _parse_datetime(schedule.get("scheduled_start_at"))
         seconds_until_start = (scheduled_at - current).total_seconds()
+        if 0 < seconds_until_start <= self.youtube_create_seconds_before:
+            provisioned_schedule = self._ensure_youtube_frame(schedule, current)
+            if isinstance(provisioned_schedule, dict):
+                schedule = provisioned_schedule
+        if not schedule.get("auto_start", False):
+            self._discard_service_preparation(schedule_id)
+            return
         if seconds_until_start > self.prepare_seconds_before:
             return
         if seconds_until_start < -self.late_start_grace_seconds:
@@ -263,6 +288,33 @@ class BroadcastAutoScheduler:
             f"{schedule['title']} / schedule_id={schedule['schedule_id']}"
         )
 
+    def _ensure_youtube_frame(self, schedule, current):
+        if schedule.get("youtube_video_id"):
+            self._youtube_retry_after.pop(schedule["schedule_id"], None)
+            return schedule
+        retry_after = self._youtube_retry_after.get(schedule["schedule_id"])
+        if retry_after is not None and current < retry_after:
+            return schedule
+        try:
+            provisioned_schedule = self.runtime.ensure_youtube_broadcast_for_schedule(
+                schedule["schedule_id"]
+            )
+        except Exception as exc:
+            self._youtube_retry_after[schedule["schedule_id"]] = (
+                current + timedelta(seconds=self.youtube_retry_seconds)
+            )
+            print(
+                "YouTube枠の自動作成エラー："
+                f"schedule_id={schedule['schedule_id']} detail={exc}"
+            )
+            return schedule
+        self._youtube_retry_after.pop(schedule["schedule_id"], None)
+        print(
+            "YouTube枠を自動作成しました："
+            f"{schedule['title']} / schedule_id={schedule['schedule_id']}"
+        )
+        return provisioned_schedule
+
 
 def auto_schedule_enabled():
     normalized = os.getenv("AUTO_SCHEDULE_ENABLED", "true").strip().lower()
@@ -272,6 +324,14 @@ def auto_schedule_enabled():
         return False
     raise RuntimeError(
         "AUTO_SCHEDULE_ENABLEDはtrueまたはfalseで設定してください。"
+    )
+
+
+def youtube_frame_create_hours_before():
+    return _positive_number(
+        os.getenv("YOUTUBE_FRAME_CREATE_HOURS_BEFORE", "48"),
+        "YouTube枠の事前作成時間",
+        maximum=24 * 365,
     )
 
 

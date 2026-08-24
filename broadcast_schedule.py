@@ -4,6 +4,7 @@ import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
+from local_storage import secure_sqlite_storage
 from llm.config import PROJECT_ROOT
 
 
@@ -24,8 +25,9 @@ ALLOWED_SCHEDULE_STATUSES = {
 class BroadcastScheduleRepository:
     def __init__(self, database_path):
         self.database_path = Path(database_path)
-        self.database_path.parent.mkdir(parents=True, exist_ok=True)
+        secure_sqlite_storage(self.database_path)
         self._initialize()
+        secure_sqlite_storage(self.database_path)
 
     def _connect(self):
         connection = sqlite3.connect(str(self.database_path), timeout=5)
@@ -400,7 +402,6 @@ class BroadcastScheduleRepository:
             normalized_changes["prepared_stream_plan"] = None
             normalized_changes["prepared_at"] = None
             normalized_changes["status"] = "draft"
-            normalized_changes["youtube_video_id"] = None
             normalized_changes["last_error"] = None
         if "prepared_stream_plan" in normalized_changes:
             normalized_changes["prepared_at"] = (

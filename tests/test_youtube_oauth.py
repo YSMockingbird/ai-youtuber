@@ -10,23 +10,117 @@ from youtube_oauth import (
     _save_credentials,
     complete_youtube_broadcast,
     create_youtube_broadcast,
+    delete_youtube_broadcast,
     find_active_youtube_broadcast,
     find_youtube_autostart_conflicts,
     find_upcoming_youtube_broadcast,
     find_reusable_youtube_stream,
     get_youtube_oauth_paths,
+    get_youtube_broadcast,
     is_youtube_broadcast_live,
     is_youtube_stream_active,
     NoActiveYouTubeBroadcastError,
     NoUpcomingYouTubeBroadcastError,
     transition_youtube_broadcast_to_live,
     update_youtube_broadcast_metadata,
+    update_youtube_scheduled_broadcast,
     YOUTUBE_MANAGE_SCOPE,
     get_youtube_credentials,
 )
 
 
 class YouTubeOAuthTest(unittest.TestCase):
+    @patch("youtube_oauth.requests.get")
+    def test_broadcast_is_loaded_by_saved_video_id(self, get_mock):
+        response = Mock()
+        response.json.return_value = {
+            "items": [
+                {
+                    "id": "scheduled-video",
+                    "snippet": {
+                        "title": "予定配信",
+                        "scheduledStartTime": "2026-08-25T13:00:00Z",
+                    },
+                    "status": {
+                        "lifeCycleStatus": "ready",
+                        "privacyStatus": "unlisted",
+                    },
+                    "contentDetails": {
+                        "boundStreamId": "stream-id",
+                        "enableAutoStart": False,
+                    },
+                }
+            ]
+        }
+        get_mock.return_value = response
+
+        result = get_youtube_broadcast(
+            "scheduled-video",
+            credentials=SimpleNamespace(token="access-token"),
+        )
+
+        self.assertEqual(result["video_id"], "scheduled-video")
+        self.assertEqual(result["life_cycle_status"], "ready")
+        self.assertEqual(result["bound_stream_id"], "stream-id")
+        self.assertEqual(
+            get_mock.call_args.kwargs["params"]["id"],
+            "scheduled-video",
+        )
+
+    @patch("youtube_oauth.requests.put")
+    @patch("youtube_oauth.get_youtube_broadcast")
+    def test_scheduled_broadcast_changes_are_synchronized(
+        self,
+        get_broadcast_mock,
+        put_mock,
+    ):
+        get_broadcast_mock.return_value = {
+            "video_id": "scheduled-video",
+            "life_cycle_status": "ready",
+        }
+        put_mock.return_value = Mock()
+
+        result = update_youtube_scheduled_broadcast(
+            "scheduled-video",
+            title="変更後の配信",
+            description="変更後の説明",
+            privacy_status="public",
+            scheduled_start_time="2026-08-25T22:00:00+09:00",
+            credentials=SimpleNamespace(token="access-token"),
+        )
+
+        body = put_mock.call_args.kwargs["json"]
+        self.assertEqual(
+            body["snippet"]["scheduledStartTime"],
+            "2026-08-25T13:00:00Z",
+        )
+        self.assertEqual(body["status"]["privacyStatus"], "public")
+        self.assertEqual(result["title"], "変更後の配信")
+
+    @patch("youtube_oauth.requests.delete")
+    @patch("youtube_oauth.get_youtube_broadcast")
+    def test_only_ready_broadcast_is_deleted(
+        self,
+        get_broadcast_mock,
+        delete_mock,
+    ):
+        get_broadcast_mock.return_value = {
+            "video_id": "scheduled-video",
+            "life_cycle_status": "ready",
+        }
+        delete_mock.return_value = Mock()
+
+        self.assertTrue(
+            delete_youtube_broadcast(
+                "scheduled-video",
+                credentials=SimpleNamespace(token="access-token"),
+            )
+        )
+        self.assertEqual(
+            delete_mock.call_args.kwargs["params"]["id"],
+            "scheduled-video",
+        )
+
     @patch("youtube_oauth.requests.put")
     @patch("youtube_oauth.requests.get")
     def test_persistent_broadcast_metadata_can_be_updated(

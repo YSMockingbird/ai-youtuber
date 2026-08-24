@@ -7,6 +7,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import wave
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
@@ -361,6 +362,157 @@ class ExternalControlRuntimeTest(unittest.TestCase):
 
         self.assertEqual(configure["title"], "保存済みタイトル")
         self.assertEqual(configure["description"], "保存済み説明")
+
+    @patch("youtube_oauth.create_youtube_broadcast")
+    def test_schedule_within_48_hours_creates_youtube_frame(
+        self,
+        create_broadcast_mock,
+    ):
+        temporary_directory, repository, runtime = self.create_schedule_runtime()
+        self.addCleanup(temporary_directory.cleanup)
+        create_broadcast_mock.return_value = {"video_id": "scheduled-video"}
+        starts_at = datetime.now(timezone.utc) + timedelta(hours=24)
+
+        schedule = runtime.save_broadcast_schedule(
+            {
+                "scheduled_start_at": starts_at.isoformat(),
+                "planning_mode": "ai",
+                "content_request": "自己紹介配信",
+                "title": "自己紹介",
+                "description": "説明",
+                "privacy_status": "unlisted",
+                "auto_start": True,
+                "template_id": None,
+            }
+        )
+
+        self.assertEqual(schedule["youtube_video_id"], "scheduled-video")
+        create_broadcast_mock.assert_called_once()
+
+    @patch("youtube_oauth.create_youtube_broadcast")
+    def test_starting_schedule_can_recover_missing_youtube_frame(
+        self,
+        create_broadcast_mock,
+    ):
+        temporary_directory, repository, runtime = self.create_schedule_runtime()
+        self.addCleanup(temporary_directory.cleanup)
+        create_broadcast_mock.return_value = {"video_id": "recovered-video"}
+        schedule = repository.create_schedule(
+            scheduled_start_at=(
+                datetime.now(timezone.utc) - timedelta(minutes=1)
+            ).isoformat(),
+            planning_mode="ai",
+            content_request="自己紹介配信",
+            title="自己紹介",
+            description="説明",
+        )
+        repository.update_schedule(schedule["schedule_id"], status="starting")
+
+        updated = runtime.ensure_youtube_broadcast_for_schedule(
+            schedule["schedule_id"]
+        )
+
+        self.assertEqual(updated["youtube_video_id"], "recovered-video")
+        scheduled_start_time = create_broadcast_mock.call_args.kwargs[
+            "scheduled_start_time"
+        ]
+        self.assertGreater(scheduled_start_time, datetime.now(timezone.utc))
+
+    @patch("youtube_oauth.update_youtube_scheduled_broadcast")
+    def test_schedule_edit_synchronizes_existing_youtube_frame(
+        self,
+        update_broadcast_mock,
+    ):
+        temporary_directory, repository, runtime = self.create_schedule_runtime()
+        self.addCleanup(temporary_directory.cleanup)
+        schedule = repository.create_schedule(
+            scheduled_start_at=(
+                datetime.now(timezone.utc) + timedelta(days=3)
+            ).isoformat(),
+            planning_mode="ai",
+            content_request="自己紹介配信",
+            title="変更前",
+            description="説明",
+        )
+        repository.update_schedule(
+            schedule["schedule_id"],
+            youtube_video_id="scheduled-video",
+        )
+
+        updated = runtime.save_broadcast_schedule(
+            {
+                "schedule_id": schedule["schedule_id"],
+                "scheduled_start_at": schedule["scheduled_start_at"],
+                "planning_mode": "ai",
+                "content_request": "自己紹介配信",
+                "title": "変更後",
+                "description": "新しい説明",
+                "privacy_status": "public",
+                "auto_start": True,
+                "template_id": None,
+            }
+        )
+
+        self.assertEqual(updated["youtube_video_id"], "scheduled-video")
+        update_broadcast_mock.assert_called_once_with(
+            "scheduled-video",
+            title="変更後",
+            description="新しい説明",
+            privacy_status="public",
+            scheduled_start_time=schedule["scheduled_start_at"],
+        )
+
+    def test_preparing_plan_keeps_youtube_video_id(self):
+        temporary_directory, repository, runtime = self.create_schedule_runtime()
+        self.addCleanup(temporary_directory.cleanup)
+        schedule = repository.create_schedule(
+            scheduled_start_at="2026-08-20T21:00:00+09:00",
+            planning_mode="ai",
+            content_request="自己紹介配信",
+            title="自己紹介",
+            description="説明",
+        )
+        repository.update_schedule(
+            schedule["schedule_id"],
+            youtube_video_id="scheduled-video",
+        )
+
+        runtime.store_prepared_broadcast_draft(
+            self.create_stream_plan(),
+            schedule["content_request"],
+            "draft-schedule",
+            schedule_id=schedule["schedule_id"],
+        )
+
+        self.assertEqual(
+            repository.get_schedule(schedule["schedule_id"])["youtube_video_id"],
+            "scheduled-video",
+        )
+
+    @patch("youtube_oauth.delete_youtube_broadcast")
+    def test_deleting_schedule_removes_unstarted_youtube_frame(
+        self,
+        delete_broadcast_mock,
+    ):
+        temporary_directory, repository, runtime = self.create_schedule_runtime()
+        self.addCleanup(temporary_directory.cleanup)
+        schedule = repository.create_schedule(
+            scheduled_start_at="2026-08-20T21:00:00+09:00",
+            planning_mode="ai",
+            content_request="自己紹介配信",
+            title="自己紹介",
+            description="説明",
+        )
+        repository.update_schedule(
+            schedule["schedule_id"],
+            youtube_video_id="scheduled-video",
+        )
+
+        runtime.delete_broadcast_schedule(schedule["schedule_id"])
+
+        delete_broadcast_mock.assert_called_once_with("scheduled-video")
+        with self.assertRaises(KeyError):
+            repository.get_schedule(schedule["schedule_id"])
 
     def test_schedule_start_is_claimed_before_live_service_starts(self):
         temporary_directory, repository, runtime = self.create_schedule_runtime()
@@ -955,6 +1107,9 @@ class CharacterMemoryHttpTest(unittest.TestCase):
         self.assertIn("空欄ならAIにおまかせ", html)
         self.assertIn("予定時刻に自動で配信開始する", html)
         self.assertIn("予定時刻の自動配信：有効", html)
+        self.assertIn('id="automationAlert"', html)
+        self.assertIn("要確認：自動配信", html)
+        self.assertIn("schedule.status === 'error'", html)
         self.assertLess(
             html.index('<div class="calendar-weekday">日</div>'),
             html.index('<div class="calendar-weekday">月</div>'),
@@ -966,6 +1121,13 @@ class CharacterMemoryHttpTest(unittest.TestCase):
             html.index("<h2>文章をそのまま発話</h2>"),
         )
         self.assertIn("/api/broadcast/schedules/save", html)
+        self.assertIn("/api/broadcast/schedules/youtube", html)
+        self.assertIn("elements.scheduleTime.value = '22:00';", html)
+        self.assertIn("YouTube待機枠は開始48時間前", html)
+        self.assertIn("今すぐYouTube枠を作成", html)
+        self.assertIn("リンクをコピー", html)
+        self.assertIn("const controlApiToken = ", html)
+        self.assertNotIn("__CONTROL_API_TOKEN__", html)
         self.assertNotIn("ライブ制御を起動", html)
         self.assertIn("開始待機を中止", html)
 
@@ -1117,7 +1279,10 @@ class CharacterMemoryHttpTest(unittest.TestCase):
             data=json.dumps(
                 {"memory_id": memory_id, "status": "approved"}
             ).encode("utf-8"),
-            headers={"Content-Type": "application/json"},
+            headers={
+                "Content-Type": "application/json",
+                "X-Control-Token": self.server.control_token,
+            },
             method="POST",
         )
 
@@ -1128,11 +1293,84 @@ class CharacterMemoryHttpTest(unittest.TestCase):
         self.assertEqual(self.repository.list("draft"), [])
         self.assertEqual(len(self.repository.list("approved")), 1)
 
+    def test_write_api_rejects_missing_control_token(self):
+        request = urllib.request.Request(
+            f"{self.base_url}/api/live-service/start",
+            data=b"{}",
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+
+        with self.assertRaises(urllib.error.HTTPError) as context:
+            urllib.request.urlopen(request, timeout=3)
+
+        self.assertEqual(context.exception.code, 403)
+
+    def test_write_api_rejects_untrusted_origin(self):
+        request = urllib.request.Request(
+            f"{self.base_url}/api/live-service/start",
+            data=b"{}",
+            headers={
+                "Content-Type": "application/json",
+                "X-Control-Token": self.server.control_token,
+                "Origin": "https://attacker.example",
+            },
+            method="POST",
+        )
+
+        with self.assertRaises(urllib.error.HTTPError) as context:
+            urllib.request.urlopen(request, timeout=3)
+
+        self.assertEqual(context.exception.code, 403)
+
+    def test_write_api_requires_json_content_type(self):
+        request = urllib.request.Request(
+            f"{self.base_url}/api/live-service/start",
+            data=b"{}",
+            headers={
+                "Content-Type": "text/plain",
+                "X-Control-Token": self.server.control_token,
+            },
+            method="POST",
+        )
+
+        with self.assertRaises(urllib.error.HTTPError) as context:
+            urllib.request.urlopen(request, timeout=3)
+
+        self.assertEqual(context.exception.code, 415)
+
+    def test_external_control_api_keeps_tokenless_json_access(self):
+        request = urllib.request.Request(
+            f"{self.base_url}/api/reset",
+            data=b"{}",
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+
+        with urllib.request.urlopen(request, timeout=3) as response:
+            body = json.loads(response.read().decode("utf-8"))
+
+        self.assertEqual(body["command"]["type"], "reset")
+
+    def test_request_rejects_untrusted_host(self):
+        request = urllib.request.Request(
+            f"{self.base_url}/health",
+            headers={"Host": "attacker.example"},
+        )
+
+        with self.assertRaises(urllib.error.HTTPError) as context:
+            urllib.request.urlopen(request, timeout=3)
+
+        self.assertEqual(context.exception.code, 403)
+
     def _post_json(self, path, body):
         request = urllib.request.Request(
             f"{self.base_url}{path}",
             data=json.dumps(body).encode("utf-8"),
-            headers={"Content-Type": "application/json"},
+            headers={
+                "Content-Type": "application/json",
+                "X-Control-Token": self.server.control_token,
+            },
             method="POST",
         )
         with urllib.request.urlopen(request, timeout=3) as response:

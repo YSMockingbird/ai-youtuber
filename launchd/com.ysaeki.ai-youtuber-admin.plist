@@ -7,11 +7,9 @@
   <key>ProgramArguments</key>
   <array>
     <string>/Users/ysaeki/Library/Mobile Documents/com~apple~CloudDocs/rockstar/ai-youtuber/.venv/bin/python</string>
-    <string>/Users/ysaeki/Library/Mobile Documents/com~apple~CloudDocs/rockstar/ai-youtuber/main.py</string>
+    <string>/Users/ysaeki/Library/Mobile Documents/com~apple~CloudDocs/rockstar/ai-youtuber/service_entrypoint.py</string>
     <string>--mode</string>
     <string>admin-service</string>
-    <string>--max-loops</string>
-    <string>1000</string>
   </array>
   <key>WorkingDirectory</key>
   <string>/Users/ysaeki/Library/Mobile Documents/com~apple~CloudDocs/rockstar/ai-youtuber</string>
@@ -28,9 +26,11 @@
   <true/>
   <key>ThrottleInterval</key>
   <integer>10</integer>
+  <key>Umask</key>
+  <integer>63</integer>
   <key>StandardOutPath</key>
-  <string>/Users/ysaeki/Library/Logs/AiYoutuber/admin-service.log</string>
+  <string>/dev/null</string>
   <key>StandardErrorPath</key>
-  <string>/Users/ysaeki/Library/Logs/AiYoutuber/admin-service-error.log</string>
+  <string>/dev/null</string>
 </dict>
 </plist>

@@ -298,6 +298,171 @@ def find_upcoming_youtube_broadcast(credentials=None):
     }
 
 
+def get_youtube_broadcast(video_id, credentials=None):
+    # 予定に保存した動画IDから、開始対象の配信枠を一意に取得します。
+    normalized_video_id = str(video_id or "").strip()
+    if not normalized_video_id:
+        raise ValueError("取得するYouTube配信の動画IDが空です。")
+    credentials = credentials or get_youtube_credentials()
+    headers = {"Authorization": f"Bearer {credentials.token}"}
+    try:
+        response = requests.get(
+            YOUTUBE_LIVE_BROADCASTS_API_URL,
+            headers=headers,
+            params={
+                "part": "id,snippet,status,contentDetails",
+                "id": normalized_video_id,
+            },
+            timeout=10,
+        )
+        response.raise_for_status()
+        items = response.json().get("items", [])
+    except (requests.exceptions.RequestException, ValueError) as exc:
+        raise RuntimeError(
+            "保存済みのYouTube配信枠を取得できませんでした。"
+            f" video_id={normalized_video_id}"
+        ) from exc
+    if not items:
+        raise RuntimeError(
+            "保存済みのYouTube配信枠が見つかりませんでした。"
+            f" video_id={normalized_video_id}"
+        )
+    item = items[0]
+    snippet = item.get("snippet", {})
+    status = item.get("status", {})
+    content_details = item.get("contentDetails", {})
+    return {
+        "video_id": normalized_video_id,
+        "title": str(snippet.get("title", "タイトル不明")),
+        "description": str(snippet.get("description", "")),
+        "scheduled_start_time": str(snippet.get("scheduledStartTime", "")),
+        "privacy_status": str(status.get("privacyStatus", "不明")),
+        "life_cycle_status": str(status.get("lifeCycleStatus", "不明")),
+        "bound_stream_id": str(content_details.get("boundStreamId", "")),
+        "enable_auto_start": bool(content_details.get("enableAutoStart", False)),
+        "enable_auto_stop": bool(content_details.get("enableAutoStop", False)),
+    }
+
+
+def update_youtube_scheduled_broadcast(
+    video_id,
+    *,
+    title,
+    description="",
+    privacy_status="unlisted",
+    scheduled_start_time,
+    credentials=None,
+):
+    # 管理画面の予定変更を、まだ開始していないYouTube配信枠へ同期します。
+    normalized_video_id = str(video_id or "").strip()
+    normalized_title = str(title or "").strip()
+    normalized_description = str(description or "").strip()
+    normalized_privacy = str(privacy_status or "").strip()
+    if not normalized_video_id:
+        raise ValueError("更新するYouTube配信の動画IDが空です。")
+    if not 1 <= len(normalized_title) <= 100:
+        raise ValueError("YouTube配信タイトルは1〜100文字にしてください。")
+    if len(normalized_description) > 5000:
+        raise ValueError("YouTube配信説明は5000文字以内にしてください。")
+    if normalized_privacy not in {"private", "unlisted", "public"}:
+        raise ValueError("公開設定はprivate、unlisted、publicのいずれかです。")
+    start_time = _normalize_scheduled_start_time(scheduled_start_time)
+    credentials = credentials or get_youtube_credentials()
+    current = get_youtube_broadcast(
+        normalized_video_id,
+        credentials=credentials,
+    )
+    if current["life_cycle_status"] != "ready":
+        raise RuntimeError(
+            "開始済みまたは終了済みのYouTube配信枠は予定変更できません。"
+            f" status={current['life_cycle_status']}"
+        )
+    headers = {
+        "Authorization": f"Bearer {credentials.token}",
+        "Content-Type": "application/json",
+    }
+    try:
+        response = requests.put(
+            YOUTUBE_LIVE_BROADCASTS_API_URL,
+            headers=headers,
+            params={"part": "id,snippet,status"},
+            json={
+                "id": normalized_video_id,
+                "snippet": {
+                    "title": normalized_title,
+                    "description": normalized_description,
+                    "scheduledStartTime": start_time,
+                },
+                "status": {"privacyStatus": normalized_privacy},
+            },
+            timeout=10,
+        )
+        response.raise_for_status()
+    except requests.exceptions.RequestException as exc:
+        raise RuntimeError(
+            "YouTube配信枠へ予定変更を同期できませんでした。"
+            f" video_id={normalized_video_id}"
+        ) from exc
+    return {
+        **current,
+        "title": normalized_title,
+        "description": normalized_description,
+        "privacy_status": normalized_privacy,
+        "scheduled_start_time": start_time,
+    }
+
+
+def delete_youtube_broadcast(video_id, credentials=None):
+    # 管理画面の予定削除に合わせ、未開始のYouTube待機枠だけを削除します。
+    normalized_video_id = str(video_id or "").strip()
+    if not normalized_video_id:
+        raise ValueError("削除するYouTube配信の動画IDが空です。")
+    credentials = credentials or get_youtube_credentials()
+    current = get_youtube_broadcast(
+        normalized_video_id,
+        credentials=credentials,
+    )
+    if current["life_cycle_status"] != "ready":
+        raise RuntimeError(
+            "開始済みまたは終了済みのYouTube配信は削除できません。"
+            f" status={current['life_cycle_status']}"
+        )
+    try:
+        response = requests.delete(
+            YOUTUBE_LIVE_BROADCASTS_API_URL,
+            headers={"Authorization": f"Bearer {credentials.token}"},
+            params={"id": normalized_video_id},
+            timeout=10,
+        )
+        response.raise_for_status()
+    except requests.exceptions.RequestException as exc:
+        raise RuntimeError(
+            "YouTube配信枠を削除できませんでした。"
+            f" video_id={normalized_video_id}"
+        ) from exc
+    return True
+
+
+def _normalize_scheduled_start_time(value):
+    if isinstance(value, datetime):
+        parsed = value
+    else:
+        normalized = str(value or "").strip()
+        if normalized.endswith("Z"):
+            normalized = f"{normalized[:-1]}+00:00"
+        try:
+            parsed = datetime.fromisoformat(normalized)
+        except ValueError as exc:
+            raise ValueError("YouTube配信開始予定時刻を読み取れません。") from exc
+    if parsed.tzinfo is None:
+        raise ValueError("YouTube配信開始予定時刻にはタイムゾーンが必要です。")
+    return (
+        parsed.astimezone(timezone.utc)
+        .isoformat(timespec="seconds")
+        .replace("+00:00", "Z")
+    )
+
+
 def update_youtube_broadcast_metadata(
     video_id,
     title,
@@ -636,13 +801,7 @@ def create_youtube_broadcast(
     start_time = scheduled_start_time or (
         datetime.now(timezone.utc) + timedelta(minutes=5)
     )
-    if start_time.tzinfo is None:
-        raise ValueError("配信開始予定時刻にはタイムゾーンが必要です。")
-    scheduled_start = (
-        start_time.astimezone(timezone.utc)
-        .isoformat(timespec="seconds")
-        .replace("+00:00", "Z")
-    )
+    scheduled_start = _normalize_scheduled_start_time(start_time)
     headers = {
         "Authorization": f"Bearer {credentials.token}",
         "Content-Type": "application/json",

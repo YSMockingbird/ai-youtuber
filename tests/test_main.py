@@ -3,6 +3,7 @@ from unittest.mock import Mock, call, patch
 
 from main import (
     AdminRequestedBroadcastEnd,
+    CommentReplyLimiter,
     generate_and_deliver_ai_response,
     generate_and_deliver_news_commentary,
     get_autonomous_speech_interval_seconds,
@@ -11,13 +12,12 @@ from main import (
     get_youtube_live_wait_settings,
     is_reply_candidate,
     process_next_admin_command,
+    resolve_max_loops,
     run_ai_youtuber_loop,
     run_ai_youtuber_live,
     run_mock_live,
     run_obs_websocket_test,
     start_obs_for_upcoming_youtube_broadcast,
-    run_x_post,
-    run_x_post_draft,
     wait_for_youtube_live,
     wait_for_youtube_stream_active,
     YouTubeBroadcastEndCoordinator,
@@ -41,6 +41,79 @@ class ReplyCandidateTest(unittest.TestCase):
         for comment in ("かわいい", "ええっ", "AIって何？", "hello"):
             with self.subTest(comment=comment):
                 self.assertTrue(is_reply_candidate({"comment": comment}))
+
+
+class MaxLoopsTest(unittest.TestCase):
+    def test_production_modes_run_without_loop_limit_by_default(self):
+        self.assertIsNone(resolve_max_loops("admin-service", None))
+        self.assertIsNone(resolve_max_loops("ai-youtuber-live", None))
+
+    def test_test_modes_keep_short_default(self):
+        self.assertEqual(resolve_max_loops("youtube-loop", None), 3)
+        self.assertEqual(resolve_max_loops("ai-youtuber-loop", None), 3)
+
+    def test_explicit_loop_limit_is_preserved(self):
+        self.assertEqual(resolve_max_loops("admin-service", 20), 20)
+
+    def test_non_positive_loop_limit_is_rejected(self):
+        with self.assertRaisesRegex(ValueError, "1以上"):
+            resolve_max_loops("admin-service", 0)
+
+
+class CommentReplyLimiterTest(unittest.TestCase):
+    @staticmethod
+    def message(user_id, comment="話を続けよう"):
+        return {
+            "message_id": f"message-{user_id}",
+            "user_id": user_id,
+            "user_name": f"視聴者{user_id}",
+            "comment": comment,
+        }
+
+    def test_same_viewer_can_continue_when_no_other_viewer_is_waiting(self):
+        current_time = [0.0]
+        limiter = CommentReplyLimiter(now=lambda: current_time[0])
+        viewer = self.message("a")
+        limiter.record_attempt(viewer)
+        current_time[0] = 10.0
+
+        self.assertIs(limiter.select([viewer]), viewer)
+
+    def test_other_viewer_is_preferred_during_priority_period(self):
+        current_time = [0.0]
+        limiter = CommentReplyLimiter(now=lambda: current_time[0])
+        recent_viewer = self.message("a")
+        other_viewer = self.message("b")
+        limiter.record_attempt(recent_viewer)
+        current_time[0] = 10.0
+
+        self.assertIs(
+            limiter.select([recent_viewer, other_viewer]),
+            other_viewer,
+        )
+
+    def test_multiple_recent_viewers_wait_until_priority_period_ends(self):
+        current_time = [0.0]
+        limiter = CommentReplyLimiter(now=lambda: current_time[0])
+        first_viewer = self.message("a")
+        second_viewer = self.message("b")
+        limiter.record_attempt(first_viewer)
+        limiter.record_attempt(second_viewer)
+        current_time[0] = 10.0
+
+        self.assertIsNone(limiter.select([first_viewer, second_viewer]))
+
+    def test_global_limit_allows_six_attempts_per_minute(self):
+        current_time = [0.0]
+        limiter = CommentReplyLimiter(now=lambda: current_time[0])
+        viewer = self.message("a")
+        for _ in range(6):
+            self.assertIs(limiter.select([viewer]), viewer)
+            limiter.record_attempt(viewer)
+
+        self.assertIsNone(limiter.select([viewer]))
+        current_time[0] = 60.0
+        self.assertIs(limiter.select([viewer]), viewer)
 
 
 class ObsOverlayWaitConfigTest(unittest.TestCase):
@@ -175,6 +248,7 @@ class YouTubeLiveWaitTest(unittest.TestCase):
             result,
             ("created-video", "初見向けの自己紹介配信"),
         )
+        find_upcoming_mock.assert_not_called()
         create_broadcast_mock.assert_called_once_with(
             title="AIの自己紹介配信",
             description="AI VTuberが自己紹介します。",
@@ -183,27 +257,24 @@ class YouTubeLiveWaitTest(unittest.TestCase):
         wait_stream_mock.assert_called_once_with("stream-id")
         transition_mock.assert_called_once_with("created-video")
 
-    @patch("youtube_oauth.update_youtube_broadcast_metadata")
-    @patch("youtube_oauth.find_upcoming_youtube_broadcast")
+    @patch("youtube_oauth.get_youtube_broadcast")
     def test_scheduled_broadcast_uses_persisted_plan_and_updates_status(
         self,
-        find_upcoming_mock,
-        update_metadata_mock,
+        get_broadcast_mock,
     ):
-        find_upcoming_mock.return_value = {
+        get_broadcast_mock.return_value = {
             "video_id": "scheduled-video",
             "title": "カレンダー配信",
             "privacy_status": "unlisted",
+            "life_cycle_status": "ready",
             "enable_auto_start": True,
             "bound_stream_id": "stream-id",
         }
-        update_metadata_mock.return_value = {
-            "video_id": "scheduled-video",
-            "title": "カレンダー配信",
-            "description": "予定に保存した説明",
-            "privacy_status": "unlisted",
-        }
         runtime = Mock()
+        runtime.get_broadcast_schedule.return_value = {
+            "schedule_id": "schedule-1",
+            "youtube_video_id": "scheduled-video",
+        }
         runtime.select_prepared_broadcast_schedule.return_value = (
             "自己紹介配信"
         )
@@ -309,30 +380,25 @@ class YouTubeLiveWaitTest(unittest.TestCase):
 
         sleep_mock.assert_not_called()
 
-    @patch("youtube_oauth.update_youtube_broadcast_metadata")
-    @patch("youtube_oauth.find_upcoming_youtube_broadcast")
+    @patch("youtube_oauth.create_youtube_broadcast")
     @patch("main.get_live_chat_id")
-    def test_admin_can_configure_persistent_broadcast_and_apply_stream_plan(
+    def test_admin_manual_start_creates_new_broadcast_and_applies_stream_plan(
         self,
         get_chat_id,
-        find_upcoming_mock,
-        update_metadata_mock,
+        create_broadcast_mock,
     ):
         get_chat_id.side_effect = [
             YouTubeLiveNotStartedError("まだ開始前"),
             ("live-chat-id", "persistent-video"),
         ]
-        find_upcoming_mock.return_value = {
-            "video_id": "persistent-video",
-            "title": "S のライブ配信",
-            "privacy_status": "unlisted",
-            "enable_auto_start": True,
-        }
-        update_metadata_mock.return_value = {
+        create_broadcast_mock.return_value = {
             "video_id": "persistent-video",
             "title": "自己紹介ライブ",
             "description": "テスト説明",
             "privacy_status": "unlisted",
+            "enable_auto_start": True,
+            "enable_auto_stop": True,
+            "bound_stream_id": "stream-id",
         }
         runtime = Mock()
         runtime.get_next_admin_command.return_value = {
@@ -358,8 +424,7 @@ class YouTubeLiveWaitTest(unittest.TestCase):
                 "初見向けの自己紹介配信",
             ),
         )
-        update_metadata_mock.assert_called_once_with(
-            video_id="persistent-video",
+        create_broadcast_mock.assert_called_once_with(
             title="自己紹介ライブ",
             description="テスト説明",
             privacy_status="unlisted",
@@ -367,14 +432,12 @@ class YouTubeLiveWaitTest(unittest.TestCase):
         obs_client.start_stream.assert_called_once_with()
 
     @patch("stream_theme.generate_stream_theme_plan")
-    @patch("youtube_oauth.update_youtube_broadcast_metadata")
-    @patch("youtube_oauth.find_upcoming_youtube_broadcast")
+    @patch("youtube_oauth.create_youtube_broadcast")
     @patch("main.get_live_chat_id")
     def test_admin_prepares_then_starts_with_same_broadcast_plan(
         self,
         get_chat_id,
-        find_upcoming_mock,
-        update_metadata_mock,
+        create_broadcast_mock,
         generate_plan_mock,
     ):
         get_chat_id.side_effect = [
@@ -382,17 +445,14 @@ class YouTubeLiveWaitTest(unittest.TestCase):
             YouTubeLiveNotStartedError("まだ開始前"),
             ("live-chat-id", "persistent-video"),
         ]
-        find_upcoming_mock.return_value = {
-            "video_id": "persistent-video",
-            "title": "S のライブ配信",
-            "privacy_status": "unlisted",
-            "enable_auto_start": True,
-        }
-        update_metadata_mock.return_value = {
+        create_broadcast_mock.return_value = {
             "video_id": "persistent-video",
             "title": "AIの自己紹介配信",
             "description": "AI VTuberが自己紹介します。",
             "privacy_status": "unlisted",
+            "enable_auto_start": True,
+            "enable_auto_stop": True,
+            "bound_stream_id": "stream-id",
         }
         plan = Mock()
         generate_plan_mock.return_value = plan
@@ -447,57 +507,6 @@ class YouTubeLiveWaitTest(unittest.TestCase):
             "draft-1"
         )
         obs_client.start_stream.assert_called_once_with()
-
-
-class XPostDraftCommandTest(unittest.TestCase):
-    @patch("x_post.generate_x_post_draft")
-    def test_x_failure_does_not_propagate(self, generate_draft):
-        generate_draft.side_effect = RuntimeError("Gemini接続失敗")
-
-        result = run_x_post_draft()
-
-        self.assertFalse(result)
-
-    @patch("x_post.publish_x_post")
-    @patch("x_post.generate_x_post_draft")
-    def test_x_post_requires_confirm_flag(self, generate_draft, publish):
-        generate_draft.return_value = {"text": "確認する本文"}
-
-        result = run_x_post(confirm=False)
-
-        self.assertFalse(result)
-        publish.assert_not_called()
-
-    @patch("x_post.publish_x_post")
-    @patch("x_post.generate_x_post_draft")
-    def test_x_post_requires_exact_confirmation(self, generate_draft, publish):
-        generate_draft.return_value = {"text": "確認する本文"}
-
-        result = run_x_post(
-            confirm=True,
-            input_func=lambda _prompt: "no",
-        )
-
-        self.assertFalse(result)
-        publish.assert_not_called()
-
-    @patch("x_post.publish_x_post")
-    @patch("x_post.generate_x_post_draft")
-    def test_x_post_publishes_after_exact_confirmation(
-        self,
-        generate_draft,
-        publish,
-    ):
-        generate_draft.return_value = {"text": "確認する本文"}
-        publish.return_value = {"post_id": "12345", "text": "確認する本文"}
-
-        result = run_x_post(
-            confirm=True,
-            input_func=lambda _prompt: "POST",
-        )
-
-        self.assertTrue(result)
-        publish.assert_called_once_with("確認する本文")
 
 
 class GenerateAndDeliverAiResponseTest(unittest.TestCase):

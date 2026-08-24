@@ -2,12 +2,14 @@ import os
 import queue
 import threading
 import time
+from collections import deque
 
 import requests
 
 
 YOUTUBE_VIDEO_API_URL = "https://www.googleapis.com/youtube/v3/videos"
 YOUTUBE_LIVE_CHAT_API_URL = "https://www.googleapis.com/youtube/v3/liveChat/messages"
+RETRYABLE_HTTP_STATUS_CODES = {408, 429, 500, 502, 503, 504}
 
 
 class YouTubeLiveNotStartedError(RuntimeError):
@@ -16,6 +18,10 @@ class YouTubeLiveNotStartedError(RuntimeError):
 
 class YouTubeLiveEndedError(RuntimeError):
     """YouTube配信とライブチャットが終了した状態です。"""
+
+
+class YouTubeTransientChatError(RuntimeError):
+    """再接続で回復する可能性があるコメント取得エラーです。"""
 
 
 def _get_youtube_error_reasons(response):
@@ -130,7 +136,9 @@ def fetch_chat_messages(live_chat_id, page_token=None):
         response = requests.get(YOUTUBE_LIVE_CHAT_API_URL, params=params, timeout=10)
         response.raise_for_status()
     except requests.exceptions.Timeout as exc:
-        raise RuntimeError("YouTubeコメント取得がタイムアウトしました。ネットワーク接続を確認してください。") from exc
+        raise YouTubeTransientChatError(
+            "YouTubeコメント取得がタイムアウトしました。"
+        ) from exc
     except requests.exceptions.HTTPError as exc:
         status_code = exc.response.status_code if exc.response is not None else "unknown"
         error_reasons = (
@@ -142,9 +150,16 @@ def fetch_chat_messages(live_chat_id, page_token=None):
             raise YouTubeLiveEndedError(
                 "YouTubeライブチャットが終了しました。"
             ) from exc
+        if status_code in RETRYABLE_HTTP_STATUS_CODES:
+            raise YouTubeTransientChatError(
+                "YouTubeコメント取得で一時的なHTTPエラーが発生しました。"
+                f"status_code={status_code}"
+            ) from exc
         raise RuntimeError(f"YouTubeコメント取得でHTTPエラーが発生しました。status_code={status_code}") from exc
     except requests.exceptions.RequestException as exc:
-        raise RuntimeError("YouTubeコメント取得に失敗しました。ネットワーク接続を確認してください。") from exc
+        raise YouTubeTransientChatError(
+            "YouTubeコメント取得の通信が一時的に切断されました。"
+        ) from exc
 
     data = response.json()
     messages = []
@@ -174,25 +189,78 @@ def fetch_chat_messages(live_chat_id, page_token=None):
     }
 
 
+def _wait_for_chat_retry(
+    wait_seconds,
+    wait_callback=None,
+    wait_step_seconds=0.25,
+    stop_event=None,
+):
+    # 待機中も管理命令と停止指示へ応答できるよう、短い間隔に分けて待ちます。
+    deadline = time.monotonic() + float(wait_seconds)
+    while time.monotonic() < deadline:
+        if stop_event is not None and stop_event.is_set():
+            return False
+        if wait_callback is not None:
+            wait_callback()
+        remaining_seconds = deadline - time.monotonic()
+        if remaining_seconds <= 0:
+            break
+        sleep_seconds = min(float(wait_step_seconds), remaining_seconds)
+        if stop_event is not None:
+            if stop_event.wait(timeout=sleep_seconds):
+                return False
+        else:
+            time.sleep(sleep_seconds)
+    return True
+
+
 def iter_chat_messages(
     live_chat_id,
     max_loops=None,
     wait_callback=None,
     wait_step_seconds=0.25,
     stop_event=None,
+    retry_initial_seconds=2,
+    retry_max_seconds=30,
 ):
     # pollingIntervalMillisに従って、YouTube Liveコメントを継続取得します。
     if float(wait_step_seconds) <= 0:
         raise ValueError("wait_step_secondsは0より大きくしてください。")
+    if float(retry_initial_seconds) <= 0:
+        raise ValueError("コメント取得の初回再試行間隔は0より大きくしてください。")
+    if float(retry_max_seconds) < float(retry_initial_seconds):
+        raise ValueError(
+            "コメント取得の最大再試行間隔は初回再試行間隔以上にしてください。"
+        )
     page_token = None
     loop_count = 0
     previous_fetch_at = None
+    retry_seconds = float(retry_initial_seconds)
 
     while True:
         if stop_event is not None and stop_event.is_set():
             return
         fetch_started_at = time.monotonic()
-        result = fetch_chat_messages(live_chat_id, page_token)
+        try:
+            result = fetch_chat_messages(live_chat_id, page_token)
+        except YouTubeTransientChatError as exc:
+            print(
+                "YouTubeコメント取得の一時エラー："
+                f"{exc} {retry_seconds:g}秒後に同じ位置から再試行します。"
+            )
+            if not _wait_for_chat_retry(
+                retry_seconds,
+                wait_callback=wait_callback,
+                wait_step_seconds=wait_step_seconds,
+                stop_event=stop_event,
+            ):
+                return
+            retry_seconds = min(
+                retry_seconds * 2,
+                float(retry_max_seconds),
+            )
+            continue
+        retry_seconds = float(retry_initial_seconds)
         page_token = result["next_page_token"]
         loop_count += 1
         actual_interval = (
@@ -214,22 +282,13 @@ def iter_chat_messages(
         if max_loops is not None and loop_count >= max_loops:
             break
 
-        wait_seconds = recommended_seconds
-        deadline = time.monotonic() + wait_seconds
-        while time.monotonic() < deadline:
-            if stop_event is not None and stop_event.is_set():
-                return
-            if wait_callback is not None:
-                wait_callback()
-            remaining_seconds = deadline - time.monotonic()
-            if remaining_seconds <= 0:
-                break
-            sleep_seconds = min(float(wait_step_seconds), remaining_seconds)
-            if stop_event is not None:
-                if stop_event.wait(timeout=sleep_seconds):
-                    return
-            else:
-                time.sleep(sleep_seconds)
+        if not _wait_for_chat_retry(
+            recommended_seconds,
+            wait_callback=wait_callback,
+            wait_step_seconds=wait_step_seconds,
+            stop_event=stop_event,
+        ):
+            return
 
 
 class YouTubeChatPoller:
@@ -242,6 +301,7 @@ class YouTubeChatPoller:
         message_callback=None,
         live_status_callback=None,
         live_status_interval_seconds=15,
+        max_seen_message_ids=2000,
     ):
         self.live_chat_id = live_chat_id
         self.max_loops = max_loops
@@ -250,12 +310,28 @@ class YouTubeChatPoller:
         self.live_status_interval_seconds = float(live_status_interval_seconds)
         if self.live_status_interval_seconds <= 0:
             raise ValueError("配信状態の確認間隔は0より大きくしてください。")
+        if isinstance(max_seen_message_ids, bool) or not isinstance(
+            max_seen_message_ids, int
+        ) or max_seen_message_ids <= 0:
+            raise ValueError("処理済みコメントIDの保持数は1以上の整数にしてください。")
+        self.max_seen_message_ids = max_seen_message_ids
         self._result_queue = queue.Queue(maxsize=256)
         self._stop_event = threading.Event()
         self._finished_event = threading.Event()
         self._error = None
         self._seen_message_ids = set()
+        self._seen_message_id_order = deque()
         self._thread = None
+
+    def _remember_message_id(self, message_id):
+        if not message_id or message_id in self._seen_message_ids:
+            return False
+        self._seen_message_ids.add(message_id)
+        self._seen_message_id_order.append(message_id)
+        while len(self._seen_message_id_order) > self.max_seen_message_ids:
+            expired_message_id = self._seen_message_id_order.popleft()
+            self._seen_message_ids.discard(expired_message_id)
+        return True
 
     def start(self):
         if self._thread is not None:
@@ -281,10 +357,8 @@ class YouTubeChatPoller:
                 messages = []
                 for message in result.get("messages", []):
                     message_id = message.get("message_id", "")
-                    if message_id and message_id in self._seen_message_ids:
+                    if message_id and not self._remember_message_id(message_id):
                         continue
-                    if message_id:
-                        self._seen_message_ids.add(message_id)
                     messages.append(message)
 
                 published_result = dict(result)

@@ -12,11 +12,33 @@ from youtube_chat import (
     resolve_youtube_video_id,
     YouTubeLiveEndedError,
     YouTubeLiveNotStartedError,
+    YouTubeTransientChatError,
     YouTubeChatPoller,
 )
 
 
 class YouTubeChatTest(unittest.TestCase):
+    @patch.dict("os.environ", {"YOUTUBE_API_KEY": "test-key"})
+    @patch("youtube_chat.requests.get")
+    def test_network_error_is_marked_as_transient(self, get_mock):
+        get_mock.side_effect = requests.exceptions.SSLError("一時切断")
+
+        with self.assertRaises(YouTubeTransientChatError):
+            fetch_chat_messages("live-chat-id", "current-token")
+
+    @patch.dict("os.environ", {"YOUTUBE_API_KEY": "test-key"})
+    @patch("youtube_chat.requests.get")
+    def test_retryable_http_error_is_marked_as_transient(self, get_mock):
+        response = Mock(status_code=503)
+        response.json.return_value = {"error": {"errors": []}}
+        response.raise_for_status.side_effect = requests.exceptions.HTTPError(
+            response=response
+        )
+        get_mock.return_value = response
+
+        with self.assertRaises(YouTubeTransientChatError):
+            fetch_chat_messages("live-chat-id")
+
     @patch.dict("os.environ", {"YOUTUBE_API_KEY": "test-key"})
     @patch("youtube_chat.requests.get")
     def test_live_chat_ended_error_is_distinguished(self, get_mock):
@@ -195,6 +217,60 @@ class YouTubeChatTest(unittest.TestCase):
         self.assertEqual(wait_callback.call_count, 4)
         self.assertEqual(sleep_mock.call_count, 4)
 
+    @patch("youtube_chat._wait_for_chat_retry", return_value=True)
+    @patch("youtube_chat.fetch_chat_messages")
+    def test_transient_errors_retry_same_page_with_backoff(
+        self,
+        fetch_mock,
+        wait_mock,
+    ):
+        fetch_mock.side_effect = [
+            YouTubeTransientChatError("一時エラー1"),
+            YouTubeTransientChatError("一時エラー2"),
+            {
+                "messages": [],
+                "next_page_token": "next-token",
+                "polling_interval_millis": 5000,
+            },
+        ]
+
+        results = list(
+            iter_chat_messages(
+                "live-chat-id",
+                max_loops=1,
+                retry_initial_seconds=2,
+                retry_max_seconds=30,
+            )
+        )
+
+        self.assertEqual(len(results), 1)
+        self.assertEqual(
+            fetch_mock.call_args_list,
+            [
+                call("live-chat-id", None),
+                call("live-chat-id", None),
+                call("live-chat-id", None),
+            ],
+        )
+        self.assertEqual(
+            [retry_call.args[0] for retry_call in wait_mock.call_args_list],
+            [2, 4],
+        )
+
+    @patch("youtube_chat._wait_for_chat_retry", return_value=True)
+    @patch("youtube_chat.fetch_chat_messages")
+    def test_permanent_error_still_stops_without_retry(
+        self,
+        fetch_mock,
+        wait_mock,
+    ):
+        fetch_mock.side_effect = RuntimeError("設定エラー")
+
+        with self.assertRaisesRegex(RuntimeError, "設定エラー"):
+            list(iter_chat_messages("live-chat-id", max_loops=1))
+
+        wait_mock.assert_not_called()
+
     @patch("youtube_chat.time.sleep")
     @patch("youtube_chat.time.monotonic")
     @patch("youtube_chat.fetch_chat_messages")
@@ -365,6 +441,34 @@ class YouTubeChatTest(unittest.TestCase):
 
         callback.assert_called_once_with([message])
         self.assertEqual(len(results[0]["messages"]), 1)
+
+    @patch("youtube_chat.iter_chat_messages")
+    def test_poller_limits_remembered_comment_ids(self, iter_messages_mock):
+        messages = [
+            {"message_id": "message-1", "comment": "1"},
+            {"message_id": "message-2", "comment": "2"},
+            {"message_id": "message-3", "comment": "3"},
+            {"message_id": "message-1", "comment": "1再取得"},
+        ]
+        iter_messages_mock.return_value = iter(
+            {"messages": [message], "next_page_token": "next"}
+            for message in messages
+        )
+        callback = Mock()
+        poller = YouTubeChatPoller(
+            "live-chat-id",
+            message_callback=callback,
+            max_seen_message_ids=2,
+        ).start()
+        poller._thread.join(timeout=1)
+
+        list(poller.iter_results())
+
+        self.assertEqual(callback.call_count, 4)
+        self.assertEqual(
+            poller._seen_message_ids,
+            {"message-1", "message-3"},
+        )
 
     @patch("youtube_chat.iter_chat_messages")
     def test_poller_coalesces_empty_results_while_reply_is_busy(

@@ -83,8 +83,7 @@ OAuth確認用コマンドは毎回実行する必要はありません。本番
 
 ```bash
 .venv/bin/python main.py \
-  --mode ai-youtuber-live \
-  --max-loops 1000
+  --mode ai-youtuber-live
 ```
 
 保存済みトークンのアクセストークンが期限切れになった場合、リフレッシュトークンで

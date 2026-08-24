@@ -14,6 +14,14 @@ fi
 
 /usr/bin/plutil -lint "$source_plist"
 /bin/mkdir -p "$HOME/Library/LaunchAgents" "$log_dir"
+/bin/chmod 700 "$log_dir"
+for log_file in \
+  "$log_dir/admin-service.log" \
+  "$log_dir/admin-service-error.log"; do
+  if [[ -e "$log_file" ]]; then
+    /bin/chmod 600 "$log_file"
+  fi
+done
 
 if /bin/launchctl print "$service_target" >/dev/null 2>&1; then
   /bin/launchctl bootout "gui/$(id -u)" "$target_plist"

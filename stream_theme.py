@@ -3,8 +3,7 @@ from typing import Literal, Optional
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from llm.client import create_llm_client
-from llm.config import load_llm_config
+from llm.client import get_shared_llm_client
 from time_context import get_current_datetime_context
 
 
@@ -102,7 +101,7 @@ def generate_stream_theme_plan(previous_state=None, instruction=None):
         f"{get_current_datetime_context()}\n\n"
         f"前回までの状態:\n{previous_context}"
     )
-    client = create_llm_client(load_llm_config())
+    client = get_shared_llm_client()
     return client.generate_structured(
         instructions=(
             "あなたはVTuber・アニメ・ゲーム好き向けの長時間雑談を構成する"
